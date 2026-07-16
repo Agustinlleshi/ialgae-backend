@@ -1,13 +1,16 @@
 // Server per iAlgae — versione a FILE UNICO, senza dipendenze esterne.
 // Usa solo moduli integrati in Node.js (http + fetch), quindi non serve npm install.
 //
-// Espone tre endpoint:
+// Espone quattro endpoint:
 //   POST /api/ask       -> risponde alle domande usando l'API di Anthropic (Claude)
 //   POST /api/vision    -> analizza un'immagine caricata (iAlgae Lens) usando Claude,
 //                          che ha capacità di visione (il backend è già collegato a
 //                          Claude, quindi riusiamo lo stesso, non usiamo Gemini di Google)
 //   GET  /api/suggest   -> restituisce suggerimenti di ricerca reali (proxy verso DuckDuckGo,
 //                          necessario perché il browser da solo non può chiamarlo per via del CORS)
+//   GET  /api/search    -> restituisce risultati di ricerca web reali (proxy verso Brave Search API),
+//                          usati dalla pagina dei risultati (results.html) per mostrare i risultati
+//                          dentro iAlgae invece di rimandare a Google
 //
 // COME PUBBLICARLO SU RENDER.COM:
 // 1. Crea un "Web Service" su Render.com e carica solo questo file (server.js).
@@ -17,20 +20,41 @@
 //      - Start Command: node server.js
 // 3. In "Environment Variables" aggiungi:
 //      - ANTHROPIC_API_KEY = la tua chiave API di Anthropic
+//      - BRAVE_API_KEY = la tua chiave gratuita di Brave Search API (vedi nota sotto)
 // 4. Fai il deploy. Render ti darà un indirizzo tipo:
 //      https://ialgae-ai-backend.onrender.com
 //    Gli endpoint da usare nel sito saranno:
 //      https://ialgae-ai-backend.onrender.com/api/ask
 //      https://ialgae-ai-backend.onrender.com/api/vision
 //      https://ialgae-ai-backend.onrender.com/api/suggest
+//      https://ialgae-ai-backend.onrender.com/api/search
+//
+// NOTA SU BRAVE_API_KEY:
+// A differenza di Frankfurter/Open-Meteo/DuckDuckGo (usati altrove nel sito),
+// non esiste un servizio di ricerca web reale completamente gratuito e senza
+// registrazione. Brave Search API offre un piano gratuito (circa 2.000 ricerche
+// al mese) pensato apposta per piccoli siti come questo. Per ottenerla:
+// 1. Vai su https://api.search.brave.com/register
+// 2. Crea un account gratuito e genera una API Key dalla dashboard
+// 3. Incollala qui sopra come variabile d'ambiente BRAVE_API_KEY
 
 const http = require('http');
 
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
+const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
 const MAX_QUESTION_LENGTH = 2000;
 const MAX_IMAGE_BASE64_LENGTH = 6000000; // ~4.5 MB di immagine decodificata
+const RESULTS_PER_PAGE = 10;
+
+function extractHost(url) {
+    try {
+        return new URL(url).hostname.replace(/^www\./, '');
+    } catch (e) {
+        return url || '';
+    }
+}
 
 function sendJSON(res, statusCode, data) {
     const body = JSON.stringify(data);
@@ -259,6 +283,118 @@ const server = http.createServer((req, res) => {
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         });
+        return;
+    }
+
+    // Endpoint risultati di ricerca reali (proxy verso Brave Search API)
+    if (req.method === 'GET' && req.url.indexOf('/api/search') === 0) {
+        (async function () {
+            try {
+                const fullUrl = new URL(req.url, 'http://localhost');
+                const q = (fullUrl.searchParams.get('q') || '').trim();
+                let page = parseInt(fullUrl.searchParams.get('page'), 10);
+                if (!page || page < 1) page = 1;
+                if (page > 10) page = 10; // limitiamo a 10 pagine, come richiesto
+
+                const allowedTypes = ['web', 'images', 'news', 'videos'];
+                let type = (fullUrl.searchParams.get('type') || 'web').toLowerCase();
+                if (allowedTypes.indexOf(type) === -1) type = 'web';
+
+                if (!q) {
+                    return sendJSON(res, 200, { results: [], totalPages: 0, page: page, type: type });
+                }
+
+                if (!BRAVE_API_KEY) {
+                    return sendJSON(res, 500, { error: 'Chiave Brave Search non configurata sul server (BRAVE_API_KEY).' });
+                }
+
+                const offset = (page - 1) * RESULTS_PER_PAGE;
+                const endpoints = {
+                    web: 'https://api.search.brave.com/res/v1/web/search',
+                    images: 'https://api.search.brave.com/res/v1/images/search',
+                    news: 'https://api.search.brave.com/res/v1/news/search',
+                    videos: 'https://api.search.brave.com/res/v1/videos/search'
+                };
+
+                // Le Immagini di Brave non supportano la paginazione con "offset": restituiscono
+                // sempre la prima pagina di risultati, quindi la omettiamo per quel tipo.
+                let searchUrl = endpoints[type] + '?q=' + encodeURIComponent(q) + '&count=' + RESULTS_PER_PAGE + '&country=it&search_lang=it';
+                if (type !== 'images') {
+                    searchUrl += '&offset=' + offset;
+                }
+
+                const braveResponse = await fetch(searchUrl, {
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-Subscription-Token': BRAVE_API_KEY
+                    }
+                });
+
+                if (!braveResponse.ok) {
+                    const errText = await braveResponse.text();
+                    console.error('Errore Brave Search API (' + type + '):', braveResponse.status, errText);
+                    return sendJSON(res, 502, { error: 'Servizio di ricerca non raggiungibile al momento.' });
+                }
+
+                const data = await braveResponse.json();
+                let results = [];
+
+                if (type === 'web') {
+                    const webResults = (data.web && Array.isArray(data.web.results)) ? data.web.results : [];
+                    results = webResults.map(function (r) {
+                        return {
+                            title: r.title || '',
+                            url: r.url || '',
+                            description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, '')
+                        };
+                    });
+                } else if (type === 'images') {
+                    const imgResults = Array.isArray(data.results) ? data.results : [];
+                    results = imgResults.map(function (r) {
+                        return {
+                            title: r.title || '',
+                            url: r.url || '',
+                            imageUrl: (r.thumbnail && r.thumbnail.src) || (r.properties && r.properties.url) || '',
+                            source: (r.source || extractHost(r.url))
+                        };
+                    });
+                } else if (type === 'news') {
+                    const newsResults = Array.isArray(data.results) ? data.results : [];
+                    results = newsResults.map(function (r) {
+                        return {
+                            title: r.title || '',
+                            url: r.url || '',
+                            description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, ''),
+                            source: (r.meta_url && r.meta_url.hostname) || extractHost(r.url),
+                            age: r.age || ''
+                        };
+                    });
+                } else if (type === 'videos') {
+                    const videoResults = Array.isArray(data.results) ? data.results : [];
+                    results = videoResults.map(function (r) {
+                        return {
+                            title: r.title || '',
+                            url: r.url || '',
+                            description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, ''),
+                            thumbnail: (r.thumbnail && r.thumbnail.src) || '',
+                            duration: (r.video && r.video.duration) || ''
+                        };
+                    });
+                }
+
+                return sendJSON(res, 200, {
+                    results: results,
+                    page: page,
+                    totalPages: (type === 'images') ? 1 : 10, // mostriamo fino a 10 pagine per gli altri tipi
+                    type: type,
+                    query: q
+                });
+
+            } catch (err) {
+                console.error('Errore ricerca:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
         return;
     }
 
