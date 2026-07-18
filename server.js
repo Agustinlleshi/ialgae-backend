@@ -308,7 +308,10 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 500, { error: 'Chiave Brave Search non configurata sul server (BRAVE_API_KEY).' });
                 }
 
-                const offset = (page - 1) * RESULTS_PER_PAGE;
+                // IMPORTANTE: per Brave, "offset" è il numero della pagina stessa (da 0 a 9),
+                // non un conteggio di risultati da saltare. Per questo la pagina 1 corrisponde
+                // a offset 0, la pagina 2 a offset 1, ecc. (fino a un massimo di offset 9).
+                const offset = page - 1;
                 const endpoints = {
                     web: 'https://api.search.brave.com/res/v1/web/search',
                     images: 'https://api.search.brave.com/res/v1/images/search',
