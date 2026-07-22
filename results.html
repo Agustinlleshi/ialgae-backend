@@ -1,0 +1,1687 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light dark">
+    <title>Risultati di ricerca - iAlgae</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Poppins:wght@500;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Roboto', Arial, sans-serif;
+        }
+
+        body {
+            background-color: #ffffff;
+            color: #202124;
+            padding-bottom: 56px;
+        }
+
+        a { color: inherit; text-decoration: none; }
+
+        /* BARRA SUPERIORE */
+        .top-bar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 18px 24px 0;
+            flex-wrap: nowrap;
+        }
+
+        .top-bar-logo {
+            display: flex;
+            align-items: center;
+            flex-shrink: 0;
+        }
+
+        .top-bar-logo svg {
+            width: 100px;
+            height: auto;
+        }
+
+        .top-bar-search {
+            flex: 1;
+            min-width: 240px;
+            max-width: 640px;
+            position: relative;
+        }
+
+        .page-suggestions-box {
+            display: none;
+            position: absolute;
+            top: 50px;
+            left: 0;
+            right: 0;
+            background: #ffffff;
+            border: 1px solid #dfe1e5;
+            border-radius: 16px;
+            box-shadow: 0 4px 6px rgba(32,33,36,0.28);
+            text-align: left;
+            overflow: hidden;
+            z-index: 50;
+        }
+
+        .page-suggestions-box.open {
+            display: block;
+        }
+
+        .page-suggestion-item {
+            display: flex;
+            align-items: center;
+            padding: 10px 16px;
+            font-size: 14px;
+            color: #202124;
+            cursor: pointer;
+        }
+
+        .page-suggestion-item:hover,
+        .page-suggestion-item.active {
+            background-color: #f1f3f4;
+        }
+
+        .page-suggestion-item svg {
+            width: 16px;
+            height: 16px;
+            color: #9aa0a6;
+            margin-right: 14px;
+            flex-shrink: 0;
+        }
+
+        .search-box-small {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border: 1px solid #dfe1e5;
+            border-radius: 24px;
+            padding: 0 16px;
+            height: 44px;
+            box-shadow: 0 1px 4px rgba(32,33,36,0.1);
+        }
+
+        .search-box-small:hover,
+        .search-box-small:focus-within {
+            box-shadow: 0 1px 6px rgba(32,33,36,0.2);
+        }
+
+        .search-box-small svg {
+            width: 18px;
+            height: 18px;
+            color: #4285F4;
+            flex-shrink: 0;
+            cursor: pointer;
+        }
+
+        .search-box-small input {
+            flex: 1;
+            border: none;
+            outline: none;
+            font-size: 15px;
+            background: transparent;
+            color: #202124;
+        }
+
+        .search-clear-btn {
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: none;
+            border: none;
+            color: #5f6368;
+            cursor: pointer;
+            padding: 4px;
+            flex-shrink: 0;
+        }
+
+        .search-clear-btn.visible {
+            display: flex;
+        }
+
+        .search-clear-btn svg {
+            width: 16px;
+            height: 16px;
+            color: inherit;
+            cursor: pointer;
+        }
+
+        .search-clear-btn:hover {
+            color: #202124;
+        }
+
+        /* PULSANTE "CERCA SUL WEB" (identico a quello della homepage) */
+        .search-submit-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background-color: #f2f3f4;
+            border: 1px solid #f2f3f4;
+            color: #202124;
+            font-weight: 500;
+            font-family: 'Roboto', Arial, sans-serif;
+            padding: 0 22px;
+            font-size: 14px;
+            height: 44px;
+            min-width: 140px;
+            border-radius: 24px;
+            cursor: pointer;
+            transition: all 0.1s;
+            user-select: none;
+            flex-shrink: 0;
+        }
+
+        .search-submit-btn:hover {
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+            background-color: #e8eaed;
+            border: 1px solid #dadce0;
+        }
+
+        .top-bar-right {
+            margin-left: auto;
+            display: flex;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+
+        .top-bar-right a {
+            font-size: 13px;
+            color: #5f6368;
+            padding: 6px 4px;
+        }
+
+        .top-bar-right a:hover {
+            text-decoration: underline;
+        }
+
+        /* TAB DI FILTRO (Tutti, Immagini, Notizie...) */
+        .filter-tabs {
+            display: flex;
+            gap: 28px;
+            padding: 14px 24px 0;
+            margin-left: 134px;
+            border-bottom: 1px solid #ebebeb;
+            flex-wrap: wrap;
+        }
+
+        .filter-tab {
+            font-size: 13px;
+            color: #5f6368;
+            padding-bottom: 12px;
+            border-bottom: 3px solid transparent;
+            cursor: pointer;
+        }
+
+        .filter-tab.active {
+            color: #1a73e8;
+            border-bottom-color: #1a73e8;
+            font-weight: 500;
+        }
+
+        /* META RISULTATI */
+        .results-meta {
+            font-size: 13px;
+            color: #70757a;
+            padding: 14px 24px 6px;
+            margin-left: 134px;
+        }
+
+        /* PANORAMICA INFORMATIVA IALGAE AI */
+        .ai-overview {
+            display: none;
+            max-width: 620px;
+            margin: 10px 24px 22px 164px;
+            padding: 16px 20px;
+            border-radius: 14px;
+            background: linear-gradient(135deg, rgba(124,58,237,0.06), rgba(6,182,212,0.06));
+            border: 1px solid rgba(124,58,237,0.18);
+        }
+
+        .ai-overview.visible {
+            display: block;
+        }
+
+        .ai-overview-head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 4px;
+        }
+
+        .ai-overview-head svg {
+            width: 18px;
+            height: 18px;
+            color: #7C3AED;
+            flex-shrink: 0;
+        }
+
+        .ai-overview-title {
+            font-size: 15.5px;
+            font-weight: 700;
+            background: linear-gradient(90deg, #7C3AED, #06B6D4);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+        }
+
+        .ai-overview-subtitle {
+            font-size: 12px;
+            color: #70757a;
+            margin: 0 0 10px 26px;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+        }
+
+        .ai-overview-body-wrap {
+            position: relative;
+            max-height: 84px;
+            overflow: hidden;
+            transition: max-height 0.25s ease;
+        }
+
+        .ai-overview-body-wrap.expanded {
+            max-height: 2000px;
+        }
+
+        .ai-overview-body-wrap:not(.expanded)::after {
+            content: "";
+            position: absolute;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            height: 28px;
+            background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,0.95));
+        }
+
+        .ai-overview-body {
+            font-size: 11px;
+            line-height: 1.55;
+            color: #303134;
+            white-space: pre-wrap;
+        }
+
+        .ai-overview-body.loading {
+            color: #70757a;
+            font-style: italic;
+        }
+
+        .ai-overview-toggle {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            margin-top: 8px;
+            background: none;
+            border: none;
+            color: #7C3AED;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            padding: 2px 0;
+        }
+
+        .ai-overview-toggle svg {
+            width: 15px;
+            height: 15px;
+            transition: transform 0.2s ease;
+        }
+
+        .ai-overview-toggle.expanded svg {
+            transform: rotate(180deg);
+        }
+
+        .ai-overview-disclaimer {
+            font-size: 11px;
+            color: #9aa0a6;
+            margin-top: 10px;
+        }
+
+        /* LISTA RISULTATI */
+        .results-list {
+            max-width: 620px;
+            margin-left: 134px;
+            padding: 6px 24px 30px;
+        }
+
+        .result-item {
+            margin-bottom: 28px;
+        }
+
+        .result-url-line {
+            display: flex;
+            flex-direction: column;
+            font-size: 13px;
+            color: #202124;
+            margin-bottom: 3px;
+        }
+
+        .result-site {
+            font-weight: 500;
+        }
+
+        .result-url {
+            color: #5f6368;
+        }
+
+        .result-title {
+            font-size: 19px;
+            color: #1a0dab;
+            margin-bottom: 4px;
+            display: inline-block;
+        }
+
+        .result-title:hover {
+            text-decoration: underline;
+        }
+
+        .result-desc {
+            font-size: 14px;
+            line-height: 1.55;
+            color: #4d5156;
+        }
+
+        /* GRIGLIA IMMAGINI */
+        .results-list.images-mode {
+            margin-left: 0;
+            max-width: 100%;
+            padding: 0 24px;
+        }
+
+        .images-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 14px;
+            width: 100%;
+        }
+
+        .image-card {
+            border-radius: 8px;
+            overflow: hidden;
+            background: #f1f3f4;
+            cursor: pointer;
+        }
+
+        .image-card img {
+            width: 100%;
+            height: 150px;
+            object-fit: cover;
+            display: block;
+            transition: transform 0.25s ease;
+        }
+
+        .image-card:hover img {
+            transform: scale(1.08);
+        }
+
+        .image-card-caption {
+            font-size: 11.5px;
+            color: #5f6368;
+            padding: 6px 8px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* RISULTATI VIDEO */
+        .video-item {
+            display: flex;
+            gap: 14px;
+            margin-bottom: 22px;
+            max-width: 620px;
+        }
+
+        .video-thumb {
+            width: 160px;
+            height: 90px;
+            border-radius: 8px;
+            object-fit: cover;
+            background: #f1f3f4;
+            flex-shrink: 0;
+        }
+
+        .video-duration {
+            font-size: 12px;
+            color: #5f6368;
+            margin-bottom: 3px;
+        }
+
+        /* NEWS: fonte + data */
+        .news-meta {
+            font-size: 12.5px;
+            color: #70757a;
+            margin-bottom: 3px;
+        }
+
+        /* MAPPA (OpenStreetMap, nessuna chiave richiesta) */
+        .results-list.map-mode {
+            margin-left: 0;
+            max-width: 100%;
+            padding: 0;
+        }
+
+        .map-wrap {
+            width: 100%;
+            position: relative;
+        }
+
+        .map-frame {
+            display: block;
+            width: 100%;
+            height: calc(100vh - 210px);
+            min-height: 420px;
+            border: none;
+            background: #eef1f2;
+            z-index: 1;
+        }
+
+        .map-caption {
+            font-size: 12.5px;
+            color: #70757a;
+            margin-top: 8px;
+            padding: 0 24px;
+        }
+
+        /* SCHEDA "INDICAZIONI STRADALI" */
+        .directions-card {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            width: 320px;
+            max-width: calc(100% - 32px);
+            background: #ffffff;
+            border-radius: 16px;
+            box-shadow: 0 4px 14px rgba(32,33,36,0.2);
+            padding: 18px 20px;
+            z-index: 500;
+        }
+
+        .directions-head {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+
+        .directions-head svg {
+            width: 22px;
+            height: 22px;
+            color: #1a73e8;
+            flex-shrink: 0;
+        }
+
+        .directions-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: #202124;
+        }
+
+        .directions-fields {
+            position: relative;
+            margin-bottom: 14px;
+        }
+
+        .directions-input {
+            width: 100%;
+            border: none;
+            background: #f1f3f4;
+            border-radius: 8px;
+            padding: 11px 14px;
+            font-size: 14px;
+            color: #202124;
+            outline: none;
+            margin-bottom: 8px;
+        }
+
+        .directions-input:focus {
+            background: #e8eaed;
+        }
+
+        .directions-swap-btn {
+            position: absolute;
+            right: 10px;
+            top: 34px;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: #ffffff;
+            border: 1px solid #dfe1e5;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            color: #5f6368;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+        }
+
+        .directions-swap-btn svg { width: 15px; height: 15px; }
+        .directions-swap-btn:hover { background: #f1f3f4; }
+
+        .directions-buttons {
+            display: flex;
+            gap: 10px;
+        }
+
+        .directions-btn-primary {
+            flex: 1;
+            background: #1a73e8;
+            color: #ffffff;
+            border: none;
+            border-radius: 24px;
+            padding: 11px 0;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .directions-btn-primary:hover { background: #1765cc; }
+
+        .directions-btn-secondary {
+            flex: 1;
+            background: #f1f3f4;
+            color: #3c4043;
+            border: none;
+            border-radius: 24px;
+            padding: 11px 0;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .directions-btn-secondary:hover { background: #e8eaed; }
+
+        .directions-status {
+            font-size: 12.5px;
+            color: #70757a;
+            margin-top: 10px;
+        }
+
+        .directions-status.error { color: #c5221f; }
+
+        .directions-reopen-btn {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            display: none;
+            align-items: center;
+            gap: 8px;
+            background: #ffffff;
+            border: none;
+            border-radius: 24px;
+            padding: 10px 18px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #1a73e8;
+            box-shadow: 0 2px 8px rgba(32,33,36,0.2);
+            cursor: pointer;
+            z-index: 500;
+        }
+
+        .directions-reopen-btn.visible { display: flex; }
+        .directions-reopen-btn svg { width: 17px; height: 17px; }
+
+        .results-status {
+            margin-left: 134px;
+            padding: 30px 24px;
+            font-size: 14px;
+            color: #70757a;
+        }
+
+        .results-status.error {
+            color: #c5221f;
+        }
+
+        /* PAGINAZIONE STILE GOOGLE (1-10) */
+        .pagination-wrap {
+            display: flex;
+            justify-content: center;
+            padding: 20px 24px 50px;
+        }
+
+        .pagination {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .page-num {
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            font-size: 14px;
+            color: #1a0dab;
+            cursor: pointer;
+        }
+
+        .page-dots {
+            width: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            color: #5f6368;
+            user-select: none;
+        }
+
+        .page-num:hover {
+            background: #f1f3f4;
+        }
+
+        .page-num.current {
+            background: #1a73e8;
+            color: #ffffff;
+            font-weight: 500;
+        }
+
+        .page-nav {
+            font-size: 13px;
+            color: #1a73e8;
+            padding: 6px 14px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .page-nav.disabled {
+            color: #dadce0;
+            cursor: default;
+        }
+
+        .page-nav:hover:not(.disabled) {
+            text-decoration: underline;
+        }
+
+        /* FASCIA GRIGIA IN BASSO */
+        .footer-bar {
+            position: fixed;
+            left: 0;
+            bottom: 0;
+            width: 100%;
+            background-color: #f2f2f2;
+            border-top: 1px solid #e4e4e4;
+            padding: 14px 24px;
+            font-size: 13px;
+            color: #70757a;
+            z-index: 60;
+        }
+
+        /* RESPONSIVE */
+        @media (max-width: 760px) {
+            .top-bar {
+                gap: 10px;
+                padding: 14px 14px 0;
+            }
+            .top-bar-logo svg { width: 90px; }
+            .top-bar-search { min-width: 140px; }
+            .top-bar-right { display: none; }
+            .search-submit-btn { display: none; }
+            .filter-tabs, .results-meta, .results-list, .results-status {
+                margin-left: 0;
+            }
+            .ai-overview {
+                margin: 10px 14px 18px;
+                max-width: 100%;
+            }
+            .filter-tabs { padding: 12px 14px 0; gap: 18px; }
+            .results-meta { padding: 12px 14px 4px; }
+            .results-list { padding: 6px 14px 24px; max-width: 100%; }
+        }
+
+        @media (max-width: 420px) {
+            .top-bar-logo svg { width: 70px; }
+            .top-bar-search { min-width: 100px; }
+            .search-box-small { padding: 0 10px; gap: 6px; }
+            .search-box-small input { font-size: 14px; }
+        }
+
+        /* MODALITÀ SCURA AUTOMATICA */
+        @media (prefers-color-scheme: dark) {
+            body { background-color: #202124; color: #e8eaed; }
+            .search-box-small { background: #303134; border-color: #5f6368; }
+            .search-box-small input { color: #e8eaed; }
+            .search-clear-btn { color: #9aa0a6; }
+            .search-submit-btn {
+                background-color: #303134;
+                border-color: #303134;
+                color: #e8eaed;
+            }
+            .search-submit-btn:hover {
+                background-color: #3c4043;
+                border-color: #5f6368;
+            }
+            .search-clear-btn:hover { color: #e8eaed; }
+            .top-bar-right a { color: #9aa0a6; }
+            .filter-tabs { border-bottom-color: #3c4043; }
+            .filter-tab { color: #9aa0a6; }
+            .filter-tab.active { color: #8ab4f8; border-bottom-color: #8ab4f8; }
+            .results-meta { color: #9aa0a6; }
+            .result-url-line { color: #e8eaed; }
+            .result-url { color: #9aa0a6; }
+            .result-title { color: #8ab4f8; }
+            .result-desc { color: #bdc1c6; }
+            .results-status { color: #9aa0a6; }
+            .page-num { color: #8ab4f8; }
+            .page-dots { color: #9aa0a6; }
+            .page-num:hover { background: #303134; }
+            .page-num.current { background: #8ab4f8; color: #202124; }
+            .page-nav { color: #8ab4f8; }
+            .page-nav.disabled { color: #5f6368; }
+            .footer-bar { background-color: #171717; border-top-color: #3c4043; color: #9aa0a6; }
+            .image-card { background: #303134; }
+            .image-card-caption { color: #9aa0a6; }
+            .video-duration { color: #9aa0a6; }
+            .news-meta { color: #9aa0a6; }
+            .map-frame { border-color: #5f6368; }
+            .map-caption { color: #9aa0a6; }
+            .directions-card { background: #2d2e30; }
+            .directions-title { color: #e8eaed; }
+            .directions-input { background: #3c4043; color: #e8eaed; }
+            .directions-input:focus { background: #45484c; }
+            .directions-input::placeholder { color: #9aa0a6; }
+            .directions-swap-btn { background: #2d2e30; border-color: #5f6368; color: #9aa0a6; }
+            .directions-swap-btn:hover { background: #3c4043; }
+            .directions-btn-secondary { background: #3c4043; color: #e8eaed; }
+            .directions-btn-secondary:hover { background: #45484c; }
+            .directions-status { color: #9aa0a6; }
+            .directions-reopen-btn { background: #2d2e30; color: #8ab4f8; }
+            .ai-overview {
+                background: linear-gradient(135deg, rgba(124,58,237,0.12), rgba(6,182,212,0.12));
+                border-color: rgba(124,58,237,0.35);
+            }
+            .ai-overview-body { color: #e8eaed; }
+            .ai-overview-body.loading,
+            .ai-overview-subtitle,
+            .ai-overview-disclaimer { color: #9aa0a6; }
+            .ai-overview-body-wrap:not(.expanded)::after {
+                background: linear-gradient(to bottom, rgba(45,46,48,0), rgba(32,33,36,0.95));
+            }
+            .ai-overview-toggle { color: #8ab4f8; }
+            .page-suggestions-box {
+                background: #303134;
+                border-color: #5f6368;
+            }
+            .page-suggestion-item {
+                color: #e8eaed;
+            }
+            .page-suggestion-item:hover,
+            .page-suggestion-item.active {
+                background-color: #3c4043;
+            }
+        }
+        /* =====================================================
+           TRADUZIONE AUTOMATICA SILENZIOSA
+           Nasconde completamente il banner e il selettore che il
+           traduttore mostrerebbe normalmente, così la traduzione
+           avviene senza alcun avviso visibile all'utente.
+           ===================================================== */
+        .goog-te-banner-frame,
+        .goog-te-gadget,
+        #google_translate_element,
+        .skiptranslate > iframe {
+            display: none !important;
+            height: 0 !important;
+        }
+
+        body {
+            top: 0 !important;
+            position: relative !important;
+        }
+
+        .goog-tooltip,
+        .goog-tooltip:hover {
+            display: none !important;
+        }
+
+        .goog-text-highlight {
+            background: none !important;
+            box-shadow: none !important;
+        }
+    </style>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+
+    <div class="top-bar">
+        <a href="index.html" class="top-bar-logo" aria-label="Torna alla home iAlgae">
+            <svg viewBox="0 0 190 115" xmlns="http://www.w3.org/2000/svg">
+                <defs>
+                    <linearGradient id="textGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                        <stop offset="0%" stop-color="#4F46E5" /><stop offset="100%" stop-color="#06B6D4" />
+                    </linearGradient>
+                    <linearGradient id="iGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                        <stop offset="0%" stop-color="#06B6D4" /><stop offset="100%" stop-color="#7C3AED" />
+                    </linearGradient>
+                </defs>
+                <text x="10" y="80" font-family="'Poppins', Arial, sans-serif" font-weight="500" font-size="58" fill="url(#iGrad)" letter-spacing="-1">i</text>
+                <text x="29" y="80" font-family="'Poppins', Arial, sans-serif" font-weight="700" font-size="58" fill="url(#textGrad)" letter-spacing="-1">Algae</text>
+            </svg>
+        </a>
+
+        <div class="top-bar-search">
+            <div class="search-box-small">
+                <svg onclick="doNewSearch()" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                <input type="text" id="searchInput" placeholder="Cerca con iAlgae" autocomplete="off">
+                <button type="button" class="search-clear-btn" id="searchClearBtn" aria-label="Cancella">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+            </div>
+            <div class="page-suggestions-box" id="pageSuggestionsBox"></div>
+        </div>
+
+        <button type="button" class="search-submit-btn" id="searchSubmitBtn" onclick="doNewSearch()">Cerca sul web</button>
+
+        <div class="top-bar-right"></div>
+    </div>
+
+    <div class="filter-tabs" id="filterTabs">
+        <div class="filter-tab" data-type="web">Tutti</div>
+        <div class="filter-tab" data-type="images">Immagini</div>
+        <div class="filter-tab" data-type="news">Notizie</div>
+        <div class="filter-tab" data-type="videos">Video</div>
+        <div class="filter-tab" data-type="maps">Maps</div>
+    </div>
+
+    <div class="results-meta" id="resultsMeta"></div>
+
+    <div class="ai-overview" id="aiOverview">
+        <div class="ai-overview-head">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l1.8 5.6L19 9l-5.2 1.4L12 16l-1.8-5.6L5 9l5.2-1.4L12 2z"/><path d="M19 14l.9 2.8L22.7 18l-2.8.9L19 21.7l-.9-2.8-2.8-.9 2.8-.9.9-2.8z"/></svg>
+            <span class="ai-overview-title">iAlgae AI</span>
+        </div>
+        <div class="ai-overview-subtitle">Panoramica informativa</div>
+        <div class="ai-overview-body-wrap" id="aiOverviewWrap">
+            <div class="ai-overview-body loading" id="aiOverviewBody">Sto preparando una panoramica...</div>
+        </div>
+        <button type="button" class="ai-overview-toggle" id="aiOverviewToggle">
+            <span id="aiOverviewToggleLabel">Mostra di più</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div class="ai-overview-disclaimer">Risposta generata automaticamente dall'IA: verifica sempre le informazioni importanti sulle fonti originali qui sotto.</div>
+    </div>
+
+    <div class="results-list" id="resultsList"></div>
+
+    <div class="results-status" id="resultsStatus" style="display:none;"></div>
+
+    <div class="pagination-wrap" id="paginationWrap" style="display:none;">
+        <div class="pagination" id="pagination"></div>
+    </div>
+
+    <div class="footer-bar">
+        Copyright - <span id="currentYear"></span> - iAlgae
+    </div>
+
+<script>
+    // INDIRIZZO DEL TUO SERVER BACKEND (lo stesso usato dal resto del sito).
+    const BACKEND_BASE_URL = 'INSERISCI_QUI_INDIRIZZO_DEL_TUO_SERVER';
+    const backendConfigured = BACKEND_BASE_URL.indexOf('INSERISCI_QUI') === -1;
+
+    document.getElementById('currentYear').textContent = new Date().getFullYear();
+
+    const searchInput = document.getElementById('searchInput');
+    const resultsMeta = document.getElementById('resultsMeta');
+    const resultsList = document.getElementById('resultsList');
+    const resultsStatus = document.getElementById('resultsStatus');
+    const paginationWrap = document.getElementById('paginationWrap');
+    const pagination = document.getElementById('pagination');
+    const filterTabs = document.getElementById('filterTabs');
+
+    const TOTAL_PAGES = 100;
+    const VALID_TYPES = ['web', 'images', 'news', 'videos', 'maps'];
+
+    function getParams() {
+        const params = new URLSearchParams(window.location.search);
+        const q = params.get('q') || '';
+        let page = parseInt(params.get('page'), 10);
+        if (!page || page < 1) page = 1;
+        if (page > TOTAL_PAGES) page = TOTAL_PAGES;
+        let type = (params.get('type') || 'web').toLowerCase();
+        if (VALID_TYPES.indexOf(type) === -1) type = 'web';
+        return { q: q, page: page, type: type };
+    }
+
+    function doNewSearch() {
+        const q = searchInput.value.trim();
+        if (!q) return;
+        const { type } = getParams();
+        window.location.href = 'results.html?q=' + encodeURIComponent(q) + '&type=' + type + '&page=1';
+    }
+
+    searchInput.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            hidePageSuggestions();
+            doNewSearch();
+        }
+    });
+
+    const searchClearBtn = document.getElementById('searchClearBtn');
+
+    function updateClearBtnVisibility() {
+        searchClearBtn.classList.toggle('visible', searchInput.value.length > 0);
+    }
+
+    searchInput.addEventListener('input', updateClearBtnVisibility);
+
+    searchClearBtn.addEventListener('click', function() {
+        searchInput.value = '';
+        updateClearBtnVisibility();
+        searchInput.focus();
+        hidePageSuggestions();
+    });
+
+    // SUGGERIMENTI DI RICERCA IN TEMPO REALE (tramite il tuo server, che interroga DuckDuckGo)
+    const pageSuggestionsBox = document.getElementById('pageSuggestionsBox');
+    let pageSuggestionsDebounce = null;
+    let pageSuggestionsRequestId = 0;
+
+    function hidePageSuggestions() {
+        pageSuggestionsBox.classList.remove('open');
+        pageSuggestionsBox.innerHTML = '';
+    }
+
+    function renderPageSuggestions(items) {
+        if (!items || items.length === 0) {
+            hidePageSuggestions();
+            return;
+        }
+        pageSuggestionsBox.innerHTML = items.slice(0, 10).map(function(text) {
+            const safe = text.replace(/'/g, "\\'");
+            return '<div class="page-suggestion-item" onclick="selectPageSuggestion(\'' + safe + '\')">' +
+                '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>' +
+                text +
+                '</div>';
+        }).join('');
+        pageSuggestionsBox.classList.add('open');
+    }
+
+    function selectPageSuggestion(text) {
+        searchInput.value = text;
+        hidePageSuggestions();
+        doNewSearch();
+    }
+
+    async function fetchPageSuggestions(val) {
+        const myRequestId = ++pageSuggestionsRequestId;
+        if (!backendConfigured) return;
+        try {
+            const response = await fetch(BACKEND_BASE_URL + '/api/suggest?q=' + encodeURIComponent(val), {
+                signal: AbortSignal.timeout(3500)
+            });
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            const data = await response.json();
+            if (myRequestId !== pageSuggestionsRequestId) return;
+            renderPageSuggestions(Array.isArray(data.suggestions) ? data.suggestions : []);
+        } catch (err) {
+            if (myRequestId !== pageSuggestionsRequestId) return;
+            hidePageSuggestions();
+        }
+    }
+
+    searchInput.addEventListener('input', function() {
+        const val = searchInput.value.trim();
+        if (pageSuggestionsDebounce) clearTimeout(pageSuggestionsDebounce);
+        if (val.length === 0) {
+            pageSuggestionsRequestId++;
+            hidePageSuggestions();
+            return;
+        }
+        pageSuggestionsDebounce = setTimeout(function() {
+            fetchPageSuggestions(val);
+        }, 180);
+    });
+
+    document.addEventListener('click', function(e) {
+        if (!e.target.closest('.top-bar-search')) {
+            hidePageSuggestions();
+        }
+    });
+
+    // NAVIGAZIONE DEI SUGGERIMENTI CON LE FRECCE DELLA TASTIERA
+    let activePageSuggestionIndex = -1;
+
+    function getPageSuggestionItems() {
+        return Array.from(pageSuggestionsBox.querySelectorAll('.page-suggestion-item'));
+    }
+
+    function highlightPageSuggestion(items, index) {
+        items.forEach(function(item) { item.classList.remove('active'); });
+        if (index >= 0 && index < items.length) {
+            items[index].classList.add('active');
+            items[index].scrollIntoView({ block: 'nearest' });
+        }
+    }
+
+    searchInput.addEventListener('keydown', function(e) {
+        const isOpen = pageSuggestionsBox.classList.contains('open');
+        if (!isOpen) return;
+        const items = getPageSuggestionItems();
+        if (items.length === 0) return;
+
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            activePageSuggestionIndex = (activePageSuggestionIndex + 1) % items.length;
+            highlightPageSuggestion(items, activePageSuggestionIndex);
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            activePageSuggestionIndex = (activePageSuggestionIndex - 1 + items.length) % items.length;
+            highlightPageSuggestion(items, activePageSuggestionIndex);
+        } else if (e.key === 'Enter' && activePageSuggestionIndex >= 0 && activePageSuggestionIndex < items.length) {
+            e.preventDefault();
+            items[activePageSuggestionIndex].click();
+            activePageSuggestionIndex = -1;
+        } else if (e.key === 'Escape') {
+            hidePageSuggestions();
+            activePageSuggestionIndex = -1;
+        }
+    });
+
+    searchInput.addEventListener('input', function() {
+        activePageSuggestionIndex = -1;
+    });
+
+    function setupTabs(currentType, query) {
+        const tabs = filterTabs.querySelectorAll('.filter-tab');
+        tabs.forEach(function(tab) {
+            tab.classList.toggle('active', tab.dataset.type === currentType);
+            tab.onclick = function() {
+                window.location.href = 'results.html?q=' + encodeURIComponent(query) + '&type=' + tab.dataset.type + '&page=1';
+            };
+        });
+    }
+
+    function getPageWindow(current, total) {
+        const delta = 2;
+        const range = [];
+        const withDots = [];
+        let last = null;
+
+        for (let i = 1; i <= total; i++) {
+            if (i === 1 || i === total || (i >= current - delta && i <= current + delta)) {
+                range.push(i);
+            }
+        }
+
+        range.forEach(function(i) {
+            if (last !== null) {
+                if (i - last === 2) {
+                    withDots.push(last + 1);
+                } else if (i - last > 1) {
+                    withDots.push('...');
+                }
+            }
+            withDots.push(i);
+            last = i;
+        });
+
+        return withDots;
+    }
+
+    function renderPagination(currentPage, query, type) {
+        pagination.innerHTML = '';
+
+        const prevLink = document.createElement('div');
+        prevLink.className = 'page-nav' + (currentPage <= 1 ? ' disabled' : '');
+        prevLink.textContent = '‹ Indietro';
+        if (currentPage > 1) {
+            prevLink.onclick = function() {
+                window.location.href = 'results.html?q=' + encodeURIComponent(query) + '&type=' + type + '&page=' + (currentPage - 1);
+            };
+        }
+        pagination.appendChild(prevLink);
+
+        getPageWindow(currentPage, TOTAL_PAGES).forEach(function(item) {
+            if (item === '...') {
+                const dots = document.createElement('div');
+                dots.className = 'page-dots';
+                dots.textContent = '…';
+                pagination.appendChild(dots);
+                return;
+            }
+            const num = document.createElement('div');
+            num.className = 'page-num' + (item === currentPage ? ' current' : '');
+            num.textContent = item;
+            num.onclick = function() {
+                window.location.href = 'results.html?q=' + encodeURIComponent(query) + '&type=' + type + '&page=' + item;
+            };
+            pagination.appendChild(num);
+        });
+
+        const nextLink = document.createElement('div');
+        nextLink.className = 'page-nav' + (currentPage >= TOTAL_PAGES ? ' disabled' : '');
+        nextLink.textContent = 'Avanti ›';
+        if (currentPage < TOTAL_PAGES) {
+            nextLink.onclick = function() {
+                window.location.href = 'results.html?q=' + encodeURIComponent(query) + '&type=' + type + '&page=' + (currentPage + 1);
+            };
+        }
+        pagination.appendChild(nextLink);
+
+        paginationWrap.style.display = 'flex';
+    }
+
+    function extractSiteName(url) {
+        try {
+            const u = new URL(url);
+            return u.hostname.replace(/^www\./, '');
+        } catch (e) {
+            return url;
+        }
+    }
+
+    function renderWebResults(results) {
+        resultsList.innerHTML = '';
+        results.forEach(function(r) {
+            const item = document.createElement('div');
+            item.className = 'result-item';
+            item.innerHTML =
+                '<div class="result-url-line">' +
+                    '<span class="result-site">' + extractSiteName(r.url) + '</span>' +
+                    '<span class="result-url">' + r.url + '</span>' +
+                '</div>' +
+                '<a class="result-title" href="' + r.url + '" target="_blank" rel="noopener">' + r.title + '</a>' +
+                '<div class="result-desc">' + r.description + '</div>';
+            resultsList.appendChild(item);
+        });
+    }
+
+    function renderImageResults(results) {
+        resultsList.classList.add('images-mode');
+        resultsList.innerHTML = '<div class="images-grid"></div>';
+        const grid = resultsList.querySelector('.images-grid');
+        results.forEach(function(r) {
+            if (!r.imageUrl) return;
+            const card = document.createElement('a');
+            card.className = 'image-card';
+            card.href = r.url;
+            card.target = '_blank';
+            card.rel = 'noopener';
+            card.innerHTML =
+                '<img src="' + r.imageUrl + '" alt="' + (r.title || '') + '" loading="lazy">' +
+                '<div class="image-card-caption">' + (r.source || extractSiteName(r.url)) + '</div>';
+            grid.appendChild(card);
+        });
+    }
+
+    function renderNewsResults(results) {
+        resultsList.innerHTML = '';
+        results.forEach(function(r) {
+            const item = document.createElement('div');
+            item.className = 'result-item';
+            item.innerHTML =
+                '<div class="news-meta">' + (r.source || extractSiteName(r.url)) + (r.age ? ' · ' + r.age : '') + '</div>' +
+                '<a class="result-title" href="' + r.url + '" target="_blank" rel="noopener">' + r.title + '</a>' +
+                '<div class="result-desc">' + r.description + '</div>';
+            resultsList.appendChild(item);
+        });
+    }
+
+    function renderVideoResults(results) {
+        resultsList.innerHTML = '';
+        results.forEach(function(r) {
+            const item = document.createElement('a');
+            item.className = 'video-item';
+            item.href = r.url;
+            item.target = '_blank';
+            item.rel = 'noopener';
+            item.innerHTML =
+                (r.thumbnail ? '<img class="video-thumb" src="' + r.thumbnail + '" alt="" loading="lazy">' : '<div class="video-thumb"></div>') +
+                '<div>' +
+                    (r.duration ? '<div class="video-duration">' + r.duration + '</div>' : '') +
+                    '<div class="result-title">' + r.title + '</div>' +
+                    '<div class="result-desc">' + (r.description || '') + '</div>' +
+                '</div>';
+            resultsList.appendChild(item);
+        });
+    }
+
+    // La scheda "Maps" non passa dal backend/Brave: usiamo OpenStreetMap (gratuito,
+    // senza chiave API) per geocodificare i luoghi, Leaflet per mostrare la mappa
+    // interattiva, e OSRM (motore di instradamento open source) per calcolare il
+    // percorso tra due punti quando l'utente lo richiede.
+    let leafletMap = null;
+    let currentMarker = null;
+    let routeLine = null;
+    let pointACoords = null; // { lat, lon, label }
+
+    function ensureLeafletMap() {
+        if (leafletMap) {
+            leafletMap.invalidateSize();
+            return;
+        }
+        leafletMap = L.map('mapCanvas', { zoomControl: true });
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap',
+            maxZoom: 19
+        }).addTo(leafletMap);
+    }
+
+    function renderMapFrame(lat, lon, label) {
+        resultsStatus.style.display = 'none';
+        resultsList.innerHTML =
+            '<div class="map-wrap">' +
+                '<div class="map-frame" id="mapCanvas"></div>' +
+
+                '<div class="directions-card" id="directionsCard">' +
+                    '<div class="directions-head">' +
+                        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="9"/></svg>' +
+                        '<span class="directions-title">Indicazioni stradali</span>' +
+                    '</div>' +
+                    '<div class="directions-fields">' +
+                        '<input type="text" class="directions-input" id="directionsFrom" value="' + (label || '') + '" placeholder="Punto di partenza">' +
+                        '<input type="text" class="directions-input" id="directionsTo" placeholder="A (es. Milano)">' +
+                        '<button type="button" class="directions-swap-btn" id="directionsSwapBtn" title="Inverti">' +
+                            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 7h13l-4-4"/><path d="M17 17H4l4 4"/></svg>' +
+                        '</button>' +
+                    '</div>' +
+                    '<div class="directions-buttons">' +
+                        '<button type="button" class="directions-btn-primary" id="directionsCalcBtn">Calcola percorso</button>' +
+                        '<button type="button" class="directions-btn-secondary" id="directionsCloseBtn">Chiudi</button>' +
+                    '</div>' +
+                    '<div class="directions-status" id="directionsStatus" style="display:none;"></div>' +
+                '</div>' +
+
+                '<button type="button" class="directions-reopen-btn" id="directionsReopenBtn">' +
+                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="9"/></svg>' +
+                    'Indicazioni' +
+                '</button>' +
+
+                '<div class="map-caption">' + (label || '') + ' — dati mappa © OpenStreetMap, percorsi © OSRM</div>' +
+            '</div>';
+
+        pointACoords = { lat: lat, lon: lon, label: label || '' };
+
+        ensureLeafletMap();
+        leafletMap.setView([lat, lon], 14);
+        if (currentMarker) leafletMap.removeLayer(currentMarker);
+        currentMarker = L.marker([lat, lon]).addTo(leafletMap);
+        if (routeLine) { leafletMap.removeLayer(routeLine); routeLine = null; }
+
+        setupDirectionsCard();
+    }
+
+    function setupDirectionsCard() {
+        const card = document.getElementById('directionsCard');
+        const reopenBtn = document.getElementById('directionsReopenBtn');
+        const closeBtn = document.getElementById('directionsCloseBtn');
+        const swapBtn = document.getElementById('directionsSwapBtn');
+        const calcBtn = document.getElementById('directionsCalcBtn');
+        const fromInput = document.getElementById('directionsFrom');
+        const toInput = document.getElementById('directionsTo');
+        const statusEl = document.getElementById('directionsStatus');
+
+        closeBtn.addEventListener('click', function() {
+            card.style.display = 'none';
+            reopenBtn.classList.add('visible');
+        });
+
+        reopenBtn.addEventListener('click', function() {
+            card.style.display = 'block';
+            reopenBtn.classList.remove('visible');
+        });
+
+        swapBtn.addEventListener('click', function() {
+            const tmp = fromInput.value;
+            fromInput.value = toInput.value;
+            toInput.value = tmp;
+        });
+
+        calcBtn.addEventListener('click', function() {
+            calculateRoute(fromInput.value.trim(), toInput.value.trim(), statusEl, calcBtn);
+        });
+    }
+
+    // Geocodifica un indirizzo tramite Nominatim (OpenStreetMap), gratuito e senza chiave
+    async function geocodePlace(text) {
+        const res = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(text));
+        const data = await res.json();
+        if (!data || data.length === 0) return null;
+        return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon), label: data[0].display_name };
+    }
+
+    async function calculateRoute(fromText, toText, statusEl, calcBtn) {
+        if (!toText) {
+            statusEl.style.display = 'block';
+            statusEl.classList.add('error');
+            statusEl.textContent = 'Scrivi una destinazione per calcolare il percorso.';
+            return;
+        }
+
+        statusEl.style.display = 'block';
+        statusEl.classList.remove('error');
+        statusEl.textContent = 'Calcolo il percorso...';
+        calcBtn.disabled = true;
+
+        try {
+            // Punto di partenza: se corrisponde ancora al luogo già geocodificato lo riusiamo,
+            // altrimenti (l'utente lo ha modificato) lo geocodifichiamo di nuovo.
+            let fromPoint = pointACoords;
+            if (!fromPoint || fromText !== (pointACoords.label || '')) {
+                fromPoint = await geocodePlace(fromText || fromPoint.label);
+            }
+            const toPoint = await geocodePlace(toText);
+
+            if (!fromPoint || !toPoint) {
+                statusEl.classList.add('error');
+                statusEl.textContent = 'Non riesco a trovare uno dei due indirizzi indicati.';
+                calcBtn.disabled = false;
+                return;
+            }
+
+            // OSRM: motore di instradamento open source gratuito (server demo pubblico,
+            // adatto a un uso normale ma non garantito per un traffico molto elevato)
+            const osrmUrl = 'https://router.project-osrm.org/route/v1/driving/' +
+                fromPoint.lon + ',' + fromPoint.lat + ';' + toPoint.lon + ',' + toPoint.lat +
+                '?overview=full&geometries=geojson';
+
+            const routeRes = await fetch(osrmUrl);
+            const routeData = await routeRes.json();
+
+            if (!routeData.routes || routeData.routes.length === 0) {
+                statusEl.classList.add('error');
+                statusEl.textContent = 'Nessun percorso trovato tra questi due punti.';
+                calcBtn.disabled = false;
+                return;
+            }
+
+            const route = routeData.routes[0];
+            const coords = route.geometry.coordinates.map(function(c) { return [c[1], c[0]]; });
+
+            if (routeLine) leafletMap.removeLayer(routeLine);
+            routeLine = L.polyline(coords, { color: '#1a73e8', weight: 5 }).addTo(leafletMap);
+
+            if (currentMarker) leafletMap.removeLayer(currentMarker);
+            currentMarker = L.marker([fromPoint.lat, fromPoint.lon]).addTo(leafletMap);
+            L.marker([toPoint.lat, toPoint.lon]).addTo(leafletMap);
+
+            leafletMap.fitBounds(routeLine.getBounds(), { padding: [40, 40] });
+
+            const km = (route.distance / 1000).toFixed(1);
+            const minutes = Math.round(route.duration / 60);
+            statusEl.classList.remove('error');
+            statusEl.textContent = 'Distanza: ' + km + ' km — Tempo stimato: ' + minutes + ' min';
+
+        } catch (err) {
+            statusEl.classList.add('error');
+            statusEl.textContent = 'Servizio di instradamento non raggiungibile al momento.';
+        } finally {
+            calcBtn.disabled = false;
+        }
+    }
+
+    function showMapFromMyLocation() {
+        resultsStatus.textContent = 'Trovo la tua posizione...';
+        if (!navigator.geolocation) {
+            resultsStatus.classList.add('error');
+            resultsStatus.textContent = 'Geolocalizzazione non disponibile su questo dispositivo.';
+            return;
+        }
+        navigator.geolocation.getCurrentPosition(
+            function(pos) {
+                renderMapFrame(pos.coords.latitude, pos.coords.longitude, 'La tua posizione');
+            },
+            function() {
+                // Permesso negato: mostriamo comunque una mappa generale invece di un errore bloccante
+                renderMapFrame(41.9, 12.5, 'Italia');
+            },
+            { timeout: 8000 }
+        );
+    }
+
+    async function renderMapResults(query) {
+        resultsStatus.style.display = 'block';
+        resultsStatus.classList.remove('error');
+        resultsList.innerHTML = '';
+        resultsList.classList.add('map-mode');
+        paginationWrap.style.display = 'none';
+
+        // Nessuna ricerca specifica: mostriamo subito la mappa in base alla posizione
+        // dell'utente, senza obbligarlo a scrivere qualcosa nella casella di ricerca.
+        if (!query) {
+            showMapFromMyLocation();
+            return;
+        }
+
+        resultsStatus.textContent = 'Cerco il luogo su OpenStreetMap...';
+
+        try {
+            const geoRes = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(query));
+            const geoData = await geoRes.json();
+
+            if (!geoData || geoData.length === 0) {
+                resultsStatus.classList.add('error');
+                resultsStatus.textContent = 'Nessun luogo trovato per "' + query + '".';
+                return;
+            }
+
+            const place = geoData[0];
+            renderMapFrame(parseFloat(place.lat), parseFloat(place.lon), place.display_name || query);
+
+        } catch (err) {
+            resultsStatus.classList.add('error');
+            resultsStatus.style.display = 'block';
+            resultsStatus.textContent = 'Servizio mappe non raggiungibile al momento.';
+        }
+    }
+
+    // PANORAMICA INFORMATIVA "IALGAE AI" (come l'AI Overview di Google)
+    // Genera un breve riassunto tramite l'IA basandosi sulla domanda e sui primi risultati trovati.
+    const aiOverview = document.getElementById('aiOverview');
+    const aiOverviewBody = document.getElementById('aiOverviewBody');
+    const aiOverviewWrap = document.getElementById('aiOverviewWrap');
+    const aiOverviewToggle = document.getElementById('aiOverviewToggle');
+    const aiOverviewToggleLabel = document.getElementById('aiOverviewToggleLabel');
+
+    function hideAiOverview() {
+        aiOverview.classList.remove('visible');
+        aiOverviewWrap.classList.remove('expanded');
+        aiOverviewToggle.classList.remove('expanded');
+        aiOverviewToggleLabel.textContent = 'Mostra di più';
+    }
+
+    aiOverviewToggle.addEventListener('click', function() {
+        const isExpanded = aiOverviewWrap.classList.toggle('expanded');
+        aiOverviewToggle.classList.toggle('expanded', isExpanded);
+        aiOverviewToggleLabel.textContent = isExpanded ? 'Mostra di meno' : 'Mostra di più';
+    });
+
+    async function loadAiOverview(query, webResults) {
+        if (!backendConfigured) return;
+
+        aiOverview.classList.add('visible');
+        aiOverviewWrap.classList.remove('expanded');
+        aiOverviewToggle.classList.remove('expanded');
+        aiOverviewToggleLabel.textContent = 'Mostra di più';
+        aiOverviewBody.classList.add('loading');
+        aiOverviewBody.textContent = 'Sto preparando una panoramica...';
+
+        const context = (webResults || []).slice(0, 3).map(function(r) {
+            return '- ' + r.title + ': ' + r.description;
+        }).join('\n');
+
+        const prompt = 'Rispondi in italiano, in modo chiaro, conciso (massimo 4-5 frasi) e informativo alla ricerca: "' + query + '". ' +
+            'Scrivi in testo semplice, senza usare formattazione markdown (niente #, **, elenchi puntati con trattini). ' +
+            'Se utile, tieni conto anche di queste informazioni trovate sul web (ma non citarle testualmente, riformula con parole tue):\n' + context;
+
+        try {
+            const response = await fetch(BACKEND_BASE_URL + '/api/ask', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question: prompt })
+            });
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.error || ('HTTP ' + response.status));
+            }
+
+            aiOverviewBody.classList.remove('loading');
+            const cleanAnswer = (data.answer || 'Nessuna panoramica disponibile per questa ricerca.')
+                .replace(/^#{1,6}\s*/gm, '')
+                .replace(/\*\*(.*?)\*\*/g, '$1')
+                .replace(/\*(.*?)\*/g, '$1')
+                .replace(/^[-*]\s+/gm, '• ')
+                .replace(/#/g, '');
+            aiOverviewBody.textContent = cleanAnswer;
+        } catch (err) {
+            // Se la panoramica non si riesce a generare, nascondiamo semplicemente il riquadro
+            // invece di mostrare un errore: i risultati normali restano comunque disponibili.
+            hideAiOverview();
+        }
+    }
+
+    async function loadResults() {
+        const { q, page, type } = getParams();
+        searchInput.value = q;
+        updateClearBtnVisibility();
+        setupTabs(type, q);
+        paginationWrap.style.display = 'none';
+        hideAiOverview();
+        resultsList.classList.remove('map-mode');
+        resultsList.classList.remove('images-mode');
+
+        // La scheda Maps funziona anche senza una ricerca scritta: in quel caso
+        // mostra la mappa in base alla posizione dell'utente (gestito più sotto).
+        if (!q && type !== 'maps') {
+            resultsStatus.style.display = 'block';
+            resultsStatus.textContent = 'Scrivi qualcosa nella casella di ricerca qui sopra.';
+            return;
+        }
+
+        if (!q && type === 'maps') {
+            document.title = 'Maps - iAlgae';
+            resultsMeta.textContent = '';
+            await renderMapResults(null);
+            return;
+        }
+
+        document.title = q + ' - Ricerca iAlgae';
+        resultsMeta.textContent = 'Risultati per: ' + q;
+
+        // La scheda Maps non richiede il backend: è gestita interamente da OpenStreetMap.
+        if (type === 'maps') {
+            await renderMapResults(q);
+            return;
+        }
+
+        if (!backendConfigured) {
+            resultsStatus.classList.add('error');
+            resultsStatus.style.display = 'block';
+            resultsStatus.textContent = 'Il server non è ancora collegato. Inserisci l\'URL corretto nella variabile BACKEND_BASE_URL in questo file.';
+            return;
+        }
+
+        // Il motore di ricerca usato (Brave Search) fornisce risultati reali solo fino
+        // alla pagina 10: oltre questo limite non ci sono altri dati da mostrare.
+        const REAL_RESULTS_LIMIT = 10;
+        if (page > REAL_RESULTS_LIMIT && type !== 'maps' && type !== 'images') {
+            resultsList.innerHTML = '';
+            resultsStatus.classList.remove('error');
+            resultsStatus.style.display = 'block';
+            resultsStatus.textContent = 'Il motore di ricerca non fornisce altri risultati oltre la pagina ' + REAL_RESULTS_LIMIT + ' per questa ricerca. Prova a modificare i termini di ricerca per trovare contenuti più specifici.';
+            renderPagination(page, q, type);
+            return;
+        }
+
+        resultsStatus.classList.remove('error');
+        resultsStatus.style.display = 'block';
+        resultsStatus.textContent = 'Ricerca in corso...';
+
+        try {
+            const response = await fetch(BACKEND_BASE_URL + '/api/search?q=' + encodeURIComponent(q) + '&type=' + type + '&page=' + page);
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.error || ('HTTP ' + response.status));
+            }
+
+            if (!data.results || data.results.length === 0) {
+                resultsList.innerHTML = '';
+                resultsStatus.style.display = 'block';
+                resultsStatus.textContent = 'Nessun risultato trovato per "' + q + '".';
+                return;
+            }
+
+            resultsStatus.style.display = 'none';
+
+            if (type === 'images') {
+                renderImageResults(data.results);
+            } else if (type === 'news') {
+                renderNewsResults(data.results);
+            } else if (type === 'videos') {
+                renderVideoResults(data.results);
+            } else {
+                renderWebResults(data.results);
+                // La panoramica IA ha senso solo per la ricerca web generale, in prima pagina
+                if (page === 1) {
+                    loadAiOverview(q, data.results);
+                }
+            }
+
+            if (data.totalPages && data.totalPages > 1) {
+                renderPagination(page, q, type);
+            }
+
+        } catch (err) {
+            resultsStatus.classList.add('error');
+            resultsStatus.style.display = 'block';
+            resultsStatus.textContent = 'Errore nel recuperare i risultati. (' + err.message + ')';
+        }
+    }
+
+    loadResults();
+</script>
+
+<!-- TRADUZIONE AUTOMATICA SILENZIOSA (nessun banner visibile) -->
+<div id="google_translate_element" style="display:none;"></div>
+<script>
+    // Lingua originale in cui è scritto il sito
+    var SITE_SOURCE_LANGUAGE = 'it';
+
+    function googleTranslateElementInit() {
+        new google.translate.TranslateElement({
+            pageLanguage: SITE_SOURCE_LANGUAGE,
+            autoDisplay: false
+        }, 'google_translate_element');
+
+        // Dopo che il widget è pronto, traduciamo automaticamente
+        // solo se la lingua del dispositivo è una di quelle richieste.
+        var SUPPORTED_LANGUAGES = ['en', 'fr', 'es', 'pt', 'zh', 'ar'];
+        var browserLang = (navigator.language || navigator.userLanguage || SITE_SOURCE_LANGUAGE).toLowerCase();
+        var langCode = browserLang.split('-')[0];
+
+        if (SUPPORTED_LANGUAGES.indexOf(langCode) === -1) {
+            return; // lingua non tra quelle richieste: il sito resta in italiano
+        }
+
+        var specialCodes = { 'zh': 'zh-CN' };
+        if (specialCodes[langCode]) {
+            langCode = specialCodes[langCode];
+        }
+
+        applyAutoTranslation(langCode);
+    }
+
+    function applyAutoTranslation(langCode) {
+        var attempts = 0;
+        var interval = setInterval(function () {
+            attempts++;
+            var combo = document.querySelector('select.goog-te-combo');
+            if (combo) {
+                combo.value = langCode;
+                combo.dispatchEvent(new Event('change'));
+                clearInterval(interval);
+            } else if (attempts > 40) {
+                clearInterval(interval);
+            }
+        }, 250);
+    }
+</script>
+<script src="https://translate.google.com/translate_a/element.js?cb=googleTranslateElementInit"></script>
+
+</body>
+</html>
