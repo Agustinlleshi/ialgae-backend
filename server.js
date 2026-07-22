@@ -369,7 +369,8 @@ const server = http.createServer((req, res) => {
                             url: r.url || '',
                             description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, ''),
                             source: (r.meta_url && r.meta_url.hostname) || extractHost(r.url),
-                            age: r.age || ''
+                            age: r.age || '',
+                            thumbnail: (r.thumbnail && r.thumbnail.src) || ''
                         };
                     });
                 } else if (type === 'videos') {
