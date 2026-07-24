@@ -47,6 +47,7 @@ const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
 const MAX_QUESTION_LENGTH = 2000;
 const MAX_IMAGE_BASE64_LENGTH = 6000000; // ~4.5 MB di immagine decodificata
 const RESULTS_PER_PAGE = 10;
+const IMAGES_COUNT = 100; // per le immagini vogliamo molti più risultati in un'unica richiesta
 
 function extractHost(url) {
     try {
@@ -321,7 +322,8 @@ const server = http.createServer((req, res) => {
 
                 // Le Immagini di Brave non supportano la paginazione con "offset": restituiscono
                 // sempre la prima pagina di risultati, quindi la omettiamo per quel tipo.
-                let searchUrl = endpoints[type] + '?q=' + encodeURIComponent(q) + '&count=' + RESULTS_PER_PAGE + '&country=it&search_lang=it';
+                const countForType = (type === 'images') ? IMAGES_COUNT : RESULTS_PER_PAGE;
+                let searchUrl = endpoints[type] + '?q=' + encodeURIComponent(q) + '&count=' + countForType + '&country=it&search_lang=it';
                 if (type !== 'images') {
                     searchUrl += '&offset=' + offset;
                 }
@@ -401,6 +403,7 @@ const server = http.createServer((req, res) => {
         })();
         return;
     }
+
 
     sendJSON(res, 404, { error: 'Percorso non trovato.' });
 });
