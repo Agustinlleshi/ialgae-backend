@@ -80,9 +80,11 @@ const server = http.createServer((req, res) => {
     }
 
     // Pagina di controllo per verificare che il server sia attivo
-    if (req.method === 'GET' && req.url === '/') {
+    // (risponde sia a GET, per chi visita col browser, sia a HEAD, usata da
+    // servizi di monitoraggio come UptimeRobot per verificare che sia sveglio)
+    if (req.url === '/' && (req.method === 'GET' || req.method === 'HEAD')) {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('Server iAlgae attivo. Endpoint disponibili: POST /api/ask , GET /api/suggest?q=...');
+        return res.end(req.method === 'HEAD' ? undefined : 'Server iAlgae attivo. Endpoint disponibili: POST /api/ask , GET /api/suggest?q=...');
     }
 
     // Endpoint suggerimenti di ricerca in tempo reale (proxy verso DuckDuckGo)
