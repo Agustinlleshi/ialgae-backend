@@ -37,20 +37,8 @@
 // 1. Vai su https://api.search.brave.com/register
 // 2. Crea un account gratuito e genera una API Key dalla dashboard
 // 3. Incollala qui sopra come variabile d'ambiente BRAVE_API_KEY
-//
-// NOTA SUL LOGIN CON GOOGLE (aggiunto in questa versione):
-// Questo file NON è più a "zero dipendenze": servono due pacchetti in più.
-// 1. Nella cartella del backend esegui: npm install google-auth-library jsonwebtoken
-//    (se non hai ancora un package.json, "npm install" te lo crea da solo)
-// 2. Su Render, in "Environment Variables" aggiungi anche:
-//      - SESSION_SECRET = una stringa lunga e casuale, inventata da te (es. generata
-//        con un password manager) — serve a firmare le sessioni di chi fa login
-// 3. Il Client ID di Google è già inserito qui sotto (GOOGLE_CLIENT_ID), preso dal
-//    tuo progetto "ialgae ia" su Google Cloud Console.
 
 const http = require('http');
-const { OAuth2Client } = require('google-auth-library');
-const jwt = require('jsonwebtoken');
 
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -60,34 +48,6 @@ const MAX_QUESTION_LENGTH = 2000;
 const MAX_IMAGE_BASE64_LENGTH = 6000000; // ~4.5 MB di immagine decodificata
 const RESULTS_PER_PAGE = 10;
 const IMAGES_COUNT = 100; // per le immagini vogliamo molti più risultati in un'unica richiesta
-
-// ---- LOGIN CON GOOGLE + LIMITE MESSAGGI GIORNALIERI ----
-const GOOGLE_CLIENT_ID = '897588931636-i6f4hn49mbicag9r46u5pmdf4su0dag9.apps.googleusercontent.com';
-// SESSION_SECRET va impostata come variabile d'ambiente su Render (stesso posto di
-// ANTHROPIC_API_KEY): una stringa lunga e casuale, inventata da te, che non condividi con nessuno.
-const SESSION_SECRET = process.env.SESSION_SECRET || 'cambia-questa-stringa-su-render';
-const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
-
-const MAX_DAILY_MESSAGES = 10;
-const RATE_LIMIT_WINDOW_MS = 6 * 60 * 60 * 1000; // 6 ore
-
-// Archivio utenti "temporaneo": vive solo finché il server resta acceso.
-// Ogni riavvio del server (frequente su Render, piano gratuito) lo svuota.
-// Quando vorrai account permanenti e chi ha pagato il Pro salvato per sempre,
-// va sostituito con un vero database (es. Postgres su Render).
-const users = new Map(); // chiave: Google "sub" -> { sub, email, name, picture, isPro, messageCount, windowStart }
-
-function getUserFromRequest(req) {
-    const authHeader = req.headers['authorization'] || '';
-    const token = authHeader.replace('Bearer ', '').trim();
-    if (!token) return null;
-    try {
-        const decoded = jwt.verify(token, SESSION_SECRET);
-        return users.get(decoded.sub) || null;
-    } catch (err) {
-        return null;
-    }
-}
 
 function extractHost(url) {
     try {
@@ -103,7 +63,7 @@ function sendJSON(res, statusCode, data) {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+        'Access-Control-Allow-Headers': 'Content-Type'
     });
     res.end(body);
 }
@@ -113,8 +73,8 @@ const server = http.createServer((req, res) => {
     if (req.method === 'OPTIONS') {
         res.writeHead(204, {
             'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type'
         });
         return res.end();
     }
@@ -160,63 +120,6 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // Rotta di login: il sito manda qui il token che riceve da Google
-    if (req.method === 'POST' && req.url === '/api/auth/google') {
-        let body = '';
-        req.on('data', function (chunk) { body += chunk; });
-        req.on('end', async function () {
-            try {
-                let payload;
-                try {
-                    payload = JSON.parse(body || '{}');
-                } catch (parseErr) {
-                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
-                }
-
-                const credential = payload.credential;
-                if (!credential || typeof credential !== 'string') {
-                    return sendJSON(res, 400, { error: 'Token mancante.' });
-                }
-
-                const ticket = await googleClient.verifyIdToken({
-                    idToken: credential,
-                    audience: GOOGLE_CLIENT_ID
-                });
-                const googlePayload = ticket.getPayload(); // { sub, email, name, picture, ... }
-
-                let user = users.get(googlePayload.sub);
-                if (!user) {
-                    user = {
-                        sub: googlePayload.sub,
-                        email: googlePayload.email,
-                        name: googlePayload.name,
-                        picture: googlePayload.picture,
-                        isPro: false,
-                        messageCount: 0,
-                        windowStart: Date.now()
-                    };
-                    users.set(googlePayload.sub, user);
-                }
-
-                const sessionToken = jwt.sign(
-                    { sub: user.sub },
-                    SESSION_SECRET,
-                    { expiresIn: '30d' }
-                );
-
-                return sendJSON(res, 200, {
-                    sessionToken: sessionToken,
-                    user: { email: user.email, name: user.name, picture: user.picture, isPro: user.isPro }
-                });
-
-            } catch (err) {
-                console.error('Errore verifica login Google:', err);
-                return sendJSON(res, 401, { error: 'Token non valido.' });
-            }
-        });
-        return;
-    }
-
     // Endpoint principale usato dal sito (supporta conversazioni multi-turno)
     if (req.method === 'POST' && req.url === '/api/ask') {
         let body = '';
@@ -239,27 +142,6 @@ const server = http.createServer((req, res) => {
                 if (question.length > MAX_QUESTION_LENGTH) {
                     return sendJSON(res, 400, { error: 'Domanda troppo lunga.' });
                 }
-
-                // Serve essere loggati con Google per usare l'assistente
-                const user = getUserFromRequest(req);
-                if (!user) {
-                    return sendJSON(res, 401, { error: 'not_logged_in', message: 'Accedi con Google per continuare.' });
-                }
-
-                // Limite di messaggi giornalieri (salta il controllo per chi ha il Pro)
-                if (Date.now() - user.windowStart > RATE_LIMIT_WINDOW_MS) {
-                    user.messageCount = 0;
-                    user.windowStart = Date.now();
-                }
-                if (!user.isPro && user.messageCount >= MAX_DAILY_MESSAGES) {
-                    return sendJSON(res, 429, {
-                        error: 'limit_reached',
-                        message: 'Hai raggiunto il numero massimo di messaggi giornalieri.',
-                        unlockAt: new Date(user.windowStart + RATE_LIMIT_WINDOW_MS).toISOString()
-                    });
-                }
-                user.messageCount += 1;
-
                 if (!ANTHROPIC_API_KEY) {
                     return sendJSON(res, 500, { error: 'Chiave API non configurata sul server.' });
                 }
