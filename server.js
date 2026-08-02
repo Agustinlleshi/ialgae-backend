@@ -47,7 +47,7 @@ const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
 const MAX_QUESTION_LENGTH = 2000;
 const MAX_IMAGE_BASE64_LENGTH = 6000000; // ~4.5 MB di immagine decodificata
 const RESULTS_PER_PAGE = 10;
-const IMAGES_COUNT = 100; // per le immagini vogliamo molti più risultati in un'unica richiesta
+const IMAGES_COUNT = 200; // per le immagini vogliamo molti più risultati in un'unica richiesta
 
 function extractHost(url) {
     try {
