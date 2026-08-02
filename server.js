@@ -43,8 +43,7 @@
 // 1. Nella cartella del backend esegui: npm install google-auth-library jsonwebtoken
 //    (se non hai ancora un package.json, "npm install" te lo crea da solo)
 // 2. Su Render, in "Environment Variables" aggiungi anche:
-//      - SESSION_SECRET = una stringa lunga e casuale, inventata da te (es. generata
-//        con un password manager) — serve a firmare le sessioni di chi fa login
+//      - SESSION_SECRET = xT8!mQ2$zR9#wL4_vP7&kK3*bN9@cX5%jF2^hY7(mV8)nB4[zQ9]wL2{kP5}xR7!mT3$vM8&qQ4*wN9#bN5_zA1%jF2^hY7(mV8)nB4[zQ9
 // 3. Il Client ID di Google è già inserito qui sotto (GOOGLE_CLIENT_ID), preso dal
 //    tuo progetto "ialgae ia" su Google Cloud Console.
 
