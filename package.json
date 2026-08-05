@@ -1,0 +1,17 @@
+{
+  "name": "ialgae-backend",
+  "version": "1.0.0",
+  "description": "Backend iAlgae: assistente IA, ricerca web, login Google, pagamenti Stripe",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "google-auth-library": "^9.15.0",
+    "jsonwebtoken": "^9.0.2",
+    "stripe": "^22.4.0"
+  }
+}
