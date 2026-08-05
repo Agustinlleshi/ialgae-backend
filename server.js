@@ -1,8 +1,13 @@
 // Server per iAlgae — versione a FILE UNICO, senza dipendenze esterne.
 // Usa solo moduli integrati in Node.js (http + fetch), quindi non serve npm install.
 //
-// Espone quattro endpoint:
-//   POST /api/ask       -> risponde alle domande usando l'API di Anthropic (Claude)
+// Espone cinque endpoint:
+//   POST /api/ask       -> risponde alle domande usando l'API di Anthropic (Claude).
+//                          Richiede login: usato dalla chat vera e propria (ia.html).
+//   POST /api/overview  -> come /api/ask ma pubblico (nessun login richiesto), con
+//                          limite per IP invece che per account. Usato da results.html
+//                          per il riassunto IA e il pannello entità, visti anche da
+//                          chi non ha fatto login.
 //   POST /api/vision    -> analizza un'immagine caricata (iAlgae Lens) usando Claude,
 //                          che ha capacità di visione (il backend è già collegato a
 //                          Claude, quindi riusiamo lo stesso, non usiamo Gemini di Google)
@@ -88,6 +93,11 @@ const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 const MAX_DAILY_MESSAGES = 10;
 const RATE_LIMIT_WINDOW_MS = 6 * 60 * 60 * 1000; // 6 ore
+
+// ---- Limite per IP per l'endpoint pubblico /api/overview (nessun login richiesto) ----
+const overviewRateLimit = new Map(); // ip -> { count, windowStart }
+const OVERVIEW_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ora
+const OVERVIEW_MAX_REQUESTS_PER_HOUR = 60;
 
 // Archivio utenti "temporaneo": vive solo finché il server resta acceso.
 // Ogni riavvio del server (frequente su Render, piano gratuito) lo svuota.
@@ -574,6 +584,84 @@ const server = http.createServer((req, res) => {
 
             } catch (err) {
                 console.error('Errore interno:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Endpoint pubblico per il riassunto IA e il pannello entità di results.html.
+    // A differenza di /api/ask, NON richiede login: viene chiamato da chiunque
+    // visiti la pagina dei risultati di ricerca, non solo dagli utenti loggati
+    // nella chat. Per evitare abusi ha un limite per indirizzo IP (non per account).
+    if (req.method === 'POST' && req.url === '/api/overview') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+
+                const question = payload.question;
+                if (!question || typeof question !== 'string' || !question.trim()) {
+                    return sendJSON(res, 400, { error: 'Domanda mancante o non valida.' });
+                }
+                if (question.length > MAX_QUESTION_LENGTH) {
+                    return sendJSON(res, 400, { error: 'Domanda troppo lunga.' });
+                }
+
+                // Limite per indirizzo IP invece che per utente (qui non c'è login)
+                const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+                let entry = overviewRateLimit.get(ip);
+                if (!entry || Date.now() - entry.windowStart > OVERVIEW_RATE_LIMIT_WINDOW_MS) {
+                    entry = { count: 0, windowStart: Date.now() };
+                }
+                if (entry.count >= OVERVIEW_MAX_REQUESTS_PER_HOUR) {
+                    return sendJSON(res, 429, { error: 'limit_reached', message: 'Troppe richieste, riprova più tardi.' });
+                }
+                entry.count += 1;
+                overviewRateLimit.set(ip, entry);
+
+                if (!ANTHROPIC_API_KEY) {
+                    return sendJSON(res, 500, { error: 'Chiave API non configurata sul server.' });
+                }
+
+                const anthropicMessages = [{ role: 'user', content: question.trim() }];
+
+                const response = await fetch('https://api.anthropic.com/v1/messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': ANTHROPIC_API_KEY,
+                        'anthropic-version': '2023-06-01'
+                    },
+                    body: JSON.stringify({
+                        model: ANTHROPIC_MODEL,
+                        max_tokens: 1000,
+                        messages: anthropicMessages
+                    })
+                });
+
+                if (!response.ok) {
+                    const errText = await response.text();
+                    console.error('Errore da Anthropic API (overview):', response.status, errText);
+                    return sendJSON(res, 502, { error: 'Errore nel contattare il servizio IA. Riprova più tardi.' });
+                }
+
+                const data = await response.json();
+                const answer = (data.content || [])
+                    .map(function (block) { return block.type === 'text' ? block.text : ''; })
+                    .filter(Boolean)
+                    .join('\n');
+
+                return sendJSON(res, 200, { answer: answer || 'Nessuna risposta ricevuta.' });
+
+            } catch (err) {
+                console.error('Errore overview:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         });
