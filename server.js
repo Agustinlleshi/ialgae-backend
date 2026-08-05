@@ -6,8 +6,9 @@
 //                          Richiede login: usato dalla chat vera e propria (ia.html).
 //   POST /api/overview  -> come /api/ask ma pubblico (nessun login richiesto), con
 //                          limite per IP invece che per account. Usato da results.html
-//                          per il riassunto IA e il pannello entità, visti anche da
-//                          chi non ha fatto login.
+//                          per il riassunto IA, il pannello entità e l'AI Mode
+//                          (conversazione multi-turno), visti anche da chi non ha
+//                          fatto login.
 //   POST /api/vision    -> analizza un'immagine caricata (iAlgae Lens) usando Claude,
 //                          che ha capacità di visione (il backend è già collegato a
 //                          Claude, quindi riusiamo lo stesso, non usiamo Gemini di Google)
@@ -590,10 +591,12 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // Endpoint pubblico per il riassunto IA e il pannello entità di results.html.
-    // A differenza di /api/ask, NON richiede login: viene chiamato da chiunque
-    // visiti la pagina dei risultati di ricerca, non solo dagli utenti loggati
-    // nella chat. Per evitare abusi ha un limite per indirizzo IP (non per account).
+    // Endpoint pubblico per il riassunto IA, il pannello entità e l'AI Mode di
+    // results.html. A differenza di /api/ask, NON richiede login: viene chiamato
+    // da chiunque visiti la pagina dei risultati di ricerca, non solo dagli
+    // utenti loggati nella chat vera e propria (ia.html). Per evitare abusi ha
+    // un limite per indirizzo IP (non per account). Supporta anche "messages"
+    // per conversazioni multi-turno (usato dall'AI Mode), non solo "question".
     if (req.method === 'POST' && req.url === '/api/overview') {
         let body = '';
         req.on('data', function (chunk) { body += chunk; });
@@ -607,6 +610,8 @@ const server = http.createServer((req, res) => {
                 }
 
                 const question = payload.question;
+                let messages = payload.messages;
+
                 if (!question || typeof question !== 'string' || !question.trim()) {
                     return sendJSON(res, 400, { error: 'Domanda mancante o non valida.' });
                 }
@@ -630,7 +635,24 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 500, { error: 'Chiave API non configurata sul server.' });
                 }
 
-                const anthropicMessages = [{ role: 'user', content: question.trim() }];
+                // Se arriva anche la cronologia della conversazione (AI Mode), la
+                // usiamo per mantenere il contesto; altrimenti si usa solo la
+                // domanda singola (riassunto IA e pannello entità).
+                let anthropicMessages;
+                if (Array.isArray(messages) && messages.length > 0) {
+                    const validRoles = ['user', 'assistant'];
+                    const cleaned = messages
+                        .filter(function (m) {
+                            return m && validRoles.indexOf(m.role) !== -1 && typeof m.content === 'string' && m.content.trim();
+                        })
+                        .slice(-20)
+                        .map(function (m) {
+                            return { role: m.role, content: m.content.slice(0, MAX_QUESTION_LENGTH) };
+                        });
+                    anthropicMessages = cleaned.length > 0 ? cleaned : [{ role: 'user', content: question.trim() }];
+                } else {
+                    anthropicMessages = [{ role: 'user', content: question.trim() }];
+                }
 
                 const response = await fetch('https://api.anthropic.com/v1/messages', {
                     method: 'POST',
