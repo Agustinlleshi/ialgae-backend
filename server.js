@@ -22,7 +22,10 @@
 // POST /api/auth/register, POST /api/auth/login, GET /api/auth/me (ripristina
 // la sessione da un token esistente, usato da login.html e ia.html al caricamento
 // della pagina), POST /api/auth/forgot-password e POST /api/auth/reset-password
-// (recupero password via email, per gli account email/password).
+// (recupero password via email, per gli account email/password), POST
+// /api/auth/verify-email e POST /api/auth/resend-verification (conferma email
+// obbligatoria per chi si registra con email/password: non può accedere finché
+// non clicca il link ricevuto).
 //
 // VARIABILI D'AMBIENTE PER ACCOUNT PERMANENTI (database) ED EMAIL:
 //   DATABASE_URL      = Connection String di Neon (postgresql://...). Senza,
@@ -182,6 +185,7 @@ async function initDb() {
         '  id TEXT PRIMARY KEY,' +
         '  email TEXT UNIQUE NOT NULL,' +
         '  name TEXT,' +
+        '  surname TEXT,' +
         '  picture TEXT,' +
         '  is_pro BOOLEAN NOT NULL DEFAULT false,' +
         '  message_count INTEGER NOT NULL DEFAULT 0,' +
@@ -190,9 +194,19 @@ async function initDb() {
         '  password_hash TEXT,' +
         '  reset_token TEXT,' +
         '  reset_token_expires TIMESTAMPTZ,' +
+        '  email_verified BOOLEAN NOT NULL DEFAULT false,' +
+        '  verify_token TEXT,' +
+        '  verify_token_expires TIMESTAMPTZ,' +
         '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
         ')'
     );
+    // Se la tabella esisteva già da prima di queste colonne (es. era stata
+    // creata con una versione precedente del sito), le aggiungiamo qui: non
+    // tocca i dati esistenti, aggiunge solo le colonne mancanti.
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS surname TEXT');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT false');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_token TEXT');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_token_expires TIMESTAMPTZ');
     console.log('Database pronto (tabella users verificata/creata).');
 }
 
@@ -205,6 +219,7 @@ function rowToUser(row) {
         sub: row.id,
         email: row.email,
         name: row.name,
+        surname: row.surname,
         picture: row.picture,
         isPro: row.is_pro,
         messageCount: row.message_count,
@@ -212,7 +227,10 @@ function rowToUser(row) {
         provider: row.provider,
         passwordHash: row.password_hash,
         resetToken: row.reset_token,
-        resetTokenExpires: row.reset_token_expires ? new Date(row.reset_token_expires).getTime() : null
+        resetTokenExpires: row.reset_token_expires ? new Date(row.reset_token_expires).getTime() : null,
+        emailVerified: row.email_verified,
+        verifyToken: row.verify_token,
+        verifyTokenExpires: row.verify_token_expires ? new Date(row.verify_token_expires).getTime() : null
     };
 }
 
@@ -253,6 +271,20 @@ async function getUserByResetToken(token) {
     return rowToUser(result.rows[0]);
 }
 
+// Cerca un utente in base al token di verifica email (usato dalla pagina
+// verify-email.html, che riceve solo il token dal link nell'email).
+async function getUserByVerifyToken(token) {
+    if (!token) return null;
+    if (!dbEnabled) {
+        for (const user of memoryUsers.values()) {
+            if (user.verifyToken && user.verifyToken === token) return user;
+        }
+        return null;
+    }
+    const result = await pool.query('SELECT * FROM users WHERE verify_token = $1', [token]);
+    return rowToUser(result.rows[0]);
+}
+
 // Salva (crea o aggiorna) un utente. Va chiamata esplicitamente ogni volta che
 // si modifica un campo (es. messageCount, isPro): a differenza della vecchia
 // Map, il database non si aggiorna da solo mutando l'oggetto in memoria.
@@ -262,18 +294,22 @@ async function saveUser(user) {
         return user;
     }
     await pool.query(
-        'INSERT INTO users (id, email, name, picture, is_pro, message_count, window_start, provider, password_hash, reset_token, reset_token_expires) ' +
-        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ' +
+        'INSERT INTO users (id, email, name, surname, picture, is_pro, message_count, window_start, provider, password_hash, reset_token, reset_token_expires, email_verified, verify_token, verify_token_expires) ' +
+        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ' +
         'ON CONFLICT (id) DO UPDATE SET ' +
-        '  email = EXCLUDED.email, name = EXCLUDED.name, picture = EXCLUDED.picture, ' +
+        '  email = EXCLUDED.email, name = EXCLUDED.name, surname = EXCLUDED.surname, picture = EXCLUDED.picture, ' +
         '  is_pro = EXCLUDED.is_pro, message_count = EXCLUDED.message_count, window_start = EXCLUDED.window_start, ' +
         '  provider = EXCLUDED.provider, password_hash = EXCLUDED.password_hash, ' +
-        '  reset_token = EXCLUDED.reset_token, reset_token_expires = EXCLUDED.reset_token_expires',
+        '  reset_token = EXCLUDED.reset_token, reset_token_expires = EXCLUDED.reset_token_expires, ' +
+        '  email_verified = EXCLUDED.email_verified, verify_token = EXCLUDED.verify_token, ' +
+        '  verify_token_expires = EXCLUDED.verify_token_expires',
         [
-            user.sub, user.email, user.name || null, user.picture || null, !!user.isPro,
+            user.sub, user.email, user.name || null, user.surname || null, user.picture || null, !!user.isPro,
             user.messageCount || 0, new Date(user.windowStart || Date.now()), user.provider,
             user.passwordHash || null, user.resetToken || null,
-            user.resetTokenExpires ? new Date(user.resetTokenExpires) : null
+            user.resetTokenExpires ? new Date(user.resetTokenExpires) : null,
+            !!user.emailVerified, user.verifyToken || null,
+            user.verifyTokenExpires ? new Date(user.verifyTokenExpires) : null
         ]
     );
     return user;
@@ -464,7 +500,8 @@ const server = http.createServer((req, res) => {
                         isPro: false,
                         messageCount: 0,
                         windowStart: Date.now(),
-                        provider: 'google'
+                        provider: 'google',
+                        emailVerified: true // Google ha già verificato questa email
                     };
                     await saveUser(user);
                 }
@@ -535,7 +572,8 @@ const server = http.createServer((req, res) => {
                         isPro: false,
                         messageCount: 0,
                         windowStart: Date.now(),
-                        provider: 'microsoft'
+                        provider: 'microsoft',
+                        emailVerified: true // Microsoft ha già verificato questa email
                     };
                     await saveUser(user);
                 }
@@ -586,6 +624,7 @@ const server = http.createServer((req, res) => {
                 const email = (payload.email || '').trim().toLowerCase();
                 const password = payload.password || '';
                 const name = (payload.name || '').trim() || email.split('@')[0];
+                const surname = (payload.surname || '').trim(); // facoltativo
 
                 if (!EMAIL_REGEX.test(email)) {
                     return sendJSON(res, 400, { error: 'Email non valida.' });
@@ -600,27 +639,137 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 409, { error: 'Esiste già un account con questa email.' });
                 }
 
+                const verifyToken = crypto.randomBytes(32).toString('hex');
                 const user = {
                     sub: id,
                     email: email,
                     name: name,
+                    surname: surname || null,
                     picture: null,
                     isPro: false,
                     messageCount: 0,
                     windowStart: Date.now(),
                     provider: 'local',
-                    passwordHash: hashPassword(password)
+                    passwordHash: hashPassword(password),
+                    emailVerified: false,
+                    verifyToken: verifyToken,
+                    verifyTokenExpires: Date.now() + 24 * 60 * 60 * 1000 // 24 ore
                 };
                 await saveUser(user);
 
+                const verifyUrl = SITE_BASE_URL + '/verify-email.html?token=' + verifyToken;
+                await sendEmail(
+                    user.email,
+                    'Conferma la tua email - iAlgae',
+                    '<p>Ciao ' + escapeHtmlServer(user.name || '') + ',</p>' +
+                    '<p>Grazie per esserti registrato su iAlgae! Conferma il tuo indirizzo email cliccando sul link qui sotto (valido per 24 ore):</p>' +
+                    '<p><a href="' + verifyUrl + '">' + verifyUrl + '</a></p>' +
+                    '<p>Se non trovi questa email nella posta in arrivo, controlla anche nella cartella <strong>spam/posta indesiderata</strong>.</p>' +
+                    '<p>Se non sei stato tu a registrarti, ignora pure questa email.</p>'
+                );
+
+                // Niente sessionToken qui: l'account esiste ma non può ancora
+                // accedere finché non conferma l'email dal link.
+                return sendJSON(res, 200, {
+                    requiresVerification: true,
+                    message: 'Account creato! Controlla la tua email (anche lo spam) e clicca sul link per confermarla prima di accedere.'
+                });
+
+            } catch (err) {
+                console.error('Errore registrazione:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Conferma l'email di un account appena registrato: riceve il token dal
+    // link nell'email e attiva l'account, poi fa il login automaticamente.
+    if (req.method === 'POST' && req.url === '/api/auth/verify-email') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+
+                const token = (payload.token || '').trim();
+                if (!token) {
+                    return sendJSON(res, 400, { error: 'Link non valido.' });
+                }
+
+                const user = await getUserByVerifyToken(token);
+                if (!user || !user.verifyTokenExpires || user.verifyTokenExpires < Date.now()) {
+                    return sendJSON(res, 400, { error: 'Il link è scaduto o non è più valido. Richiedine uno nuovo.' });
+                }
+
+                user.emailVerified = true;
+                user.verifyToken = null;
+                user.verifyTokenExpires = null;
+                await saveUser(user);
+
+                // Una volta confermata l'email, colleghiamo subito l'utente:
+                // non deve rifare il login da capo.
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
+                    message: 'Email confermata con successo!',
                     sessionToken: sessionToken,
                     user: { email: user.email, name: user.name, picture: user.picture, isPro: user.isPro }
                 });
 
             } catch (err) {
-                console.error('Errore registrazione:', err);
+                console.error('Errore verify-email:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Rimanda l'email di conferma (utile se il link è scaduto o l'email non è
+    // arrivata). Risponde sempre allo stesso modo, esista o meno l'account,
+    // per non rivelare quali email sono registrate.
+    if (req.method === 'POST' && req.url === '/api/auth/resend-verification') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+
+                const email = (payload.email || '').trim().toLowerCase();
+                if (!EMAIL_REGEX.test(email)) {
+                    return sendJSON(res, 400, { error: 'Email non valida.' });
+                }
+
+                const user = await getUserByEmail(email);
+                if (user && user.provider === 'local' && !user.emailVerified) {
+                    user.verifyToken = crypto.randomBytes(32).toString('hex');
+                    user.verifyTokenExpires = Date.now() + 24 * 60 * 60 * 1000;
+                    await saveUser(user);
+
+                    const verifyUrl = SITE_BASE_URL + '/verify-email.html?token=' + user.verifyToken;
+                    await sendEmail(
+                        user.email,
+                        'Conferma la tua email - iAlgae',
+                        '<p>Ciao ' + escapeHtmlServer(user.name || '') + ',</p>' +
+                        '<p>Ecco un nuovo link per confermare la tua email (valido per 24 ore):</p>' +
+                        '<p><a href="' + verifyUrl + '">' + verifyUrl + '</a></p>' +
+                        '<p>Se non trovi questa email nella posta in arrivo, controlla anche nella cartella <strong>spam/posta indesiderata</strong>.</p>'
+                    );
+                }
+
+                return sendJSON(res, 200, { message: 'Se l\'indirizzo è registrato e non ancora confermato, riceverai a breve una nuova email.' });
+
+            } catch (err) {
+                console.error('Errore resend-verification:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         });
@@ -646,6 +795,13 @@ const server = http.createServer((req, res) => {
                 const user = await getUserById(localAccountId(email));
                 if (!user || !user.passwordHash || !verifyPassword(password, user.passwordHash)) {
                     return sendJSON(res, 401, { error: 'Email o password non corrette.' });
+                }
+
+                if (!user.emailVerified) {
+                    return sendJSON(res, 403, {
+                        error: 'email_not_verified',
+                        message: 'Devi prima confermare la tua email. Controlla la tua casella (anche lo spam) per il link di conferma.'
+                    });
                 }
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
