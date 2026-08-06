@@ -500,18 +500,29 @@ const server = http.createServer((req, res) => {
 
                 let user = await getUserById(googlePayload.sub);
                 if (!user) {
-                    user = {
-                        sub: googlePayload.sub,
-                        email: googlePayload.email,
-                        name: googlePayload.name,
-                        picture: googlePayload.picture,
-                        isPro: false,
-                        messageCount: 0,
-                        windowStart: Date.now(),
-                        provider: 'google',
-                        emailVerified: true // Google ha già verificato questa email
-                    };
-                    await saveUser(user);
+                    // L'ID di Google è nuovo, ma potrebbe esserci già un account
+                    // con questa stessa email (es. registrato prima con email e
+                    // password): in quel caso riusiamo quell'account invece di
+                    // provare a crearne uno duplicato (l'email deve restare unica).
+                    user = await getUserByEmail(googlePayload.email);
+                    if (user) {
+                        if (!user.picture) user.picture = googlePayload.picture;
+                        user.emailVerified = true; // Google ha già verificato questa email
+                        await saveUser(user);
+                    } else {
+                        user = {
+                            sub: googlePayload.sub,
+                            email: googlePayload.email,
+                            name: googlePayload.name,
+                            picture: googlePayload.picture,
+                            isPro: false,
+                            messageCount: 0,
+                            windowStart: Date.now(),
+                            provider: 'google',
+                            emailVerified: true // Google ha già verificato questa email
+                        };
+                        await saveUser(user);
+                    }
                 }
 
                 const sessionToken = jwt.sign(
@@ -572,18 +583,27 @@ const server = http.createServer((req, res) => {
 
                 let user = await getUserById(msId);
                 if (!user) {
-                    user = {
-                        sub: msId,
-                        email: msEmail,
-                        name: msName,
-                        picture: null, // Microsoft Graph richiederebbe un permesso extra per la foto profilo
-                        isPro: false,
-                        messageCount: 0,
-                        windowStart: Date.now(),
-                        provider: 'microsoft',
-                        emailVerified: true // Microsoft ha già verificato questa email
-                    };
-                    await saveUser(user);
+                    // Come per Google: se esiste già un account con questa email
+                    // (es. registrato prima con email e password), lo riusiamo
+                    // invece di crearne uno duplicato.
+                    user = msEmail ? await getUserByEmail(msEmail) : null;
+                    if (user) {
+                        user.emailVerified = true; // Microsoft ha già verificato questa email
+                        await saveUser(user);
+                    } else {
+                        user = {
+                            sub: msId,
+                            email: msEmail,
+                            name: msName,
+                            picture: null, // Microsoft Graph richiederebbe un permesso extra per la foto profilo
+                            isPro: false,
+                            messageCount: 0,
+                            windowStart: Date.now(),
+                            provider: 'microsoft',
+                            emailVerified: true // Microsoft ha già verificato questa email
+                        };
+                        await saveUser(user);
+                    }
                 }
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
