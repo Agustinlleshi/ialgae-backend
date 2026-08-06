@@ -4,11 +4,11 @@
 // Espone cinque endpoint:
 //   POST /api/ask       -> risponde alle domande usando l'API di Anthropic (Claude).
 //                          Richiede login: usato dalla chat vera e propria (ia.html).
-//   POST /api/overview  -> come /api/ask ma pubblico (nessun login richiesto), con
-//                          limite per IP invece che per account. Usato da results.html
-//                          per il riassunto IA, il pannello entità e l'AI Mode
-//                          (conversazione multi-turno), visti anche da chi non ha
-//                          fatto login.
+//   POST /api/overview  -> come /api/ask ma pubblico e SENZA ALCUN LIMITE: usato da
+//                          results.html e dalla homepage per il riassunto IA, il
+//                          pannello entità e l'AI Mode (conversazione multi-turno).
+//                          Il limite di 20 utilizzi ogni 4 ore si applica SOLO a
+//                          /api/ask (la chat vera e propria su ia.html).
 //   POST /api/vision    -> analizza un'immagine caricata (iAlgae Lens) usando Claude,
 //                          che ha capacità di visione (il backend è già collegato a
 //                          Claude, quindi riusiamo lo stesso, non usiamo Gemini di Google)
@@ -17,6 +17,25 @@
 //   GET  /api/search    -> restituisce risultati di ricerca web reali (proxy verso Brave Search API),
 //                          usati dalla pagina dei risultati (results.html) per mostrare i risultati
 //                          dentro iAlgae invece di rimandare a Google
+//
+// Endpoint di autenticazione: POST /api/auth/google, POST /api/auth/microsoft,
+// POST /api/auth/register, POST /api/auth/login, GET /api/auth/me (ripristina
+// la sessione da un token esistente, usato da login.html e ia.html al caricamento
+// della pagina), POST /api/auth/forgot-password e POST /api/auth/reset-password
+// (recupero password via email, per gli account email/password).
+//
+// VARIABILI D'AMBIENTE PER ACCOUNT PERMANENTI (database) ED EMAIL:
+//   DATABASE_URL      = Connection String di Neon (postgresql://...). Senza,
+//                        gli account restano solo in memoria (si perdono ad
+//                        ogni riavvio del server), come prima.
+//   RESEND_API_KEY     = chiave API di Resend (re_...), per inviare davvero le
+//                        email di recupero password. Senza, il link di reset
+//                        viene comunque generato ma l'email non parte (lo
+//                        segnala nei log — utile in fase di test).
+//   RESEND_FROM_EMAIL = indirizzo mittente delle email, es. "iAlgae <noreply@ialgae.com>"
+//                        (richiede dominio verificato su Resend). Se non impostata,
+//                        usa il dominio di test di Resend (funziona solo per email
+//                        verso il tuo stesso account Resend).
 //
 // COME PUBBLICARLO SU RENDER.COM:
 // 1. Crea un "Web Service" su Render.com e carica solo questo file (server.js).
@@ -58,6 +77,8 @@ const http = require('http');
 const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
 const jwt = require('jsonwebtoken');
+const jwksClient = require('jwks-rsa');
+const { Pool } = require('pg');
 const Stripe = require('stripe');
 
 const PORT = process.env.PORT || 3000;
@@ -92,44 +113,182 @@ const GOOGLE_CLIENT_ID = '897588931636-i6f4hn49mbicag9r46u5pmdf4su0dag9.apps.goo
 const SESSION_SECRET = process.env.SESSION_SECRET || 'cambia-questa-stringa-su-render';
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
-const MAX_DAILY_MESSAGES = 10;
-const RATE_LIMIT_WINDOW_MS = 6 * 60 * 60 * 1000; // 6 ore
+// ---- LOGIN CON MICROSOFT ----
+// Sostituisci con l'"Application (client) ID" che trovi in Microsoft Entra admin
+// center dopo aver registrato l'app (vedi commento più sotto in /api/auth/microsoft
+// per i dettagli). Finché resta con questo valore segnaposto, il login Microsoft
+// è disattivato e mostra "presto disponibile" sul sito.
+const MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID || 'b175e7db-c753-4eea-a266-650b0d14012f';
+const microsoftLoginEnabled = MICROSOFT_CLIENT_ID.indexOf('INSERISCI_QUI') === -1;
+// Le chiavi pubbliche di Microsoft per verificare la firma dei token, prese
+// dall'endpoint "common" (funziona sia con account aziendali sia personali,
+// tipo Outlook/Hotmail — coerente con come abbiamo registrato l'app).
+const microsoftJwksClient = jwksClient({
+    jwksUri: 'https://login.microsoftonline.com/common/discovery/v2.0/keys',
+    cache: true,
+    cacheMaxAge: 12 * 60 * 60 * 1000 // 12 ore
+});
+function getMicrosoftSigningKey(kid) {
+    return new Promise(function (resolve, reject) {
+        microsoftJwksClient.getSigningKey(kid, function (err, key) {
+            if (err) return reject(err);
+            resolve(key.getPublicKey());
+        });
+    });
+}
+// Verifica un id_token di Microsoft: firma valida, destinato alla nostra app,
+// ed emesso da un tenant Microsoft vero (account aziendale o personale).
+async function verifyMicrosoftToken(idToken) {
+    const decoded = jwt.decode(idToken, { complete: true });
+    if (!decoded || !decoded.header || !decoded.header.kid) {
+        throw new Error('Token non valido.');
+    }
+    const publicKey = await getMicrosoftSigningKey(decoded.header.kid);
+    const payload = jwt.verify(idToken, publicKey, { algorithms: ['RS256'] });
 
-// ---- Limite per IP per l'endpoint pubblico /api/overview (nessun login richiesto) ----
-const overviewRateLimit = new Map(); // ip -> { count, windowStart }
-const OVERVIEW_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ora
-const OVERVIEW_MAX_REQUESTS_PER_HOUR = 60;
+    if (payload.aud !== MICROSOFT_CLIENT_ID) {
+        throw new Error('Token destinato a un\'altra applicazione.');
+    }
+    // L'emittente cambia a seconda del tenant dell'utente (aziendale o personale):
+    // controlliamo solo che abbia la forma giusta, non un tenant specifico.
+    if (!payload.iss || !/^https:\/\/login\.microsoftonline\.com\/[^/]+\/v2\.0$/.test(payload.iss)) {
+        throw new Error('Emittente del token non riconosciuto.');
+    }
+    return payload; // { oid o sub, email o preferred_username, name, ... }
+}
 
-// Archivio utenti "temporaneo": vive solo finché il server resta acceso.
-// Ogni riavvio del server (frequente su Render, piano gratuito) lo svuota.
-// Quando vorrai account permanenti e chi ha pagato il Pro salvato per sempre,
-// va sostituito con un vero database (es. Postgres su Render).
-// Chiave: per gli account Google è il "sub" di Google; per gli account email/password
-// è "local:" + email in minuscolo. Valore: { sub, email, name, picture, isPro,
-// messageCount, windowStart, provider: 'google' | 'local', passwordHash? }
-const users = new Map();
+const MAX_DAILY_MESSAGES = 20;
+const RATE_LIMIT_WINDOW_MS = 4 * 60 * 60 * 1000; // 4 ore (solo per /api/ask, la chat su ia.html)
 
-function getUserFromRequest(req) {
+// ---- DATABASE (Postgres su Neon) ----
+// Finché non imposti DATABASE_URL su Render, gli account restano SOLO in
+// memoria (si perdono a ogni riavvio, come prima). Appena aggiungi la
+// variabile d'ambiente DATABASE_URL con la Connection String di Neon, tutto
+// passa automaticamente al database vero, senza altre modifiche al codice.
+const DATABASE_URL = process.env.DATABASE_URL || '';
+const dbEnabled = !!DATABASE_URL;
+const pool = dbEnabled ? new Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false } // Neon richiede una connessione SSL
+}) : null;
+
+async function initDb() {
+    if (!dbEnabled) {
+        console.warn('DATABASE_URL non impostata: gli account restano solo in memoria (si perdono ad ogni riavvio).');
+        return;
+    }
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS users (' +
+        '  id TEXT PRIMARY KEY,' +
+        '  email TEXT UNIQUE NOT NULL,' +
+        '  name TEXT,' +
+        '  picture TEXT,' +
+        '  is_pro BOOLEAN NOT NULL DEFAULT false,' +
+        '  message_count INTEGER NOT NULL DEFAULT 0,' +
+        '  window_start TIMESTAMPTZ NOT NULL DEFAULT now(),' +
+        '  provider TEXT NOT NULL,' +
+        '  password_hash TEXT,' +
+        '  reset_token TEXT,' +
+        '  reset_token_expires TIMESTAMPTZ,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
+        ')'
+    );
+    console.log('Database pronto (tabella users verificata/creata).');
+}
+
+// Usato SOLO se DATABASE_URL non è configurata (vedi sopra).
+const memoryUsers = new Map();
+
+function rowToUser(row) {
+    if (!row) return null;
+    return {
+        sub: row.id,
+        email: row.email,
+        name: row.name,
+        picture: row.picture,
+        isPro: row.is_pro,
+        messageCount: row.message_count,
+        windowStart: new Date(row.window_start).getTime(),
+        provider: row.provider,
+        passwordHash: row.password_hash,
+        resetToken: row.reset_token,
+        resetTokenExpires: row.reset_token_expires ? new Date(row.reset_token_expires).getTime() : null
+    };
+}
+
+async function getUserById(id) {
+    if (!id) return null;
+    if (!dbEnabled) return memoryUsers.get(id) || null;
+    const result = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+    return rowToUser(result.rows[0]);
+}
+
+// Cerca un utente in base all'email (usato dal webhook di Stripe, che ci parla
+// solo di email/customer, non conosce il nostro "id" interno; e dal recupero
+// password, che parte sempre dall'email digitata).
+async function getUserByEmail(email) {
+    if (!email) return null;
+    const lower = email.toLowerCase();
+    if (!dbEnabled) {
+        for (const user of memoryUsers.values()) {
+            if (user.email && user.email.toLowerCase() === lower) return user;
+        }
+        return null;
+    }
+    const result = await pool.query('SELECT * FROM users WHERE lower(email) = $1', [lower]);
+    return rowToUser(result.rows[0]);
+}
+
+// Cerca un utente in base al token di reset password (usato dalla pagina
+// reset-password.html, che riceve solo il token dal link nell'email).
+async function getUserByResetToken(token) {
+    if (!token) return null;
+    if (!dbEnabled) {
+        for (const user of memoryUsers.values()) {
+            if (user.resetToken && user.resetToken === token) return user;
+        }
+        return null;
+    }
+    const result = await pool.query('SELECT * FROM users WHERE reset_token = $1', [token]);
+    return rowToUser(result.rows[0]);
+}
+
+// Salva (crea o aggiorna) un utente. Va chiamata esplicitamente ogni volta che
+// si modifica un campo (es. messageCount, isPro): a differenza della vecchia
+// Map, il database non si aggiorna da solo mutando l'oggetto in memoria.
+async function saveUser(user) {
+    if (!dbEnabled) {
+        memoryUsers.set(user.sub, user);
+        return user;
+    }
+    await pool.query(
+        'INSERT INTO users (id, email, name, picture, is_pro, message_count, window_start, provider, password_hash, reset_token, reset_token_expires) ' +
+        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ' +
+        'ON CONFLICT (id) DO UPDATE SET ' +
+        '  email = EXCLUDED.email, name = EXCLUDED.name, picture = EXCLUDED.picture, ' +
+        '  is_pro = EXCLUDED.is_pro, message_count = EXCLUDED.message_count, window_start = EXCLUDED.window_start, ' +
+        '  provider = EXCLUDED.provider, password_hash = EXCLUDED.password_hash, ' +
+        '  reset_token = EXCLUDED.reset_token, reset_token_expires = EXCLUDED.reset_token_expires',
+        [
+            user.sub, user.email, user.name || null, user.picture || null, !!user.isPro,
+            user.messageCount || 0, new Date(user.windowStart || Date.now()), user.provider,
+            user.passwordHash || null, user.resetToken || null,
+            user.resetTokenExpires ? new Date(user.resetTokenExpires) : null
+        ]
+    );
+    return user;
+}
+
+async function getUserFromRequest(req) {
     const authHeader = req.headers['authorization'] || '';
     const token = authHeader.replace('Bearer ', '').trim();
     if (!token) return null;
     try {
         const decoded = jwt.verify(token, SESSION_SECRET);
-        return users.get(decoded.sub) || null;
+        return await getUserById(decoded.sub);
     } catch (err) {
         return null;
     }
-}
-
-// Cerca un utente in base all'email (usato dal webhook di Stripe, che ci parla
-// solo di email/customer, non conosce il nostro "sub" interno di Google).
-function findUserByEmail(email) {
-    if (!email) return null;
-    const lower = email.toLowerCase();
-    for (const user of users.values()) {
-        if (user.email && user.email.toLowerCase() === lower) return user;
-    }
-    return null;
 }
 
 // ---- Account con email e password (alternativa al login Google) ----
@@ -156,6 +315,48 @@ function verifyPassword(password, storedHash) {
     const originalBuffer = Buffer.from(originalHash, 'hex');
     if (derivedKey.length !== originalBuffer.length) return false;
     return crypto.timingSafeEqual(derivedKey, originalBuffer);
+}
+
+// ---- EMAIL (per il recupero password), tramite Resend ----
+// RESEND_API_KEY va impostata come variabile d'ambiente su Render (stesso
+// posto delle altre chiavi). Finché manca, il recupero password funziona lo
+// stesso lato server (genera il link), ma l'email non viene davvero inviata:
+// lo segnaliamo nei log invece di far fallire silenziosamente la richiesta.
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'iAlgae <onboarding@resend.dev>';
+
+function escapeHtmlServer(str) {
+    return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+async function sendEmail(to, subject, html) {
+    if (!RESEND_API_KEY) {
+        console.warn('RESEND_API_KEY non configurata: email NON inviata a', to, '- oggetto:', subject);
+        return false;
+    }
+    try {
+        const response = await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+                'Authorization': 'Bearer ' + RESEND_API_KEY,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ from: RESEND_FROM_EMAIL, to: [to], subject: subject, html: html })
+        });
+        if (!response.ok) {
+            const errText = await response.text();
+            console.error('Errore invio email Resend:', response.status, errText);
+            return false;
+        }
+        return true;
+    } catch (err) {
+        console.error('Errore di rete inviando email:', err);
+        return false;
+    }
 }
 
 function extractHost(url) {
@@ -253,7 +454,7 @@ const server = http.createServer((req, res) => {
                 });
                 const googlePayload = ticket.getPayload(); // { sub, email, name, picture, ... }
 
-                let user = users.get(googlePayload.sub);
+                let user = await getUserById(googlePayload.sub);
                 if (!user) {
                     user = {
                         sub: googlePayload.sub,
@@ -265,7 +466,7 @@ const server = http.createServer((req, res) => {
                         windowStart: Date.now(),
                         provider: 'google'
                     };
-                    users.set(googlePayload.sub, user);
+                    await saveUser(user);
                 }
 
                 const sessionToken = jwt.sign(
@@ -287,11 +488,93 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // Login con Microsoft (account aziendali o personali tipo Outlook/Hotmail).
+    // Stesso schema del login Google: il browser fa apparire la finestra di
+    // accesso Microsoft (via MSAL.js) e ci manda qui solo l'id_token da
+    // verificare, mai una password. Per attivarlo:
+    //   1. Registra l'app su https://entra.microsoft.com (gratuito, vedi
+    //      istruzioni ricevute separatamente)
+    //   2. Imposta la variabile d'ambiente MICROSOFT_CLIENT_ID su Render con
+    //      l'Application (client) ID che ottieni dalla registrazione
+    if (req.method === 'POST' && req.url === '/api/auth/microsoft') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!microsoftLoginEnabled) {
+                    return sendJSON(res, 501, { error: 'Login Microsoft non ancora configurato sul server.' });
+                }
+
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+
+                const credential = payload.credential;
+                if (!credential || typeof credential !== 'string') {
+                    return sendJSON(res, 400, { error: 'Token mancante.' });
+                }
+
+                const msPayload = await verifyMicrosoftToken(credential);
+                // "oid" identifica l'utente in modo stabile; alcuni account personali
+                // (tipo Outlook.com) potrebbero avere solo "sub". Il prefisso "ms:"
+                // evita collisioni con gli ID di Google o degli account email/password.
+                const msId = 'ms:' + (msPayload.oid || msPayload.sub);
+                const msEmail = msPayload.email || msPayload.preferred_username || '';
+                const msName = msPayload.name || msEmail.split('@')[0] || 'Utente Microsoft';
+
+                let user = await getUserById(msId);
+                if (!user) {
+                    user = {
+                        sub: msId,
+                        email: msEmail,
+                        name: msName,
+                        picture: null, // Microsoft Graph richiederebbe un permesso extra per la foto profilo
+                        isPro: false,
+                        messageCount: 0,
+                        windowStart: Date.now(),
+                        provider: 'microsoft'
+                    };
+                    await saveUser(user);
+                }
+
+                const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
+                return sendJSON(res, 200, {
+                    sessionToken: sessionToken,
+                    user: { email: user.email, name: user.name, picture: user.picture, isPro: user.isPro }
+                });
+
+            } catch (err) {
+                console.error('Errore verifica login Microsoft:', err);
+                return sendJSON(res, 401, { error: 'Token non valido.' });
+            }
+        });
+        return;
+    }
+
+    // Restituisce l'utente collegato al token presente (se valido), così le
+    // pagine possono ripristinare la sessione al caricamento senza dover
+    // rifare il login ogni volta (es. dopo essere passati da login.html a ia.html).
+    if (req.method === 'GET' && req.url === '/api/auth/me') {
+        (async function () {
+            const user = await getUserFromRequest(req);
+            if (!user) {
+                return sendJSON(res, 401, { error: 'not_logged_in' });
+            }
+            return sendJSON(res, 200, {
+                user: { email: user.email, name: user.name, picture: user.picture || null, isPro: !!user.isPro }
+            });
+        })();
+        return;
+    }
+
     // Registrazione con email e password (alternativa al login Google)
     if (req.method === 'POST' && req.url === '/api/auth/register') {
         let body = '';
         req.on('data', function (chunk) { body += chunk; });
-        req.on('end', function () {
+        req.on('end', async function () {
             try {
                 let payload;
                 try {
@@ -312,7 +595,8 @@ const server = http.createServer((req, res) => {
                 }
 
                 const id = localAccountId(email);
-                if (users.has(id) || findUserByEmail(email)) {
+                const existing = (await getUserById(id)) || (await getUserByEmail(email));
+                if (existing) {
                     return sendJSON(res, 409, { error: 'Esiste già un account con questa email.' });
                 }
 
@@ -327,7 +611,7 @@ const server = http.createServer((req, res) => {
                     provider: 'local',
                     passwordHash: hashPassword(password)
                 };
-                users.set(id, user);
+                await saveUser(user);
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
@@ -347,7 +631,7 @@ const server = http.createServer((req, res) => {
     if (req.method === 'POST' && req.url === '/api/auth/login') {
         let body = '';
         req.on('data', function (chunk) { body += chunk; });
-        req.on('end', function () {
+        req.on('end', async function () {
             try {
                 let payload;
                 try {
@@ -359,7 +643,7 @@ const server = http.createServer((req, res) => {
                 const email = (payload.email || '').trim().toLowerCase();
                 const password = payload.password || '';
 
-                const user = users.get(localAccountId(email));
+                const user = await getUserById(localAccountId(email));
                 if (!user || !user.passwordHash || !verifyPassword(password, user.passwordHash)) {
                     return sendJSON(res, 401, { error: 'Email o password non corrette.' });
                 }
@@ -372,6 +656,100 @@ const server = http.createServer((req, res) => {
 
             } catch (err) {
                 console.error('Errore login email/password:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Richiesta di recupero password: genera un token temporaneo e manda
+    // un'email con il link per sceglierne una nuova. Per non rivelare quali
+    // email sono registrate sul sito, la risposta è sempre la stessa, sia che
+    // l'account esista sia che non esista.
+    if (req.method === 'POST' && req.url === '/api/auth/forgot-password') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+
+                const email = (payload.email || '').trim().toLowerCase();
+                if (!EMAIL_REGEX.test(email)) {
+                    return sendJSON(res, 400, { error: 'Email non valida.' });
+                }
+
+                const user = await getUserByEmail(email);
+                // Il reset ha senso solo per gli account email/password: chi accede
+                // con Google o Microsoft non ha una password nostra da reimpostare.
+                if (user && user.provider === 'local') {
+                    user.resetToken = crypto.randomBytes(32).toString('hex');
+                    user.resetTokenExpires = Date.now() + 60 * 60 * 1000; // 1 ora
+                    await saveUser(user);
+
+                    const resetUrl = SITE_BASE_URL + '/reset-password.html?token=' + user.resetToken;
+                    await sendEmail(
+                        user.email,
+                        'Reimposta la tua password iAlgae',
+                        '<p>Ciao ' + escapeHtmlServer(user.name || '') + ',</p>' +
+                        '<p>Hai richiesto di reimpostare la password del tuo account iAlgae. Clicca sul link qui sotto per sceglierne una nuova (valido per 1 ora):</p>' +
+                        '<p><a href="' + resetUrl + '">' + resetUrl + '</a></p>' +
+                        '<p>Se non sei stato tu a richiederlo, ignora pure questa email: la tua password resta invariata.</p>'
+                    );
+                }
+
+                return sendJSON(res, 200, { message: 'Se l\'indirizzo è registrato, riceverai a breve un\'email con le istruzioni.' });
+
+            } catch (err) {
+                console.error('Errore forgot-password:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Completamento del recupero password: riceve il token dal link nell'email
+    // e la nuova password scelta dall'utente.
+    if (req.method === 'POST' && req.url === '/api/auth/reset-password') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+
+                const token = (payload.token || '').trim();
+                const newPassword = payload.password || '';
+
+                if (!token) {
+                    return sendJSON(res, 400, { error: 'Link non valido.' });
+                }
+                if (newPassword.length < MIN_PASSWORD_LENGTH) {
+                    return sendJSON(res, 400, { error: 'La password deve avere almeno 8 caratteri.' });
+                }
+
+                const user = await getUserByResetToken(token);
+                if (!user || !user.resetTokenExpires || user.resetTokenExpires < Date.now()) {
+                    return sendJSON(res, 400, { error: 'Il link è scaduto o non è più valido. Richiedine uno nuovo.' });
+                }
+
+                user.passwordHash = hashPassword(newPassword);
+                user.resetToken = null;
+                user.resetTokenExpires = null;
+                await saveUser(user);
+
+                return sendJSON(res, 200, { message: 'Password aggiornata con successo.' });
+
+            } catch (err) {
+                console.error('Errore reset-password:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         });
@@ -406,7 +784,7 @@ const server = http.createServer((req, res) => {
                 // Se l'utente ha già fatto login, precompiliamo la sua email e lo
                 // colleghiamo (client_reference_id) al suo account interno, così il
                 // webhook più sotto sa a chi assegnare il Pro dopo il pagamento.
-                const user = getUserFromRequest(req);
+                const user = await getUserFromRequest(req);
 
                 const sessionParams = {
                     mode: 'subscription',
@@ -437,7 +815,7 @@ const server = http.createServer((req, res) => {
     if (req.method === 'POST' && req.url === '/api/stripe-webhook') {
         let rawBody = '';
         req.on('data', function (chunk) { rawBody += chunk; });
-        req.on('end', function () {
+        req.on('end', async function () {
             if (!stripe || !STRIPE_WEBHOOK_SECRET) {
                 console.error('Webhook Stripe ricevuto ma STRIPE_WEBHOOK_SECRET non configurato.');
                 res.writeHead(500);
@@ -457,20 +835,21 @@ const server = http.createServer((req, res) => {
                 const session = event.data.object;
                 let user = null;
                 if (session.client_reference_id) {
-                    user = users.get(session.client_reference_id);
+                    user = await getUserById(session.client_reference_id);
                 }
                 if (!user && session.customer_email) {
-                    user = findUserByEmail(session.customer_email);
+                    user = await getUserByEmail(session.customer_email);
                 } else if (!user && session.customer_details && session.customer_details.email) {
-                    user = findUserByEmail(session.customer_details.email);
+                    user = await getUserByEmail(session.customer_details.email);
                 }
                 if (user) {
                     user.isPro = true;
+                    await saveUser(user);
                     console.log('Utente passato a Pro:', user.email);
                 } else {
                     // L'utente ha pagato senza aver mai fatto login prima: creiamo comunque
                     // una scheda per lui, così quando farà login con la stessa email
-                    // Google, ritroverà lo stato Pro già attivo (in memoria, per ora).
+                    // Google, ritroverà lo stato Pro già attivo.
                     const email = session.customer_email || (session.customer_details && session.customer_details.email);
                     if (email) {
                         console.log('Pagamento ricevuto da un\'email non ancora collegata a un account:', email);
@@ -508,7 +887,7 @@ const server = http.createServer((req, res) => {
                 }
 
                 // Serve essere loggati con Google per usare l'assistente
-                const user = getUserFromRequest(req);
+                const user = await getUserFromRequest(req);
                 if (!user) {
                     return sendJSON(res, 401, { error: 'not_logged_in', message: 'Accedi con Google per continuare.' });
                 }
@@ -521,11 +900,13 @@ const server = http.createServer((req, res) => {
                 if (!user.isPro && user.messageCount >= MAX_DAILY_MESSAGES) {
                     return sendJSON(res, 429, {
                         error: 'limit_reached',
-                        message: 'Hai raggiunto il numero massimo di messaggi giornalieri.',
-                        unlockAt: new Date(user.windowStart + RATE_LIMIT_WINDOW_MS).toISOString()
+                        message: 'Hai raggiunto il limite di ' + MAX_DAILY_MESSAGES + ' messaggi gratuiti. Passa a un piano Pro per continuare senza limiti, oppure riprova tra qualche ora.',
+                        unlockAt: new Date(user.windowStart + RATE_LIMIT_WINDOW_MS).toISOString(),
+                        upgradeUrl: SITE_BASE_URL + '/piani.html'
                     });
                 }
                 user.messageCount += 1;
+                await saveUser(user);
 
                 if (!ANTHROPIC_API_KEY) {
                     return sendJSON(res, 500, { error: 'Chiave API non configurata sul server.' });
@@ -619,17 +1000,10 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 400, { error: 'Domanda troppo lunga.' });
                 }
 
-                // Limite per indirizzo IP invece che per utente (qui non c'è login)
-                const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
-                let entry = overviewRateLimit.get(ip);
-                if (!entry || Date.now() - entry.windowStart > OVERVIEW_RATE_LIMIT_WINDOW_MS) {
-                    entry = { count: 0, windowStart: Date.now() };
-                }
-                if (entry.count >= OVERVIEW_MAX_REQUESTS_PER_HOUR) {
-                    return sendJSON(res, 429, { error: 'limit_reached', message: 'Troppe richieste, riprova più tardi.' });
-                }
-                entry.count += 1;
-                overviewRateLimit.set(ip, entry);
+                // Nessun limite qui, di proposito: /api/overview alimenta results.html
+                // e la homepage, che devono restare completamente libere, senza login
+                // e senza tetto di utilizzi. Il limite (20 ogni 4 ore) si applica SOLO
+                // a /api/ask, cioè solo alla chat vera e propria su ia.html.
 
                 if (!ANTHROPIC_API_KEY) {
                     return sendJSON(res, 500, { error: 'Chiave API non configurata sul server.' });
@@ -897,6 +1271,19 @@ const server = http.createServer((req, res) => {
     sendJSON(res, 404, { error: 'Percorso non trovato.' });
 });
 
-server.listen(PORT, function () {
-    console.log('Server in ascolto sulla porta ' + PORT);
-});
+// Prima di aprire le porte al traffico, verifichiamo/creiamo la tabella nel
+// database (se DATABASE_URL è configurata). Se qualcosa va storto qui (es.
+// stringa di connessione sbagliata), il server parte comunque, usando la
+// memoria come ripiego, invece di restare bloccato per sempre.
+initDb()
+    .then(function () {
+        server.listen(PORT, function () {
+            console.log('Server in ascolto sulla porta ' + PORT);
+        });
+    })
+    .catch(function (err) {
+        console.error('Errore inizializzazione database, si parte comunque con la memoria come ripiego:', err);
+        server.listen(PORT, function () {
+            console.log('Server in ascolto sulla porta ' + PORT + ' (database non disponibile)');
+        });
+    });
