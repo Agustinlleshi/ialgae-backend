@@ -3,7 +3,10 @@
 //
 // Espone cinque endpoint:
 //   POST /api/ask       -> risponde alle domande usando l'API di Anthropic (Claude).
-//                          Richiede login: usato dalla chat vera e propria (ia.html).
+//                          Usato dalla chat vera e propria (ia.html). Permette 20
+//                          messaggi ogni 4 ore anche senza login (contati per IP);
+//                          chi si logga passa al conteggio per account, ed è
+//                          l'unico modo per sbloccare il piano Pro (nessun limite).
 //   POST /api/overview  -> come /api/ask ma pubblico e SENZA ALCUN LIMITE: usato da
 //                          results.html e dalla homepage per il riassunto IA, il
 //                          pannello entità e l'AI Mode (conversazione multi-turno).
@@ -162,6 +165,11 @@ async function verifyMicrosoftToken(idToken) {
 
 const MAX_DAILY_MESSAGES = 20;
 const RATE_LIMIT_WINDOW_MS = 4 * 60 * 60 * 1000; // 4 ore (solo per /api/ask, la chat su ia.html)
+
+// Conteggio per indirizzo IP di chi usa /api/ask senza essere loggato (stessa
+// regola di MAX_DAILY_MESSAGES/RATE_LIMIT_WINDOW_MS). Chi si logga passa invece
+// al conteggio per account (vedi sopra), che è anche l'unico modo per avere il Pro.
+const askAnonymousRateLimit = new Map(); // ip -> { count, windowStart }
 
 // ---- DATABASE (Postgres su Neon) ----
 // Finché non imposti DATABASE_URL su Render, gli account restano SOLO in
@@ -937,22 +945,26 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 400, { error: 'Piano non valido. Usa "pro" oppure "pro_max".' });
                 }
 
-                // Se l'utente ha già fatto login, precompiliamo la sua email e lo
-                // colleghiamo (client_reference_id) al suo account interno, così il
-                // webhook più sotto sa a chi assegnare il Pro dopo il pagamento.
+                // Per passare a un piano Pro serve prima un account: lo richiediamo
+                // anche qui lato server (non solo nella pagina piani.html), così
+                // non si può aggirare il controllo chiamando l'API direttamente.
                 const user = await getUserFromRequest(req);
+                if (!user) {
+                    return sendJSON(res, 401, {
+                        error: 'not_logged_in',
+                        message: 'Devi prima creare un account per passare a un piano Pro.'
+                    });
+                }
 
                 const sessionParams = {
                     mode: 'subscription',
                     payment_method_types: ['card'],
                     line_items: [{ price: priceId, quantity: 1 }],
                     success_url: SITE_BASE_URL + '/pagamento-completato.html?session_id={CHECKOUT_SESSION_ID}',
-                    cancel_url: SITE_BASE_URL + '/piani.html'
+                    cancel_url: SITE_BASE_URL + '/piani.html',
+                    customer_email: user.email,
+                    client_reference_id: user.sub
                 };
-                if (user) {
-                    sessionParams.customer_email = user.email;
-                    sessionParams.client_reference_id = user.sub;
-                }
 
                 const session = await stripe.checkout.sessions.create(sessionParams);
                 return sendJSON(res, 200, { url: session.url });
@@ -1042,27 +1054,45 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 400, { error: 'Domanda troppo lunga.' });
                 }
 
-                // Serve essere loggati con Google per usare l'assistente
+                // ia.html non richiede più il login fin da subito: chi non è
+                // loggato ha comunque diritto a MAX_DAILY_MESSAGES messaggi ogni
+                // RATE_LIMIT_WINDOW_MS, contati per indirizzo IP. Chi è loggato usa
+                // invece il conteggio del proprio account (ed è l'unico modo per
+                // sbloccare il piano Pro, che rimuove del tutto il limite).
                 const user = await getUserFromRequest(req);
-                if (!user) {
-                    return sendJSON(res, 401, { error: 'not_logged_in', message: 'Accedi con Google per continuare.' });
-                }
 
-                // Limite di messaggi giornalieri (salta il controllo per chi ha il Pro)
-                if (Date.now() - user.windowStart > RATE_LIMIT_WINDOW_MS) {
-                    user.messageCount = 0;
-                    user.windowStart = Date.now();
+                if (user) {
+                    if (Date.now() - user.windowStart > RATE_LIMIT_WINDOW_MS) {
+                        user.messageCount = 0;
+                        user.windowStart = Date.now();
+                    }
+                    if (!user.isPro && user.messageCount >= MAX_DAILY_MESSAGES) {
+                        return sendJSON(res, 429, {
+                            error: 'limit_reached',
+                            message: 'Hai raggiunto il limite di ' + MAX_DAILY_MESSAGES + ' messaggi gratuiti. Passa a un piano Pro per continuare senza limiti, oppure riprova tra qualche ora.',
+                            unlockAt: new Date(user.windowStart + RATE_LIMIT_WINDOW_MS).toISOString(),
+                            upgradeUrl: SITE_BASE_URL + '/piani.html'
+                        });
+                    }
+                    user.messageCount += 1;
+                    await saveUser(user);
+                } else {
+                    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+                    let entry = askAnonymousRateLimit.get(ip);
+                    if (!entry || Date.now() - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+                        entry = { count: 0, windowStart: Date.now() };
+                    }
+                    if (entry.count >= MAX_DAILY_MESSAGES) {
+                        return sendJSON(res, 429, {
+                            error: 'limit_reached',
+                            message: 'Hai raggiunto il limite di ' + MAX_DAILY_MESSAGES + ' messaggi gratuiti. Passa a un piano Pro per continuare senza limiti, oppure riprova tra qualche ora.',
+                            unlockAt: new Date(entry.windowStart + RATE_LIMIT_WINDOW_MS).toISOString(),
+                            upgradeUrl: SITE_BASE_URL + '/piani.html'
+                        });
+                    }
+                    entry.count += 1;
+                    askAnonymousRateLimit.set(ip, entry);
                 }
-                if (!user.isPro && user.messageCount >= MAX_DAILY_MESSAGES) {
-                    return sendJSON(res, 429, {
-                        error: 'limit_reached',
-                        message: 'Hai raggiunto il limite di ' + MAX_DAILY_MESSAGES + ' messaggi gratuiti. Passa a un piano Pro per continuare senza limiti, oppure riprova tra qualche ora.',
-                        unlockAt: new Date(user.windowStart + RATE_LIMIT_WINDOW_MS).toISOString(),
-                        upgradeUrl: SITE_BASE_URL + '/piani.html'
-                    });
-                }
-                user.messageCount += 1;
-                await saveUser(user);
 
                 if (!ANTHROPIC_API_KEY) {
                     return sendJSON(res, 500, { error: 'Chiave API non configurata sul server.' });
