@@ -231,6 +231,7 @@ async function initDb() {
         '  email_verified BOOLEAN NOT NULL DEFAULT false,' +
         '  verify_token TEXT,' +
         '  verify_token_expires TIMESTAMPTZ,' +
+        '  stripe_customer_id TEXT,' +
         '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
         ')'
     );
@@ -241,6 +242,7 @@ async function initDb() {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT false');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_token TEXT');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_token_expires TIMESTAMPTZ');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT');
     console.log('Database pronto (tabella users verificata/creata).');
 }
 
@@ -264,7 +266,8 @@ function rowToUser(row) {
         resetTokenExpires: row.reset_token_expires ? new Date(row.reset_token_expires).getTime() : null,
         emailVerified: row.email_verified,
         verifyToken: row.verify_token,
-        verifyTokenExpires: row.verify_token_expires ? new Date(row.verify_token_expires).getTime() : null
+        verifyTokenExpires: row.verify_token_expires ? new Date(row.verify_token_expires).getTime() : null,
+        stripeCustomerId: row.stripe_customer_id
     };
 }
 
@@ -272,6 +275,21 @@ async function getUserById(id) {
     if (!id) return null;
     if (!dbEnabled) return memoryUsers.get(id) || null;
     const result = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+    return rowToUser(result.rows[0]);
+}
+
+// Cerca un utente in base al suo ID cliente Stripe (usato dal webhook quando
+// un abbonamento viene annullato dal Customer Portal: Stripe ci parla solo
+// del customer id, non del nostro account interno).
+async function getUserByStripeCustomerId(customerId) {
+    if (!customerId) return null;
+    if (!dbEnabled) {
+        for (const user of memoryUsers.values()) {
+            if (user.stripeCustomerId === customerId) return user;
+        }
+        return null;
+    }
+    const result = await pool.query('SELECT * FROM users WHERE stripe_customer_id = $1', [customerId]);
     return rowToUser(result.rows[0]);
 }
 
@@ -328,22 +346,23 @@ async function saveUser(user) {
         return user;
     }
     await pool.query(
-        'INSERT INTO users (id, email, name, surname, picture, is_pro, message_count, window_start, provider, password_hash, reset_token, reset_token_expires, email_verified, verify_token, verify_token_expires) ' +
-        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ' +
+        'INSERT INTO users (id, email, name, surname, picture, is_pro, message_count, window_start, provider, password_hash, reset_token, reset_token_expires, email_verified, verify_token, verify_token_expires, stripe_customer_id) ' +
+        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ' +
         'ON CONFLICT (id) DO UPDATE SET ' +
         '  email = EXCLUDED.email, name = EXCLUDED.name, surname = EXCLUDED.surname, picture = EXCLUDED.picture, ' +
         '  is_pro = EXCLUDED.is_pro, message_count = EXCLUDED.message_count, window_start = EXCLUDED.window_start, ' +
         '  provider = EXCLUDED.provider, password_hash = EXCLUDED.password_hash, ' +
         '  reset_token = EXCLUDED.reset_token, reset_token_expires = EXCLUDED.reset_token_expires, ' +
         '  email_verified = EXCLUDED.email_verified, verify_token = EXCLUDED.verify_token, ' +
-        '  verify_token_expires = EXCLUDED.verify_token_expires',
+        '  verify_token_expires = EXCLUDED.verify_token_expires, stripe_customer_id = EXCLUDED.stripe_customer_id',
         [
             user.sub, user.email, user.name || null, user.surname || null, user.picture || null, !!user.isPro,
             user.messageCount || 0, new Date(user.windowStart || Date.now()), user.provider,
             user.passwordHash || null, user.resetToken || null,
             user.resetTokenExpires ? new Date(user.resetTokenExpires) : null,
             !!user.emailVerified, user.verifyToken || null,
-            user.verifyTokenExpires ? new Date(user.verifyTokenExpires) : null
+            user.verifyTokenExpires ? new Date(user.verifyTokenExpires) : null,
+            user.stripeCustomerId || null
         ]
     );
     return user;
@@ -659,6 +678,48 @@ const server = http.createServer((req, res) => {
                 user: { email: user.email, name: user.name, picture: user.picture || null, isPro: !!user.isPro }
             });
         })();
+        return;
+    }
+
+    // Aggiorna il nome dell'utente loggato (usato dalla pagina profilo.html).
+    // Non permette di cambiare email o piano da qui: l'email è l'identificativo
+    // dell'account, e il piano si cambia solo tramite il checkout Stripe.
+    if (req.method === 'POST' && req.url === '/api/auth/update-profile') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                const user = await getUserFromRequest(req);
+                if (!user) {
+                    return sendJSON(res, 401, { error: 'not_logged_in' });
+                }
+
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+
+                const newName = (payload.name || '').trim();
+                if (!newName) {
+                    return sendJSON(res, 400, { error: 'Il nome non può essere vuoto.' });
+                }
+                if (newName.length > 80) {
+                    return sendJSON(res, 400, { error: 'Il nome è troppo lungo.' });
+                }
+
+                user.name = newName;
+                await saveUser(user);
+
+                return sendJSON(res, 200, {
+                    user: { email: user.email, name: user.name, picture: user.picture || null, isPro: !!user.isPro }
+                });
+            } catch (err) {
+                console.error('Errore update-profile:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
         return;
     }
 
@@ -1038,6 +1099,57 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // Apre il Customer Portal di Stripe: da lì l'utente può vedere fatture,
+    // aggiornare il metodo di pagamento, o annullare/declassare da solo il
+    // proprio abbonamento, senza bisogno di contattarci.
+    if (req.method === 'POST' && req.url === '/api/create-portal-session') {
+        (async function () {
+            try {
+                if (!stripe) {
+                    return sendJSON(res, 500, { error: 'Pagamenti non configurati sul server (STRIPE_SECRET_KEY mancante).' });
+                }
+
+                const user = await getUserFromRequest(req);
+                if (!user) {
+                    return sendJSON(res, 401, { error: 'not_logged_in' });
+                }
+
+                let customerId = user.stripeCustomerId;
+
+                // Utenti diventati Pro prima che salvassimo lo stripeCustomerId
+                // potrebbero non averlo: proviamo a recuperarlo da Stripe tramite
+                // l'email, come fallback una tantum.
+                if (!customerId) {
+                    const customers = await stripe.customers.list({ email: user.email, limit: 1 });
+                    if (customers.data.length > 0) {
+                        customerId = customers.data[0].id;
+                        user.stripeCustomerId = customerId;
+                        await saveUser(user);
+                    }
+                }
+
+                if (!customerId) {
+                    return sendJSON(res, 404, {
+                        error: 'no_subscription',
+                        message: 'Non troviamo un abbonamento attivo collegato al tuo account.'
+                    });
+                }
+
+                const portalSession = await stripe.billingPortal.sessions.create({
+                    customer: customerId,
+                    return_url: SITE_BASE_URL + '/profilo.html'
+                });
+
+                return sendJSON(res, 200, { url: portalSession.url });
+
+            } catch (err) {
+                console.error('Errore creazione sessione Customer Portal:', err);
+                return sendJSON(res, 500, { error: 'Impossibile aprire la gestione abbonamento in questo momento.' });
+            }
+        })();
+        return;
+    }
+
     // Webhook di Stripe: qui arriva la notifica quando un pagamento va davvero a
     // buon fine. È l'UNICO punto in cui l'utente diventa "Pro" per davvero — mai
     // fidarsi di quello che dice il browser, solo di quello che conferma Stripe.
@@ -1073,6 +1185,9 @@ const server = http.createServer((req, res) => {
                 }
                 if (user) {
                     user.isPro = true;
+                    if (session.customer) {
+                        user.stripeCustomerId = session.customer;
+                    }
                     await saveUser(user);
                     console.log('Utente passato a Pro:', user.email);
                 } else {
@@ -1083,6 +1198,20 @@ const server = http.createServer((req, res) => {
                     if (email) {
                         console.log('Pagamento ricevuto da un\'email non ancora collegata a un account:', email);
                     }
+                }
+            }
+
+            // L'utente ha annullato l'abbonamento dal Customer Portal (o è scaduto
+            // per pagamento non riuscito): lo togliamo da Pro. Questo evento va
+            // aggiunto esplicitamente nell'elenco eventi ascoltati dal webhook su
+            // dashboard.stripe.com, altrimenti Stripe non lo invia.
+            if (event.type === 'customer.subscription.deleted') {
+                const subscription = event.data.object;
+                const user = await getUserByStripeCustomerId(subscription.customer);
+                if (user) {
+                    user.isPro = false;
+                    await saveUser(user);
+                    console.log('Abbonamento annullato, utente non più Pro:', user.email);
                 }
             }
 
