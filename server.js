@@ -368,6 +368,16 @@ async function saveUser(user) {
     return user;
 }
 
+// Cancella definitivamente un account (usata dall'eliminazione self-service
+// in profilo.html e dallo strumento gdpr-tool.js). Operazione irreversibile.
+async function deleteUser(user) {
+    if (!dbEnabled) {
+        memoryUsers.delete(user.sub);
+        return;
+    }
+    await pool.query('DELETE FROM users WHERE id = $1', [user.sub]);
+}
+
 async function getUserFromRequest(req) {
     const authHeader = req.headers['authorization'] || '';
     const token = authHeader.replace('Bearer ', '').trim();
@@ -720,6 +730,48 @@ const server = http.createServer((req, res) => {
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         });
+        return;
+    }
+
+    // Eliminazione self-service dell'account (usata dal pulsante "Elimina
+    // account" in profilo.html). Operazione irreversibile: se l'utente ha un
+    // abbonamento Stripe attivo, lo annulliamo subito (non a fine periodo)
+    // per evitare addebiti su un account che non esiste più.
+    if (req.method === 'POST' && req.url === '/api/auth/delete-account') {
+        (async function () {
+            try {
+                const user = await getUserFromRequest(req);
+                if (!user) {
+                    return sendJSON(res, 401, { error: 'not_logged_in' });
+                }
+
+                if (stripe && user.stripeCustomerId) {
+                    try {
+                        const subscriptions = await stripe.subscriptions.list({
+                            customer: user.stripeCustomerId,
+                            status: 'active'
+                        });
+                        for (const sub of subscriptions.data) {
+                            await stripe.subscriptions.cancel(sub.id);
+                        }
+                    } catch (stripeErr) {
+                        // Non blocchiamo la cancellazione dell'account per un
+                        // errore lato Stripe: logghiamo e procediamo comunque,
+                        // così l'utente non resta bloccato. L'eventuale
+                        // abbonamento andrà controllato manualmente.
+                        console.error('Errore annullando l\'abbonamento Stripe durante l\'eliminazione account:', stripeErr);
+                    }
+                }
+
+                await deleteUser(user);
+                console.log('Account eliminato su richiesta dell\'utente:', user.email);
+
+                return sendJSON(res, 200, { message: 'Account eliminato con successo.' });
+            } catch (err) {
+                console.error('Errore delete-account:', err);
+                return sendJSON(res, 500, { error: 'Impossibile eliminare l\'account in questo momento.' });
+            }
+        })();
         return;
     }
 
