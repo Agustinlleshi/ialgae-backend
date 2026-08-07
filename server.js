@@ -171,6 +171,32 @@ const RATE_LIMIT_WINDOW_MS = 4 * 60 * 60 * 1000; // 4 ore (solo per /api/ask, la
 // al conteggio per account (vedi sopra), che è anche l'unico modo per avere il Pro.
 const askAnonymousRateLimit = new Map(); // ip -> { count, windowStart }
 
+// Rate limiting per le richieste di reset password (endpoint
+// /api/auth/forgot-password). Senza questo limite, chiunque potrebbe inviare
+// richieste illimitate verso la stessa email (spam) o da uno stesso IP verso
+// email diverse (abuso), danneggiando la deliverability del dominio email.
+const MAX_RESET_REQUESTS = 3;
+const RESET_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ora
+const resetRateLimitByEmail = new Map(); // email -> { count, windowStart }
+const resetRateLimitByIp = new Map();    // ip -> { count, windowStart }
+
+// Controlla e aggiorna un contatore di rate limit in una Map. Ritorna true se
+// la richiesta è consentita (e in tal caso incrementa il contatore), false se
+// il limite è già stato raggiunto per la finestra corrente.
+function checkAndConsumeRateLimit(map, key, maxCount, windowMs) {
+    let entry = map.get(key);
+    if (!entry || Date.now() - entry.windowStart > windowMs) {
+        entry = { count: 0, windowStart: Date.now() };
+    }
+    if (entry.count >= maxCount) {
+        map.set(key, entry);
+        return false;
+    }
+    entry.count += 1;
+    map.set(key, entry);
+    return true;
+}
+
 // ---- DATABASE (Postgres su Neon) ----
 // Finché non imposti DATABASE_URL su Render, gli account restano SOLO in
 // memoria (si perdono a ogni riavvio, come prima). Appena aggiungi la
@@ -865,6 +891,21 @@ const server = http.createServer((req, res) => {
                 const email = (payload.email || '').trim().toLowerCase();
                 if (!EMAIL_REGEX.test(email)) {
                     return sendJSON(res, 400, { error: 'Email non valida.' });
+                }
+
+                // Limite di frequenza: max MAX_RESET_REQUESTS richieste per
+                // ora, sia per email (evita spam ripetuto verso lo stesso
+                // utente) sia per IP (evita che una sola sorgente bombardi
+                // email diverse). La risposta in caso di blocco resta
+                // generica, per non rivelare quali email sono registrate.
+                const resetIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+                const emailAllowed = checkAndConsumeRateLimit(resetRateLimitByEmail, email, MAX_RESET_REQUESTS, RESET_RATE_LIMIT_WINDOW_MS);
+                const ipAllowed = checkAndConsumeRateLimit(resetRateLimitByIp, resetIp, MAX_RESET_REQUESTS, RESET_RATE_LIMIT_WINDOW_MS);
+                if (!emailAllowed || !ipAllowed) {
+                    return sendJSON(res, 429, {
+                        error: 'limit_reached',
+                        message: 'Hai richiesto troppi reset password di recente. Riprova tra qualche minuto.'
+                    });
                 }
 
                 const user = await getUserByEmail(email);
