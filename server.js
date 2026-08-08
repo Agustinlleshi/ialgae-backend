@@ -10,7 +10,7 @@
 //   POST /api/overview  -> come /api/ask ma pubblico e SENZA ALCUN LIMITE: usato da
 //                          results.html e dalla homepage per il riassunto IA, il
 //                          pannello entità e l'AI Mode (conversazione multi-turno).
-//                          Il limite di 20 utilizzi ogni 4 ore si applica SOLO a
+//                          Il limite di 10 utilizzi ogni 4 ore si applica SOLO a
 //                          /api/ask (la chat vera e propria su ia.html).
 //   POST /api/vision    -> analizza un'immagine caricata (iAlgae Lens) usando Claude,
 //                          che ha capacità di visione (il backend è già collegato a
