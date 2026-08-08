@@ -251,6 +251,8 @@ async function initDb() {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_token TEXT');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_token_expires TIMESTAMPTZ');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT false');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT');
 
     // Cache dei risultati di ricerca: evita di richiamare Brave/Serper per
     // query già cercate di recente da qualsiasi utente. cache_key combina
@@ -339,7 +341,10 @@ function rowToUser(row) {
         emailVerified: row.email_verified,
         verifyToken: row.verify_token,
         verifyTokenExpires: row.verify_token_expires ? new Date(row.verify_token_expires).getTime() : null,
-        stripeCustomerId: row.stripe_customer_id
+        stripeCustomerId: row.stripe_customer_id,
+        suspended: row.suspended,
+        suspendedReason: row.suspended_reason,
+        createdAt: row.created_at
     };
 }
 
@@ -418,15 +423,16 @@ async function saveUser(user) {
         return user;
     }
     await pool.query(
-        'INSERT INTO users (id, email, name, surname, picture, is_pro, message_count, window_start, provider, password_hash, reset_token, reset_token_expires, email_verified, verify_token, verify_token_expires, stripe_customer_id) ' +
-        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ' +
+        'INSERT INTO users (id, email, name, surname, picture, is_pro, message_count, window_start, provider, password_hash, reset_token, reset_token_expires, email_verified, verify_token, verify_token_expires, stripe_customer_id, suspended, suspended_reason) ' +
+        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) ' +
         'ON CONFLICT (id) DO UPDATE SET ' +
         '  email = EXCLUDED.email, name = EXCLUDED.name, surname = EXCLUDED.surname, picture = EXCLUDED.picture, ' +
         '  is_pro = EXCLUDED.is_pro, message_count = EXCLUDED.message_count, window_start = EXCLUDED.window_start, ' +
         '  provider = EXCLUDED.provider, password_hash = EXCLUDED.password_hash, ' +
         '  reset_token = EXCLUDED.reset_token, reset_token_expires = EXCLUDED.reset_token_expires, ' +
         '  email_verified = EXCLUDED.email_verified, verify_token = EXCLUDED.verify_token, ' +
-        '  verify_token_expires = EXCLUDED.verify_token_expires, stripe_customer_id = EXCLUDED.stripe_customer_id',
+        '  verify_token_expires = EXCLUDED.verify_token_expires, stripe_customer_id = EXCLUDED.stripe_customer_id, ' +
+        '  suspended = EXCLUDED.suspended, suspended_reason = EXCLUDED.suspended_reason',
         [
             user.sub, user.email, user.name || null, user.surname || null, user.picture || null, !!user.isPro,
             user.messageCount || 0, new Date(user.windowStart || Date.now()), user.provider,
@@ -434,7 +440,8 @@ async function saveUser(user) {
             user.resetTokenExpires ? new Date(user.resetTokenExpires) : null,
             !!user.emailVerified, user.verifyToken || null,
             user.verifyTokenExpires ? new Date(user.verifyTokenExpires) : null,
-            user.stripeCustomerId || null
+            user.stripeCustomerId || null,
+            !!user.suspended, user.suspendedReason || null
         ]
     );
     return user;
@@ -456,7 +463,12 @@ async function getUserFromRequest(req) {
     if (!token) return null;
     try {
         const decoded = jwt.verify(token, SESSION_SECRET);
-        return await getUserById(decoded.sub);
+        const user = await getUserById(decoded.sub);
+        // Un account sospeso viene trattato come "non loggato" ovunque nel
+        // sito, anche se ha ancora un token valido salvato nel browser: la
+        // sospensione deve avere effetto immediato, non solo al prossimo login.
+        if (user && user.suspended) return null;
+        return user;
     } catch (err) {
         return null;
     }
@@ -652,6 +664,13 @@ const server = http.createServer((req, res) => {
                     }
                 }
 
+                if (user.suspended) {
+                    return sendJSON(res, 403, {
+                        error: 'account_suspended',
+                        message: 'Il tuo account è stato sospeso per violazione dei Termini di Servizio. Se ritieni sia un errore, contattaci a info@ialgae.com.'
+                    });
+                }
+
                 const sessionToken = jwt.sign(
                     { sub: user.sub },
                     SESSION_SECRET,
@@ -731,6 +750,13 @@ const server = http.createServer((req, res) => {
                         };
                         await saveUser(user);
                     }
+                }
+
+                if (user.suspended) {
+                    return sendJSON(res, 403, {
+                        error: 'account_suspended',
+                        message: 'Il tuo account è stato sospeso per violazione dei Termini di Servizio. Se ritieni sia un errore, contattaci a info@ialgae.com.'
+                    });
                 }
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
@@ -887,6 +913,189 @@ const server = http.createServer((req, res) => {
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         })();
+        return;
+    }
+
+    // Cerca un utente per email (pannello "Gestione utenti" in admin-stats.html).
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/find-user') === 0) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                const fullUrl = new URL(req.url, 'http://localhost');
+                const secret = fullUrl.searchParams.get('secret') || '';
+                if (secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Chiave non valida.' });
+                }
+                const email = (fullUrl.searchParams.get('email') || '').trim().toLowerCase();
+                if (!email) {
+                    return sendJSON(res, 400, { error: 'Email mancante.' });
+                }
+
+                const user = await getUserByEmail(email);
+                if (!user) {
+                    return sendJSON(res, 404, { error: 'Nessun utente trovato con questa email.' });
+                }
+
+                return sendJSON(res, 200, {
+                    user: {
+                        email: user.email,
+                        name: user.name,
+                        isPro: !!user.isPro,
+                        provider: user.provider,
+                        createdAt: user.createdAt,
+                        suspended: !!user.suspended,
+                        suspendedReason: user.suspendedReason || null
+                    }
+                });
+            } catch (err) {
+                console.error('Errore admin/find-user:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Sospende un account: da questo momento non può più accedere (login
+    // bloccato e sessioni già aperte invalidate), ma i dati restano intatti
+    // — a differenza della cancellazione, è un'azione reversibile.
+    if (req.method === 'POST' && req.url === '/api/admin/suspend-user') {
+        let suspendBody = '';
+        req.on('data', function (chunk) { suspendBody += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                let payload;
+                try {
+                    payload = JSON.parse(suspendBody || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+                if (payload.secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Chiave non valida.' });
+                }
+                const email = (payload.email || '').trim().toLowerCase();
+                if (!email) {
+                    return sendJSON(res, 400, { error: 'Email mancante.' });
+                }
+
+                const user = await getUserByEmail(email);
+                if (!user) {
+                    return sendJSON(res, 404, { error: 'Nessun utente trovato con questa email.' });
+                }
+
+                user.suspended = true;
+                user.suspendedReason = (payload.reason || '').trim() || null;
+                await saveUser(user);
+                console.log('Account sospeso da admin:', user.email, '-', user.suspendedReason || '(nessun motivo indicato)');
+
+                return sendJSON(res, 200, { message: 'Account sospeso.' });
+            } catch (err) {
+                console.error('Errore admin/suspend-user:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Riattiva un account precedentemente sospeso.
+    if (req.method === 'POST' && req.url === '/api/admin/unsuspend-user') {
+        let unsuspendBody = '';
+        req.on('data', function (chunk) { unsuspendBody += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                let payload;
+                try {
+                    payload = JSON.parse(unsuspendBody || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+                if (payload.secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Chiave non valida.' });
+                }
+                const email = (payload.email || '').trim().toLowerCase();
+                if (!email) {
+                    return sendJSON(res, 400, { error: 'Email mancante.' });
+                }
+
+                const user = await getUserByEmail(email);
+                if (!user) {
+                    return sendJSON(res, 404, { error: 'Nessun utente trovato con questa email.' });
+                }
+
+                user.suspended = false;
+                user.suspendedReason = null;
+                await saveUser(user);
+                console.log('Account riattivato da admin:', user.email);
+
+                return sendJSON(res, 200, { message: 'Account riattivato.' });
+            } catch (err) {
+                console.error('Errore admin/unsuspend-user:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Cancella definitivamente un account (stessa logica dell'eliminazione
+    // self-service: annulla anche un eventuale abbonamento Stripe attivo,
+    // così non resta un addebito su un account che non esiste più).
+    if (req.method === 'POST' && req.url === '/api/admin/delete-user') {
+        let deleteBody = '';
+        req.on('data', function (chunk) { deleteBody += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                let payload;
+                try {
+                    payload = JSON.parse(deleteBody || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+                if (payload.secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Chiave non valida.' });
+                }
+                const email = (payload.email || '').trim().toLowerCase();
+                if (!email) {
+                    return sendJSON(res, 400, { error: 'Email mancante.' });
+                }
+
+                const user = await getUserByEmail(email);
+                if (!user) {
+                    return sendJSON(res, 404, { error: 'Nessun utente trovato con questa email.' });
+                }
+
+                if (stripe && user.stripeCustomerId) {
+                    try {
+                        const subscriptions = await stripe.subscriptions.list({
+                            customer: user.stripeCustomerId,
+                            status: 'active'
+                        });
+                        for (const sub of subscriptions.data) {
+                            await stripe.subscriptions.cancel(sub.id);
+                        }
+                    } catch (stripeErr) {
+                        console.error('Errore annullando abbonamento Stripe durante eliminazione admin:', stripeErr);
+                    }
+                }
+
+                await deleteUser(user);
+                console.log('Account eliminato da admin:', email);
+
+                return sendJSON(res, 200, { message: 'Account eliminato.' });
+            } catch (err) {
+                console.error('Errore admin/delete-user:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
         return;
     }
 
@@ -1083,6 +1292,13 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 403, {
                         error: 'email_not_verified',
                         message: 'Devi prima confermare la tua email. Controlla la tua casella (anche lo spam) per il link di conferma.'
+                    });
+                }
+
+                if (user.suspended) {
+                    return sendJSON(res, 403, {
+                        error: 'account_suspended',
+                        message: 'Il tuo account è stato sospeso per violazione dei Termini di Servizio. Se ritieni sia un errore, contattaci a info@ialgae.com.'
                     });
                 }
 
