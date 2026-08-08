@@ -91,6 +91,14 @@ const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
+// Chiave di test per la demo di Serper.dev (facoltativa, non usata dal
+// resto del sito): serve solo per la pagina test-serper.html, per
+// verificare come sarebbero i risultati usando Serper invece di Brave.
+const SERPER_API_KEY = process.env.SERPER_API_KEY;
+// Chiave segreta per proteggere le statistiche interne (es. iscrizioni
+// giornaliere). Impostala su Render come stringa lunga e casuale, inventata
+// da te: chi non la conosce non può vedere i dati statistici del sito.
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
 const MAX_QUESTION_LENGTH = 2000;
 const MAX_IMAGE_BASE64_LENGTH = 6000000; // ~4.5 MB di immagine decodificata
 const RESULTS_PER_PAGE = 10;
@@ -243,11 +251,75 @@ async function initDb() {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_token TEXT');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_token_expires TIMESTAMPTZ');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT');
+
+    // Cache dei risultati di ricerca: evita di richiamare Brave/Serper per
+    // query già cercate di recente da qualsiasi utente. cache_key combina
+    // query normalizzata + tipo + pagina, così "pizza" pagina 1 e pagina 2
+    // restano voci separate. expires_at determina quando la voce va
+    // considerata "vecchia" e ricalcolata.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS search_cache (' +
+        '  cache_key TEXT PRIMARY KEY,' +
+        '  results JSONB NOT NULL,' +
+        '  source TEXT NOT NULL,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),' +
+        '  expires_at TIMESTAMPTZ NOT NULL' +
+        ')'
+    );
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_search_cache_expires ON search_cache (expires_at)');
+
     console.log('Database pronto (tabella users verificata/creata).');
 }
 
 // Usato SOLO se DATABASE_URL non è configurata (vedi sopra).
 const memoryUsers = new Map();
+
+// Quanto resta valida una voce di cache prima di essere ricalcolata.
+const SEARCH_CACHE_TTL_MS = 2 * 60 * 60 * 1000; // 2 ore
+
+// Costruisce una chiave di cache stabile per una combinazione di ricerca.
+// Query normalizzata (minuscolo, spazi ripuliti) così "Pizza " e "pizza"
+// condividono la stessa voce di cache.
+function buildSearchCacheKey(query, type, page) {
+    const normalizedQuery = (query || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    return type + ':' + page + ':' + normalizedQuery;
+}
+
+// Ritorna { results, source } se una voce valida (non scaduta) esiste in
+// cache, altrimenti null. Se il database non è configurato, la cache è
+// semplicemente disattivata (si torna sempre a chiamare Brave/Serper).
+async function getCachedSearch(cacheKey) {
+    if (!dbEnabled) return null;
+    try {
+        const result = await pool.query(
+            'SELECT results, source FROM search_cache WHERE cache_key = $1 AND expires_at > now()',
+            [cacheKey]
+        );
+        if (result.rows.length === 0) return null;
+        return { results: result.rows[0].results, source: result.rows[0].source };
+    } catch (err) {
+        // Un problema con la cache non deve mai far fallire una ricerca:
+        // logghiamo e trattiamo come "cache assente".
+        console.error('Errore lettura search_cache:', err);
+        return null;
+    }
+}
+
+// Salva (o sovrascrive) una voce di cache con una nuova scadenza.
+async function saveCachedSearch(cacheKey, results, source) {
+    if (!dbEnabled) return;
+    try {
+        const expiresAt = new Date(Date.now() + SEARCH_CACHE_TTL_MS);
+        await pool.query(
+            'INSERT INTO search_cache (cache_key, results, source, expires_at) VALUES ($1, $2, $3, $4) ' +
+            'ON CONFLICT (cache_key) DO UPDATE SET results = EXCLUDED.results, source = EXCLUDED.source, ' +
+            '  created_at = now(), expires_at = EXCLUDED.expires_at',
+            [cacheKey, JSON.stringify(results), source, expiresAt]
+        );
+    } catch (err) {
+        console.error('Errore scrittura search_cache:', err);
+    }
+}
 
 function rowToUser(row) {
     if (!row) return null;
@@ -770,6 +842,49 @@ const server = http.createServer((req, res) => {
             } catch (err) {
                 console.error('Errore delete-account:', err);
                 return sendJSON(res, 500, { error: 'Impossibile eliminare l\'account in questo momento.' });
+            }
+        })();
+        return;
+    }
+
+    // Statistiche interne (iscrizioni giornaliere, totali). Protetto da una
+    // chiave segreta passata come query string, dato che non esiste un vero
+    // sistema di ruoli admin sul sito: solo chi conosce ADMIN_SECRET può
+    // vedere questi dati. Pensato per essere consultato da admin-stats.html.
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/signups') === 0) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                const fullUrl = new URL(req.url, 'http://localhost');
+                const secret = fullUrl.searchParams.get('secret') || '';
+                if (secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Chiave non valida.' });
+                }
+                if (!dbEnabled) {
+                    return sendJSON(res, 500, { error: 'Database non configurato: nessuna statistica disponibile.' });
+                }
+
+                const dailyResult = await pool.query(
+                    "SELECT to_char(created_at, 'YYYY-MM-DD') AS day, COUNT(*)::int AS count " +
+                    'FROM users WHERE created_at >= now() - interval \'30 days\' ' +
+                    'GROUP BY day ORDER BY day'
+                );
+                const totalsResult = await pool.query(
+                    'SELECT COUNT(*)::int AS total, ' +
+                    'COUNT(*) FILTER (WHERE is_pro)::int AS pro_count ' +
+                    'FROM users'
+                );
+
+                return sendJSON(res, 200, {
+                    daily: dailyResult.rows,
+                    total: totalsResult.rows[0].total,
+                    proCount: totalsResult.rows[0].pro_count
+                });
+            } catch (err) {
+                console.error('Errore admin/signups:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         })();
         return;
@@ -1576,6 +1691,56 @@ const server = http.createServer((req, res) => {
     }
 
     // Endpoint risultati di ricerca reali (proxy verso Brave Search API)
+    // Endpoint di TEST per la demo di Serper.dev: isolato dal resto del sito,
+    // usato solo da test-serper.html per una prova reale. Non tocca in alcun
+    // modo /api/search (quello vero, con Brave) usato da results.html.
+    if (req.method === 'GET' && req.url.indexOf('/api/search-serper-test') === 0) {
+        (async function () {
+            try {
+                const fullUrl = new URL(req.url, 'http://localhost');
+                const q = (fullUrl.searchParams.get('q') || '').trim();
+
+                if (!q) {
+                    return sendJSON(res, 200, { results: [] });
+                }
+                if (!SERPER_API_KEY) {
+                    return sendJSON(res, 500, { error: 'Chiave Serper non configurata sul server (SERPER_API_KEY).' });
+                }
+
+                const serperResponse = await fetch('https://google.serper.dev/search', {
+                    method: 'POST',
+                    headers: {
+                        'X-API-KEY': SERPER_API_KEY,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ q: q, gl: 'it', hl: 'it' })
+                });
+
+                if (!serperResponse.ok) {
+                    const errText = await serperResponse.text();
+                    console.error('Errore Serper API:', serperResponse.status, errText);
+                    return sendJSON(res, 502, { error: 'Servizio di ricerca (Serper) non raggiungibile al momento.' });
+                }
+
+                const data = await serperResponse.json();
+                const organic = Array.isArray(data.organic) ? data.organic : [];
+                const results = organic.map(function (r) {
+                    return {
+                        title: r.title || '',
+                        url: r.link || '',
+                        description: r.snippet || ''
+                    };
+                });
+
+                return sendJSON(res, 200, { results: results });
+            } catch (err) {
+                console.error('Errore search-serper-test:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/search') === 0) {
         (async function () {
             try {
@@ -1591,6 +1756,24 @@ const server = http.createServer((req, res) => {
 
                 if (!q) {
                     return sendJSON(res, 200, { results: [], totalPages: 0, page: page, type: type });
+                }
+
+                // Prima di chiamare Brave/Serper, controlliamo se qualcuno ha già
+                // cercato la stessa cosa di recente: se sì, rispondiamo subito da
+                // cache senza consumare quota delle API esterne.
+                const cacheKey = buildSearchCacheKey(q, type, page);
+                const cached = await getCachedSearch(cacheKey);
+                if (cached) {
+                    return sendJSON(res, 200, {
+                        results: cached.results,
+                        page: page,
+                        totalPages: (type === 'images') ? 1 : 10,
+                        type: type,
+                        query: q,
+                        alteredQuery: null,
+                        source: cached.source,
+                        fromCache: true
+                    });
                 }
 
                 if (!BRAVE_API_KEY) {
@@ -1676,6 +1859,52 @@ const server = http.createServer((req, res) => {
                     });
                 }
 
+                // Riserva: se la ricerca web di Brave non trova nulla (capita più
+                // spesso su query locali/geografiche, dove l'indice di Brave è più
+                // debole), proviamo Serper come secondo tentativo prima di arrenderci.
+                // Solo sulla prima pagina, per non moltiplicare le chiamate a Serper
+                // (che ha una quota gratuita limitata) su paginazioni successive.
+                let usedFallback = false;
+                if (type === 'web' && results.length === 0 && page === 1 && SERPER_API_KEY) {
+                    try {
+                        const serperResponse = await fetch('https://google.serper.dev/search', {
+                            method: 'POST',
+                            headers: {
+                                'X-API-KEY': SERPER_API_KEY,
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({ q: q, gl: 'it', hl: 'it' })
+                        });
+                        if (serperResponse.ok) {
+                            const serperData = await serperResponse.json();
+                            const organic = Array.isArray(serperData.organic) ? serperData.organic : [];
+                            if (organic.length > 0) {
+                                results = organic.map(function (r) {
+                                    return {
+                                        title: r.title || '',
+                                        url: r.link || '',
+                                        description: r.snippet || ''
+                                    };
+                                });
+                                usedFallback = true;
+                            }
+                        } else {
+                            console.error('Riserva Serper non riuscita:', serperResponse.status);
+                        }
+                    } catch (fallbackErr) {
+                        // Se anche la riserva fallisce, va bene: rispondiamo comunque
+                        // con l'elenco vuoto di Brave, invece di far fallire tutto.
+                        console.error('Errore nella riserva Serper:', fallbackErr);
+                    }
+                }
+
+                // Salviamo il risultato in cache (solo se abbiamo trovato qualcosa:
+                // non ha senso cachare una lista vuota, potrebbe essere un problema
+                // temporaneo del provider più che una vera assenza di risultati).
+                if (results.length > 0) {
+                    await saveCachedSearch(cacheKey, results, usedFallback ? 'serper' : 'brave');
+                }
+
                 return sendJSON(res, 200, {
                     results: results,
                     page: page,
@@ -1684,7 +1913,8 @@ const server = http.createServer((req, res) => {
                     query: q,
                     // "Forse cercavi...": Brave a volte corregge da sola un probabile errore
                     // di battitura. Se lo fa, ce lo dice qui — non lo inventiamo noi.
-                    alteredQuery: (data.query && data.query.altered) ? data.query.altered : null
+                    alteredQuery: (data.query && data.query.altered) ? data.query.altered : null,
+                    source: usedFallback ? 'serper' : 'brave'
                 });
 
             } catch (err) {
@@ -1715,3 +1945,16 @@ initDb()
             console.log('Server in ascolto sulla porta ' + PORT + ' (database non disponibile)');
         });
     });
+
+// Pulizia periodica delle voci di cache scadute, così la tabella non cresce
+// all'infinito nel tempo. Non è indispensabile per il funzionamento (le voci
+// scadute vengono comunque ignorate dalle query grazie a "expires_at > now()"),
+// ma tiene il database più leggero. Gira ogni ora.
+if (dbEnabled) {
+    setInterval(function () {
+        pool.query('DELETE FROM search_cache WHERE expires_at <= now()')
+            .catch(function (err) {
+                console.error('Errore pulizia search_cache:', err);
+            });
+    }, 60 * 60 * 1000);
+}
