@@ -10,7 +10,7 @@
 //   POST /api/overview  -> come /api/ask ma pubblico e SENZA ALCUN LIMITE: usato da
 //                          results.html e dalla homepage per il riassunto IA, il
 //                          pannello entità e l'AI Mode (conversazione multi-turno).
-//                          Il limite di 10 utilizzi ogni 4 ore si applica SOLO a
+//                          Il limite di 20 utilizzi ogni 4 ore si applica SOLO a
 //                          /api/ask (la chat vera e propria su ia.html).
 //   POST /api/vision    -> analizza un'immagine caricata (iAlgae Lens) usando Claude,
 //                          che ha capacità di visione (il backend è già collegato a
@@ -91,6 +91,7 @@ const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
+const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
 // Chiave di test per la demo di Serper.dev (facoltativa, non usata dal
 // resto del sito): serve solo per la pagina test-serper.html, per
 // verificare come sarebbero i risultati usando Serper invece di Brave.
@@ -1951,6 +1952,41 @@ const server = http.createServer((req, res) => {
                 return sendJSON(res, 200, { results: results });
             } catch (err) {
                 console.error('Errore search-serper-test:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Scheda "Libri": facciamo da tramite verso Google Books, così la chiave
+    // API resta solo sul server e non è mai visibile a chi guarda il
+    // codice sorgente della pagina.
+    if (req.method === 'GET' && req.url.indexOf('/api/books') === 0) {
+        (async function () {
+            try {
+                const fullUrl = new URL(req.url, 'http://localhost');
+                const q = (fullUrl.searchParams.get('q') || '').trim();
+
+                if (!q) {
+                    return sendJSON(res, 200, { items: [] });
+                }
+
+                if (!GOOGLE_BOOKS_API_KEY) {
+                    return sendJSON(res, 500, { error: 'Chiave Google Books non configurata sul server (GOOGLE_BOOKS_API_KEY).' });
+                }
+
+                const booksUrl = 'https://www.googleapis.com/books/v1/volumes?q=' + encodeURIComponent(q) + '&maxResults=20&key=' + GOOGLE_BOOKS_API_KEY;
+                const booksResponse = await fetch(booksUrl);
+                const data = await booksResponse.json();
+
+                if (!booksResponse.ok || data.error) {
+                    console.error('Errore Google Books API:', booksResponse.status, data.error || data);
+                    return sendJSON(res, 502, { error: 'Servizio libri non raggiungibile al momento.' });
+                }
+
+                return sendJSON(res, 200, { items: data.items || [] });
+            } catch (err) {
+                console.error('Errore endpoint /api/books:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         })();
