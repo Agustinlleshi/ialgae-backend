@@ -271,6 +271,34 @@ async function initDb() {
     );
     await pool.query('CREATE INDEX IF NOT EXISTS idx_search_cache_expires ON search_cache (expires_at)');
 
+    // Blog: articoli scritti in markdown, con stato bozza/pubblicato.
+    // "slug" è la versione URL-friendly del titolo (es. "la-mia-storia"),
+    // usata nell'indirizzo della pagina dell'articolo.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS blog_posts (' +
+        '  id SERIAL PRIMARY KEY,' +
+        '  slug TEXT UNIQUE NOT NULL,' +
+        '  title TEXT NOT NULL,' +
+        '  excerpt TEXT,' +
+        '  content TEXT NOT NULL,' +
+        '  cover_image TEXT,' +
+        '  category TEXT,' +
+        '  author TEXT,' +
+        '  tags TEXT[] NOT NULL DEFAULT \'{}\',' +
+        '  read_time_minutes INTEGER NOT NULL DEFAULT 1,' +
+        '  published BOOLEAN NOT NULL DEFAULT false,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),' +
+        '  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),' +
+        '  published_at TIMESTAMPTZ' +
+        ')'
+    );
+    // Se la tabella blog_posts esisteva già da prima di queste colonne,
+    // le aggiungiamo qui senza toccare gli articoli già scritti.
+    await pool.query('ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS category TEXT');
+    await pool.query('ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS author TEXT');
+    await pool.query('ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT \'{}\'');
+    await pool.query('ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS read_time_minutes INTEGER NOT NULL DEFAULT 1');
+
     console.log('Database pronto (tabella users verificata/creata).');
 }
 
@@ -1992,6 +2020,243 @@ const server = http.createServer((req, res) => {
         })();
         return;
     }
+
+    // ===== BLOG =====
+
+    // Stima il tempo di lettura: circa 200 parole al minuto, arrotondato
+    // per eccesso e mai sotto 1 minuto.
+    function estimateReadTime(content) {
+        const wordCount = String(content).trim().split(/\s+/).filter(Boolean).length;
+        return Math.max(1, Math.ceil(wordCount / 200));
+    }
+
+    // Genera uno "slug" leggibile e unico a partire dal titolo (es. "La mia
+    // storia!" -> "la-mia-storia"). Se lo slug esiste già, aggiunge un
+    // numero in fondo (la-mia-storia-2) per non avere collisioni.
+    function slugify(title) {
+        return String(title)
+            .toLowerCase()
+            .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // accenti -> lettere semplici
+            .replace(/[^a-z0-9\s-]/g, '')
+            .trim()
+            .replace(/\s+/g, '-')
+            .replace(/-+/g, '-')
+            .slice(0, 80) || 'articolo';
+    }
+    async function generateUniqueSlug(title, excludeId) {
+        const base = slugify(title);
+        let slug = base;
+        let counter = 2;
+        while (true) {
+            const existing = await pool.query(
+                'SELECT id FROM blog_posts WHERE slug = $1' + (excludeId ? ' AND id != $2' : ''),
+                excludeId ? [slug, excludeId] : [slug]
+            );
+            if (existing.rows.length === 0) return slug;
+            slug = base + '-' + counter;
+            counter++;
+        }
+    }
+
+    // Elenco pubblico degli articoli PUBBLICATI (per la pagina blog.html).
+    if (req.method === 'GET' && req.url.indexOf('/api/blog/posts') === 0 && req.url.indexOf('/api/blog/admin') !== 0) {
+        (async function () {
+            try {
+                if (!dbEnabled) return sendJSON(res, 200, { posts: [] });
+                const result = await pool.query(
+                    'SELECT slug, title, excerpt, cover_image, category, author, tags, read_time_minutes, published_at FROM blog_posts ' +
+                    'WHERE published = true ORDER BY published_at DESC'
+                );
+                return sendJSON(res, 200, { posts: result.rows });
+            } catch (err) {
+                console.error('Errore /api/blog/posts:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Singolo articolo pubblicato, per slug (per blog-post.html).
+    if (req.method === 'GET' && req.url.indexOf('/api/blog/post/') === 0) {
+        (async function () {
+            try {
+                const slug = decodeURIComponent(req.url.split('/api/blog/post/')[1].split('?')[0]);
+                if (!dbEnabled || !slug) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
+                const result = await pool.query(
+                    'SELECT slug, title, content, cover_image, category, author, tags, read_time_minutes, published_at FROM blog_posts ' +
+                    'WHERE slug = $1 AND published = true',
+                    [slug]
+                );
+                if (result.rows.length === 0) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
+                return sendJSON(res, 200, { post: result.rows[0] });
+            } catch (err) {
+                console.error('Errore /api/blog/post/:slug:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Admin: elenco DI TUTTI gli articoli (bozze incluse), protetto da ADMIN_SECRET.
+    if (req.method === 'GET' && req.url.indexOf('/api/blog/admin/posts') === 0) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                const fullUrl = new URL(req.url, 'http://localhost');
+                if (fullUrl.searchParams.get('secret') !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Chiave non valida.' });
+                }
+                if (!dbEnabled) return sendJSON(res, 200, { posts: [] });
+                const result = await pool.query(
+                    'SELECT id, slug, title, excerpt, category, published, created_at, updated_at, published_at ' +
+                    'FROM blog_posts ORDER BY created_at DESC'
+                );
+                return sendJSON(res, 200, { posts: result.rows });
+            } catch (err) {
+                console.error('Errore /api/blog/admin/posts:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Admin: dettaglio completo di un articolo (per caricarlo nel form di modifica).
+    if (req.method === 'GET' && req.url.indexOf('/api/blog/admin/post/') === 0) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                const fullUrl = new URL(req.url, 'http://localhost');
+                if (fullUrl.searchParams.get('secret') !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Chiave non valida.' });
+                }
+                const id = req.url.split('/api/blog/admin/post/')[1].split('?')[0];
+                const result = await pool.query('SELECT * FROM blog_posts WHERE id = $1', [id]);
+                if (result.rows.length === 0) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
+                return sendJSON(res, 200, { post: result.rows[0] });
+            } catch (err) {
+                console.error('Errore /api/blog/admin/post/:id:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Admin: crea un nuovo articolo (bozza o pubblicato direttamente).
+    if (req.method === 'POST' && req.url === '/api/blog/admin/create') {
+        let createBody = '';
+        req.on('data', function (chunk) { createBody += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                let payload;
+                try { payload = JSON.parse(createBody || '{}'); }
+                catch (e) { return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' }); }
+                if (payload.secret !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Chiave non valida.' });
+
+                const title = (payload.title || '').trim();
+                const content = (payload.content || '').trim();
+                if (!title || !content) return sendJSON(res, 400, { error: 'Titolo e contenuto sono obbligatori.' });
+
+                const excerpt = (payload.excerpt || '').trim() || content.slice(0, 160).trim() + '…';
+                const coverImage = (payload.coverImage || '').trim() || null;
+                const category = (payload.category || '').trim() || null;
+                const author = (payload.author || '').trim() || 'Team iAlgae';
+                const tags = Array.isArray(payload.tags)
+                    ? payload.tags.map(function (t) { return String(t).trim(); }).filter(Boolean)
+                    : String(payload.tags || '').split(',').map(function (t) { return t.trim(); }).filter(Boolean);
+                const readTime = estimateReadTime(content);
+                const published = !!payload.published;
+                const slug = await generateUniqueSlug(title);
+
+                const result = await pool.query(
+                    'INSERT INTO blog_posts (slug, title, excerpt, content, cover_image, category, author, tags, read_time_minutes, published, published_at) ' +
+                    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, ' + (published ? 'now()' : 'NULL') + ') RETURNING id, slug',
+                    [slug, title, excerpt, content, coverImage, category, author, tags, readTime, published]
+                );
+                return sendJSON(res, 200, { id: result.rows[0].id, slug: result.rows[0].slug });
+            } catch (err) {
+                console.error('Errore /api/blog/admin/create:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Admin: aggiorna un articolo esistente (modifica, pubblica/spubblica).
+    if (req.method === 'POST' && req.url === '/api/blog/admin/update') {
+        let updateBody = '';
+        req.on('data', function (chunk) { updateBody += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                let payload;
+                try { payload = JSON.parse(updateBody || '{}'); }
+                catch (e) { return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' }); }
+                if (payload.secret !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Chiave non valida.' });
+
+                const id = payload.id;
+                if (!id) return sendJSON(res, 400, { error: 'ID articolo mancante.' });
+
+                const existing = await pool.query('SELECT * FROM blog_posts WHERE id = $1', [id]);
+                if (existing.rows.length === 0) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
+                const current = existing.rows[0];
+
+                const title = (payload.title || current.title).trim();
+                const content = (payload.content || current.content).trim();
+                const excerpt = (payload.excerpt || '').trim() || content.slice(0, 160).trim() + '…';
+                const coverImage = payload.coverImage !== undefined ? (payload.coverImage || null) : current.cover_image;
+                const category = payload.category !== undefined ? ((payload.category || '').trim() || null) : current.category;
+                const author = payload.author !== undefined ? ((payload.author || '').trim() || 'Team iAlgae') : current.author;
+                const tags = payload.tags !== undefined
+                    ? (Array.isArray(payload.tags)
+                        ? payload.tags.map(function (t) { return String(t).trim(); }).filter(Boolean)
+                        : String(payload.tags || '').split(',').map(function (t) { return t.trim(); }).filter(Boolean))
+                    : current.tags;
+                const readTime = estimateReadTime(content);
+                const published = payload.published !== undefined ? !!payload.published : current.published;
+                const slug = title !== current.title ? await generateUniqueSlug(title, id) : current.slug;
+                const wasPublished = current.published;
+
+                await pool.query(
+                    'UPDATE blog_posts SET slug = $1, title = $2, excerpt = $3, content = $4, cover_image = $5, ' +
+                    'category = $6, author = $7, tags = $8, read_time_minutes = $9, published = $10, updated_at = now()' +
+                    (published && !wasPublished ? ', published_at = now()' : '') +
+                    ' WHERE id = $11',
+                    [slug, title, excerpt, content, coverImage, category, author, tags, readTime, published, id]
+                );
+                return sendJSON(res, 200, { message: 'Articolo aggiornato.', slug: slug });
+            } catch (err) {
+                console.error('Errore /api/blog/admin/update:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Admin: elimina un articolo definitivamente.
+    if (req.method === 'POST' && req.url === '/api/blog/admin/delete') {
+        let deleteBody = '';
+        req.on('data', function (chunk) { deleteBody += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                let payload;
+                try { payload = JSON.parse(deleteBody || '{}'); }
+                catch (e) { return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' }); }
+                if (payload.secret !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Chiave non valida.' });
+                if (!payload.id) return sendJSON(res, 400, { error: 'ID articolo mancante.' });
+
+                await pool.query('DELETE FROM blog_posts WHERE id = $1', [payload.id]);
+                return sendJSON(res, 200, { message: 'Articolo eliminato.' });
+            } catch (err) {
+                console.error('Errore /api/blog/admin/delete:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // ===== FINE BLOG =====
 
     if (req.method === 'GET' && req.url.indexOf('/api/search') === 0) {
         (async function () {
