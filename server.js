@@ -286,6 +286,8 @@ async function initDb() {
         '  author TEXT,' +
         '  tags TEXT[] NOT NULL DEFAULT \'{}\',' +
         '  read_time_minutes INTEGER NOT NULL DEFAULT 1,' +
+        '  card_size TEXT NOT NULL DEFAULT \'medium\',' +
+        '  sort_order INTEGER NOT NULL DEFAULT 0,' +
         '  published BOOLEAN NOT NULL DEFAULT false,' +
         '  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),' +
         '  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),' +
@@ -298,6 +300,16 @@ async function initDb() {
     await pool.query('ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS author TEXT');
     await pool.query('ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT \'{}\'');
     await pool.query('ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS read_time_minutes INTEGER NOT NULL DEFAULT 1');
+    await pool.query('ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS card_size TEXT NOT NULL DEFAULT \'medium\'');
+    await pool.query('ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0');
+    // Per gli articoli già esistenti (sort_order tutti a 0 di default),
+    // assegniamo un ordine iniziale basato sulla data di creazione, così il
+    // trascinamento nel pannello admin parte da un ordine sensato.
+    await pool.query(
+        'UPDATE blog_posts SET sort_order = sub.rn FROM (' +
+        '  SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rn FROM blog_posts' +
+        ') sub WHERE blog_posts.id = sub.id AND blog_posts.sort_order = 0'
+    );
 
     console.log('Database pronto (tabella users verificata/creata).');
 }
@@ -2064,8 +2076,8 @@ const server = http.createServer((req, res) => {
             try {
                 if (!dbEnabled) return sendJSON(res, 200, { posts: [] });
                 const result = await pool.query(
-                    'SELECT slug, title, excerpt, cover_image, category, author, tags, read_time_minutes, published_at FROM blog_posts ' +
-                    'WHERE published = true ORDER BY published_at DESC'
+                    'SELECT slug, title, excerpt, cover_image, category, author, tags, read_time_minutes, card_size, published_at FROM blog_posts ' +
+                    'WHERE published = true ORDER BY sort_order ASC, published_at DESC'
                 );
                 return sendJSON(res, 200, { posts: result.rows });
             } catch (err) {
@@ -2083,7 +2095,7 @@ const server = http.createServer((req, res) => {
                 const slug = decodeURIComponent(req.url.split('/api/blog/post/')[1].split('?')[0]);
                 if (!dbEnabled || !slug) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
                 const result = await pool.query(
-                    'SELECT slug, title, content, cover_image, category, author, tags, read_time_minutes, published_at FROM blog_posts ' +
+                    'SELECT slug, title, content, cover_image, category, author, tags, read_time_minutes, card_size, published_at FROM blog_posts ' +
                     'WHERE slug = $1 AND published = true',
                     [slug]
                 );
@@ -2108,8 +2120,8 @@ const server = http.createServer((req, res) => {
                 }
                 if (!dbEnabled) return sendJSON(res, 200, { posts: [] });
                 const result = await pool.query(
-                    'SELECT id, slug, title, excerpt, category, published, created_at, updated_at, published_at ' +
-                    'FROM blog_posts ORDER BY created_at DESC'
+                    'SELECT id, slug, title, excerpt, category, card_size, sort_order, published, created_at, updated_at, published_at ' +
+                    'FROM blog_posts ORDER BY sort_order ASC, created_at DESC'
                 );
                 return sendJSON(res, 200, { posts: result.rows });
             } catch (err) {
@@ -2144,8 +2156,18 @@ const server = http.createServer((req, res) => {
     // Admin: crea un nuovo articolo (bozza o pubblicato direttamente).
     if (req.method === 'POST' && req.url === '/api/blog/admin/create') {
         let createBody = '';
-        req.on('data', function (chunk) { createBody += chunk; });
+        let createTooLarge = false;
+        req.on('data', function (chunk) {
+            createBody += chunk;
+            if (createBody.length > MAX_IMAGE_BASE64_LENGTH) {
+                createTooLarge = true;
+                req.destroy();
+            }
+        });
         req.on('end', async function () {
+            if (createTooLarge) {
+                return sendJSON(res, 413, { error: 'Immagine troppo grande (massimo circa 4,5 MB). Prova a caricarne una più leggera.' });
+            }
             try {
                 if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
                 let payload;
@@ -2161,6 +2183,7 @@ const server = http.createServer((req, res) => {
                 const coverImage = (payload.coverImage || '').trim() || null;
                 const category = (payload.category || '').trim() || null;
                 const author = (payload.author || '').trim() || 'Team iAlgae';
+                const cardSize = ['small', 'medium', 'large'].indexOf(payload.cardSize) !== -1 ? payload.cardSize : 'medium';
                 const tags = Array.isArray(payload.tags)
                     ? payload.tags.map(function (t) { return String(t).trim(); }).filter(Boolean)
                     : String(payload.tags || '').split(',').map(function (t) { return t.trim(); }).filter(Boolean);
@@ -2168,10 +2191,15 @@ const server = http.createServer((req, res) => {
                 const published = !!payload.published;
                 const slug = await generateUniqueSlug(title);
 
+                // I nuovi articoli vanno sempre in cima all'elenco per default
+                // (l'ordine si può poi cambiare trascinando nel pannello admin).
+                const minOrderResult = await pool.query('SELECT COALESCE(MIN(sort_order), 0) - 1 AS next_order FROM blog_posts');
+                const sortOrder = minOrderResult.rows[0].next_order;
+
                 const result = await pool.query(
-                    'INSERT INTO blog_posts (slug, title, excerpt, content, cover_image, category, author, tags, read_time_minutes, published, published_at) ' +
-                    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, ' + (published ? 'now()' : 'NULL') + ') RETURNING id, slug',
-                    [slug, title, excerpt, content, coverImage, category, author, tags, readTime, published]
+                    'INSERT INTO blog_posts (slug, title, excerpt, content, cover_image, category, author, tags, read_time_minutes, card_size, sort_order, published, published_at) ' +
+                    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, ' + (published ? 'now()' : 'NULL') + ') RETURNING id, slug',
+                    [slug, title, excerpt, content, coverImage, category, author, tags, readTime, cardSize, sortOrder, published]
                 );
                 return sendJSON(res, 200, { id: result.rows[0].id, slug: result.rows[0].slug });
             } catch (err) {
@@ -2185,8 +2213,18 @@ const server = http.createServer((req, res) => {
     // Admin: aggiorna un articolo esistente (modifica, pubblica/spubblica).
     if (req.method === 'POST' && req.url === '/api/blog/admin/update') {
         let updateBody = '';
-        req.on('data', function (chunk) { updateBody += chunk; });
+        let updateTooLarge = false;
+        req.on('data', function (chunk) {
+            updateBody += chunk;
+            if (updateBody.length > MAX_IMAGE_BASE64_LENGTH) {
+                updateTooLarge = true;
+                req.destroy();
+            }
+        });
         req.on('end', async function () {
+            if (updateTooLarge) {
+                return sendJSON(res, 413, { error: 'Immagine troppo grande (massimo circa 4,5 MB). Prova a caricarne una più leggera.' });
+            }
             try {
                 if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
                 let payload;
@@ -2207,6 +2245,9 @@ const server = http.createServer((req, res) => {
                 const coverImage = payload.coverImage !== undefined ? (payload.coverImage || null) : current.cover_image;
                 const category = payload.category !== undefined ? ((payload.category || '').trim() || null) : current.category;
                 const author = payload.author !== undefined ? ((payload.author || '').trim() || 'Team iAlgae') : current.author;
+                const cardSize = payload.cardSize !== undefined
+                    ? (['small', 'medium', 'large'].indexOf(payload.cardSize) !== -1 ? payload.cardSize : 'medium')
+                    : current.card_size;
                 const tags = payload.tags !== undefined
                     ? (Array.isArray(payload.tags)
                         ? payload.tags.map(function (t) { return String(t).trim(); }).filter(Boolean)
@@ -2219,14 +2260,43 @@ const server = http.createServer((req, res) => {
 
                 await pool.query(
                     'UPDATE blog_posts SET slug = $1, title = $2, excerpt = $3, content = $4, cover_image = $5, ' +
-                    'category = $6, author = $7, tags = $8, read_time_minutes = $9, published = $10, updated_at = now()' +
+                    'category = $6, author = $7, tags = $8, read_time_minutes = $9, card_size = $10, published = $11, updated_at = now()' +
                     (published && !wasPublished ? ', published_at = now()' : '') +
-                    ' WHERE id = $11',
-                    [slug, title, excerpt, content, coverImage, category, author, tags, readTime, published, id]
+                    ' WHERE id = $12',
+                    [slug, title, excerpt, content, coverImage, category, author, tags, readTime, cardSize, published, id]
                 );
                 return sendJSON(res, 200, { message: 'Articolo aggiornato.', slug: slug });
             } catch (err) {
                 console.error('Errore /api/blog/admin/update:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Admin: salva il nuovo ordine degli articoli dopo il trascinamento nel
+    // pannello. Riceve un elenco di {id, sortOrder} e li aggiorna tutti insieme.
+    if (req.method === 'POST' && req.url === '/api/blog/admin/reorder') {
+        let reorderBody = '';
+        req.on('data', function (chunk) { reorderBody += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                let payload;
+                try { payload = JSON.parse(reorderBody || '{}'); }
+                catch (e) { return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' }); }
+                if (payload.secret !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Chiave non valida.' });
+
+                const order = Array.isArray(payload.order) ? payload.order : [];
+                if (order.length === 0) return sendJSON(res, 400, { error: 'Elenco ordine mancante.' });
+
+                for (const item of order) {
+                    if (!item.id || typeof item.sortOrder !== 'number') continue;
+                    await pool.query('UPDATE blog_posts SET sort_order = $1 WHERE id = $2', [item.sortOrder, item.id]);
+                }
+                return sendJSON(res, 200, { message: 'Ordine aggiornato.' });
+            } catch (err) {
+                console.error('Errore /api/blog/admin/reorder:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         });
