@@ -254,6 +254,12 @@ async function initDb() {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT false');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT');
+    // Elenco delle app che l'utente ha scelto di nascondere dal proprio menu
+    // "I tuoi preferiti" (personalizzazione disponibile solo da loggati).
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS hidden_apps TEXT[] NOT NULL DEFAULT \'{}\'');
+    // App personalizzate aggiunte liberamente dall'utente (nome + indirizzo),
+    // salvate come JSON: [{ "name": "...", "url": "..." }, ...]
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_apps JSONB NOT NULL DEFAULT \'[]\'');
 
     // Cache dei risultati di ricerca: evita di richiamare Brave/Serper per
     // query già cercate di recente da qualsiasi utente. cache_key combina
@@ -872,10 +878,74 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // Eliminazione self-service dell'account (usata dal pulsante "Elimina
-    // account" in profilo.html). Operazione irreversibile: se l'utente ha un
-    // abbonamento Stripe attivo, lo annulliamo subito (non a fine periodo)
-    // per evitare addebiti su un account che non esiste più.
+    // Restituisce l'elenco delle app che l'utente loggato ha scelto di
+    // nascondere, più le eventuali app personalizzate che ha aggiunto lui
+    // stesso al proprio menu "I tuoi preferiti".
+    if (req.method === 'GET' && req.url === '/api/user/hidden-apps') {
+        (async function () {
+            const user = await getUserFromRequest(req);
+            if (!user) return sendJSON(res, 401, { error: 'not_logged_in' });
+            try {
+                const result = await pool.query('SELECT hidden_apps, custom_apps FROM users WHERE id = $1', [user.sub]);
+                const row = result.rows[0] || {};
+                return sendJSON(res, 200, {
+                    hiddenApps: row.hidden_apps || [],
+                    customApps: row.custom_apps || []
+                });
+            } catch (err) {
+                console.error('Errore /api/user/hidden-apps GET:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Salva la personalizzazione: solo un utente loggato può modificarla.
+    // Riceve l'elenco COMPLETO aggiornato (app nascoste + app personalizzate),
+    // non una singola modifica, così un doppio salvataggio non crea inconsistenze.
+    if (req.method === 'POST' && req.url === '/api/user/hidden-apps') {
+        let hiddenAppsBody = '';
+        req.on('data', function (chunk) { hiddenAppsBody += chunk; });
+        req.on('end', async function () {
+            const user = await getUserFromRequest(req);
+            if (!user) return sendJSON(res, 401, { error: 'not_logged_in' });
+            try {
+                let payload;
+                try { payload = JSON.parse(hiddenAppsBody || '{}'); }
+                catch (e) { return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' }); }
+
+                const hiddenApps = Array.isArray(payload.hiddenApps)
+                    ? payload.hiddenApps.map(function (n) { return String(n).trim(); }).filter(Boolean).slice(0, 200)
+                    : [];
+
+                // Ogni app personalizzata deve avere un nome e un indirizzo web
+                // validi; scartiamo silenziosamente le voci malformate invece
+                // di far fallire l'intero salvataggio.
+                const customApps = Array.isArray(payload.customApps)
+                    ? payload.customApps
+                        .map(function (a) {
+                            const name = String((a && a.name) || '').trim().slice(0, 40);
+                            let url = String((a && a.url) || '').trim();
+                            if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+                            return { name: name, url: url };
+                        })
+                        .filter(function (a) { return a.name && /^https?:\/\/.+/i.test(a.url); })
+                        .slice(0, 30)
+                    : [];
+
+                await pool.query(
+                    'UPDATE users SET hidden_apps = $1, custom_apps = $2 WHERE id = $3',
+                    [hiddenApps, JSON.stringify(customApps), user.sub]
+                );
+                return sendJSON(res, 200, { message: 'Preferenze salvate.', hiddenApps: hiddenApps, customApps: customApps });
+            } catch (err) {
+                console.error('Errore /api/user/hidden-apps POST:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
     if (req.method === 'POST' && req.url === '/api/auth/delete-account') {
         (async function () {
             try {
