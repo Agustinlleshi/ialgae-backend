@@ -90,6 +90,12 @@ const Stripe = require('stripe');
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
+// Google Gemini è usato SOLO come riserva quando Anthropic non risponde (es.
+// credito esaurito, chiave non configurata, errore del servizio) — vedi
+// getAiAnswer() più sotto. Se GEMINI_API_KEY non è impostata su Render, il
+// sito continua a funzionare esattamente come prima, usando solo Anthropic.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
 const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
 // Chiave di test per la demo di Serper.dev (facoltativa, non usata dal
@@ -387,6 +393,114 @@ async function initDb() {
 
 // Usato SOLO se DATABASE_URL non è configurata (vedi sopra).
 const memoryUsers = new Map();
+
+// ---- IA: Anthropic (Claude) con Gemini come riserva ----
+// Le tre funzioni sotto sono usate da /api/ask, /api/overview e /api/vision.
+// getAiAnswer() prova sempre prima Claude; solo se quella chiamata fallisce
+// (credito esaurito, chiave mancante, errore del servizio, timeout) passa
+// automaticamente a Gemini, senza che l'utente se ne accorga.
+
+// Converte i messaggi in formato Anthropic (role "user"/"assistant", content
+// stringa o array di blocchi tipo {type:"text"} / {type:"image"}) nel formato
+// richiesto da Gemini (role "user"/"model", parts: [...]).
+function toGeminiContents(anthropicMessages) {
+    return anthropicMessages.map(function (m) {
+        const role = (m.role === 'assistant') ? 'model' : 'user';
+        let parts;
+        if (typeof m.content === 'string') {
+            parts = [{ text: m.content }];
+        } else if (Array.isArray(m.content)) {
+            parts = m.content.map(function (block) {
+                if (block.type === 'image') {
+                    return { inline_data: { mime_type: block.source.media_type, data: block.source.data } };
+                }
+                return { text: block.text || '' };
+            });
+        } else {
+            parts = [{ text: '' }];
+        }
+        return { role: role, parts: parts };
+    });
+}
+
+// Chiama Claude (Anthropic). Ritorna il testo della risposta, oppure lancia
+// un errore se la chiamata fallisce per qualsiasi motivo — l'errore viene
+// intercettato da getAiAnswer() per tentare automaticamente Gemini.
+async function callAnthropic(anthropicMessages) {
+    if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY non configurata');
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+            model: ANTHROPIC_MODEL,
+            max_tokens: 1000,
+            messages: anthropicMessages
+        })
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error('Anthropic ' + response.status + ': ' + errText);
+    }
+
+    const data = await response.json();
+    return (data.content || [])
+        .map(function (block) { return block.type === 'text' ? block.text : ''; })
+        .filter(Boolean)
+        .join('\n');
+}
+
+// Chiama Gemini (Google) con lo stesso formato di messaggi, convertito da
+// toGeminiContents(). Usato SOLO come riserva quando Anthropic non risponde.
+async function callGemini(anthropicMessages) {
+    if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY non configurata');
+
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_API_KEY;
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            contents: toGeminiContents(anthropicMessages),
+            generationConfig: { maxOutputTokens: 1000 }
+        })
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error('Gemini ' + response.status + ': ' + errText);
+    }
+
+    const data = await response.json();
+    const candidate = (data.candidates && data.candidates[0]) || null;
+    const parts = candidate && candidate.content && candidate.content.parts;
+    return Array.isArray(parts) ? parts.map(function (p) { return p.text || ''; }).join('\n') : '';
+}
+
+// Punto d'ingresso unico: prova prima Claude, e SOLO se fallisce passa a
+// Gemini come riserva. Ritorna { answer, provider } così i log (e volendo
+// anche il frontend) sanno sempre quale dei due ha risposto davvero. Se
+// falliscono entrambi (o nessuno dei due è configurato), lancia un errore
+// che il chiamante trasforma in una risposta 502 per l'utente.
+async function getAiAnswer(anthropicMessages) {
+    try {
+        const answer = await callAnthropic(anthropicMessages);
+        return { answer: answer, provider: 'anthropic' };
+    } catch (anthropicErr) {
+        console.error('Anthropic non disponibile, provo con Gemini come riserva:', anthropicErr.message);
+        try {
+            const answer = await callGemini(anthropicMessages);
+            return { answer: answer, provider: 'gemini' };
+        } catch (geminiErr) {
+            console.error('Anche Gemini non disponibile:', geminiErr.message);
+            throw new Error('Nessun servizio IA disponibile al momento.');
+        }
+    }
+}
 
 // ---- RICH RESULT: calcoli e conversioni di unità ----
 // Prima di interrogare Brave/Serper, controlliamo se la query è un calcolo
@@ -1959,8 +2073,8 @@ const server = http.createServer((req, res) => {
                     }
                 }
 
-                if (!ANTHROPIC_API_KEY) {
-                    return sendJSON(res, 500, { error: 'Chiave API non configurata sul server.' });
+                if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY) {
+                    return sendJSON(res, 500, { error: 'Nessuna chiave API configurata sul server.' });
                 }
 
                 // Se il sito invia l'intera cronologia della conversazione, la usiamo
@@ -1987,33 +2101,15 @@ const server = http.createServer((req, res) => {
                     anthropicMessages = [{ role: 'user', content: question.trim() }];
                 }
 
-                const response = await fetch('https://api.anthropic.com/v1/messages', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key': ANTHROPIC_API_KEY,
-                        'anthropic-version': '2023-06-01'
-                    },
-                    body: JSON.stringify({
-                        model: ANTHROPIC_MODEL,
-                        max_tokens: 1000,
-                        messages: anthropicMessages
-                    })
-                });
-
-                if (!response.ok) {
-                    const errText = await response.text();
-                    console.error('Errore da Anthropic API:', response.status, errText);
+                let aiResult;
+                try {
+                    aiResult = await getAiAnswer(anthropicMessages);
+                } catch (aiErr) {
+                    console.error('Errore IA (ask):', aiErr.message);
                     return sendJSON(res, 502, { error: 'Errore nel contattare il servizio IA. Riprova più tardi.' });
                 }
 
-                const data = await response.json();
-                const answer = (data.content || [])
-                    .map(function (block) { return block.type === 'text' ? block.text : ''; })
-                    .filter(Boolean)
-                    .join('\n');
-
-                return sendJSON(res, 200, { answer: answer || 'Nessuna risposta ricevuta.' });
+                return sendJSON(res, 200, { answer: aiResult.answer || 'Nessuna risposta ricevuta.', aiProvider: aiResult.provider });
 
             } catch (err) {
                 console.error('Errore interno:', err);
@@ -2056,8 +2152,8 @@ const server = http.createServer((req, res) => {
                 // e senza tetto di utilizzi. Il limite (20 ogni 4 ore) si applica SOLO
                 // a /api/ask, cioè solo alla chat vera e propria su ia.html.
 
-                if (!ANTHROPIC_API_KEY) {
-                    return sendJSON(res, 500, { error: 'Chiave API non configurata sul server.' });
+                if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY) {
+                    return sendJSON(res, 500, { error: 'Nessuna chiave API configurata sul server.' });
                 }
 
                 // Se arriva anche la cronologia della conversazione (AI Mode), la
@@ -2079,33 +2175,15 @@ const server = http.createServer((req, res) => {
                     anthropicMessages = [{ role: 'user', content: question.trim() }];
                 }
 
-                const response = await fetch('https://api.anthropic.com/v1/messages', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key': ANTHROPIC_API_KEY,
-                        'anthropic-version': '2023-06-01'
-                    },
-                    body: JSON.stringify({
-                        model: ANTHROPIC_MODEL,
-                        max_tokens: 1000,
-                        messages: anthropicMessages
-                    })
-                });
-
-                if (!response.ok) {
-                    const errText = await response.text();
-                    console.error('Errore da Anthropic API (overview):', response.status, errText);
+                let aiResult;
+                try {
+                    aiResult = await getAiAnswer(anthropicMessages);
+                } catch (aiErr) {
+                    console.error('Errore IA (overview):', aiErr.message);
                     return sendJSON(res, 502, { error: 'Errore nel contattare il servizio IA. Riprova più tardi.' });
                 }
 
-                const data = await response.json();
-                const answer = (data.content || [])
-                    .map(function (block) { return block.type === 'text' ? block.text : ''; })
-                    .filter(Boolean)
-                    .join('\n');
-
-                return sendJSON(res, 200, { answer: answer || 'Nessuna risposta ricevuta.' });
+                return sendJSON(res, 200, { answer: aiResult.answer || 'Nessuna risposta ricevuta.', aiProvider: aiResult.provider });
 
             } catch (err) {
                 console.error('Errore overview:', err);
@@ -2152,43 +2230,27 @@ const server = http.createServer((req, res) => {
                 if (allowedTypes.indexOf(mediaType) === -1) {
                     return sendJSON(res, 400, { error: 'Formato immagine non supportato.' });
                 }
-                if (!ANTHROPIC_API_KEY) {
-                    return sendJSON(res, 500, { error: 'Chiave API non configurata sul server.' });
+                if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY) {
+                    return sendJSON(res, 500, { error: 'Nessuna chiave API configurata sul server.' });
                 }
 
-                const response = await fetch('https://api.anthropic.com/v1/messages', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key': ANTHROPIC_API_KEY,
-                        'anthropic-version': '2023-06-01'
-                    },
-                    body: JSON.stringify({
-                        model: ANTHROPIC_MODEL,
-                        max_tokens: 1000,
-                        messages: [{
-                            role: 'user',
-                            content: [
-                                { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
-                                { type: 'text', text: question.trim() }
-                            ]
-                        }]
-                    })
-                });
+                const anthropicMessages = [{
+                    role: 'user',
+                    content: [
+                        { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
+                        { type: 'text', text: question.trim() }
+                    ]
+                }];
 
-                if (!response.ok) {
-                    const errText = await response.text();
-                    console.error('Errore da Anthropic API (vision):', response.status, errText);
+                let aiResult;
+                try {
+                    aiResult = await getAiAnswer(anthropicMessages);
+                } catch (aiErr) {
+                    console.error('Errore IA (vision):', aiErr.message);
                     return sendJSON(res, 502, { error: 'Errore nel contattare il servizio IA. Riprova più tardi.' });
                 }
 
-                const data = await response.json();
-                const answer = (data.content || [])
-                    .map(function (block) { return block.type === 'text' ? block.text : ''; })
-                    .filter(Boolean)
-                    .join('\n');
-
-                return sendJSON(res, 200, { answer: answer || 'Nessuna risposta ricevuta.' });
+                return sendJSON(res, 200, { answer: aiResult.answer || 'Nessuna risposta ricevuta.', aiProvider: aiResult.provider });
 
             } catch (err) {
                 console.error('Errore interno (vision):', err);
