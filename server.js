@@ -195,6 +195,12 @@ const RESET_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ora
 const resetRateLimitByEmail = new Map(); // email -> { count, windowStart }
 const resetRateLimitByIp = new Map();    // ip -> { count, windowStart }
 
+// Rate limiting per i tentativi di codice 2FA al login (endpoint
+// /api/auth/2fa/login-verify). Senza questo limite, un codice a 6 cifre
+// (un milione di combinazioni) sarebbe indovinabile a forza bruta in un
+// tempo ragionevole automatizzando i tentativi.
+const memory2faAttempts = new Map(); // userId -> { count, windowStart }
+
 // Controlla e aggiorna un contatore di rate limit in una Map. Ritorna
 // { allowed, windowStart }: allowed è true se la richiesta è consentita (e in
 // tal caso incrementa il contatore), false se il limite è già stato
@@ -318,6 +324,17 @@ async function initDb() {
     // App personalizzate aggiunte liberamente dall'utente (nome + indirizzo),
     // salvate come JSON: [{ "name": "...", "url": "..." }, ...]
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_apps JSONB NOT NULL DEFAULT \'[]\'');
+
+    // 2FA (autenticazione a due fattori, standard TOTP compatibile con Google
+    // Authenticator, Authy, ecc.). totp_secret è la chiave segreta attiva
+    // (impostata solo dopo che l'utente ha confermato il primo codice);
+    // totp_pending_secret è la chiave generata durante la configurazione, non
+    // ancora confermata — separarle evita che un utente resti "a metà"
+    // configurazione con una chiave attiva che non ha mai verificato di saper
+    // usare davvero.
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_pending_secret TEXT');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT false');
 
     // Cache dei risultati di ricerca: evita di richiamare Brave/Serper per
     // query già cercate di recente da qualsiasi utente. cache_key combina
@@ -691,6 +708,9 @@ function rowToUser(row) {
         stripeCustomerId: row.stripe_customer_id,
         suspended: row.suspended,
         suspendedReason: row.suspended_reason,
+        totpSecret: row.totp_secret,
+        totpPendingSecret: row.totp_pending_secret,
+        totpEnabled: row.totp_enabled,
         createdAt: row.created_at
     };
 }
@@ -770,8 +790,8 @@ async function saveUser(user) {
         return user;
     }
     await pool.query(
-        'INSERT INTO users (id, email, name, surname, picture, is_pro, message_count, window_start, provider, password_hash, reset_token, reset_token_expires, email_verified, verify_token, verify_token_expires, stripe_customer_id, suspended, suspended_reason) ' +
-        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) ' +
+        'INSERT INTO users (id, email, name, surname, picture, is_pro, message_count, window_start, provider, password_hash, reset_token, reset_token_expires, email_verified, verify_token, verify_token_expires, stripe_customer_id, suspended, suspended_reason, totp_secret, totp_pending_secret, totp_enabled) ' +
+        'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) ' +
         'ON CONFLICT (id) DO UPDATE SET ' +
         '  email = EXCLUDED.email, name = EXCLUDED.name, surname = EXCLUDED.surname, picture = EXCLUDED.picture, ' +
         '  is_pro = EXCLUDED.is_pro, message_count = EXCLUDED.message_count, window_start = EXCLUDED.window_start, ' +
@@ -779,7 +799,9 @@ async function saveUser(user) {
         '  reset_token = EXCLUDED.reset_token, reset_token_expires = EXCLUDED.reset_token_expires, ' +
         '  email_verified = EXCLUDED.email_verified, verify_token = EXCLUDED.verify_token, ' +
         '  verify_token_expires = EXCLUDED.verify_token_expires, stripe_customer_id = EXCLUDED.stripe_customer_id, ' +
-        '  suspended = EXCLUDED.suspended, suspended_reason = EXCLUDED.suspended_reason',
+        '  suspended = EXCLUDED.suspended, suspended_reason = EXCLUDED.suspended_reason, ' +
+        '  totp_secret = EXCLUDED.totp_secret, totp_pending_secret = EXCLUDED.totp_pending_secret, ' +
+        '  totp_enabled = EXCLUDED.totp_enabled',
         [
             user.sub, user.email, user.name || null, user.surname || null, user.picture || null, !!user.isPro,
             user.messageCount || 0, new Date(user.windowStart || Date.now()), user.provider,
@@ -788,7 +810,8 @@ async function saveUser(user) {
             !!user.emailVerified, user.verifyToken || null,
             user.verifyTokenExpires ? new Date(user.verifyTokenExpires) : null,
             user.stripeCustomerId || null,
-            !!user.suspended, user.suspendedReason || null
+            !!user.suspended, user.suspendedReason || null,
+            user.totpSecret || null, user.totpPendingSecret || null, !!user.totpEnabled
         ]
     );
     return user;
@@ -819,6 +842,92 @@ async function getUserFromRequest(req) {
     } catch (err) {
         return null;
     }
+}
+
+// ---- 2FA: TOTP (stesso standard di Google Authenticator, Authy, ecc.) ----
+// Implementato con il modulo "crypto" nativo di Node (RFC 4226 / RFC 6238),
+// senza librerie esterne — niente da installare in più su Render.
+
+// Le chiavi segrete TOTP si scrivono in Base32 (non Base64): è lo standard
+// richiesto dalle app di autenticazione. Queste due funzioni convertono da/a
+// Base32 usando solo Buffer nativi.
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function base32Encode(buffer) {
+    let bits = '';
+    for (const byte of buffer) bits += byte.toString(2).padStart(8, '0');
+    let output = '';
+    for (let i = 0; i + 5 <= bits.length; i += 5) {
+        output += BASE32_ALPHABET[parseInt(bits.substr(i, 5), 2)];
+    }
+    const remainder = bits.length % 5;
+    if (remainder > 0) {
+        const lastChunk = bits.substr(bits.length - remainder).padEnd(5, '0');
+        output += BASE32_ALPHABET[parseInt(lastChunk, 2)];
+    }
+    return output;
+}
+
+function base32Decode(base32) {
+    const clean = (base32 || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
+    let bits = '';
+    for (const char of clean) {
+        const val = BASE32_ALPHABET.indexOf(char);
+        if (val === -1) continue;
+        bits += val.toString(2).padStart(5, '0');
+    }
+    const bytes = [];
+    for (let i = 0; i + 8 <= bits.length; i += 8) {
+        bytes.push(parseInt(bits.substr(i, 8), 2));
+    }
+    return Buffer.from(bytes);
+}
+
+// Genera una nuova chiave segreta casuale (160 bit, la lunghezza standard
+// consigliata dalla specifica TOTP) per un utente che sta attivando la 2FA.
+function generateTotpSecret() {
+    return base32Encode(crypto.randomBytes(20));
+}
+
+// Calcola il codice a 6 cifre per un dato "contatore" (finestra di 30 secondi
+// dall'epoch Unix) — algoritmo HOTP/TOTP standard, RFC 4226/6238.
+function generateTotpCode(secretBase32, counter) {
+    const key = base32Decode(secretBase32);
+    const counterBuffer = Buffer.alloc(8);
+    counterBuffer.writeBigUInt64BE(BigInt(counter));
+    const hmac = crypto.createHmac('sha1', key).update(counterBuffer).digest();
+    const offset = hmac[hmac.length - 1] & 0x0f;
+    const binCode = ((hmac[offset] & 0x7f) << 24) |
+                     ((hmac[offset + 1] & 0xff) << 16) |
+                     ((hmac[offset + 2] & 0xff) << 8) |
+                     (hmac[offset + 3] & 0xff);
+    return String(binCode % 1000000).padStart(6, '0');
+}
+
+// Verifica il codice a 6 cifre digitato dall'utente. Controlla anche la
+// finestra di 30 secondi immediatamente precedente e successiva a quella
+// corrente, per tollerare un piccolo sfasamento tra l'orologio del telefono
+// e quello del server (capita spesso, non è un bug).
+function verifyTotpCode(secretBase32, code) {
+    const cleanCode = (code || '').replace(/\s+/g, '');
+    if (!/^\d{6}$/.test(cleanCode)) return false;
+    const currentCounter = Math.floor(Date.now() / 1000 / 30);
+    for (let drift = -1; drift <= 1; drift++) {
+        if (generateTotpCode(secretBase32, currentCounter + drift) === cleanCode) return true;
+    }
+    return false;
+}
+
+// Costruisce l'URL "otpauth://" che le app di autenticazione leggono (di
+// solito tramite QR code, generato lato frontend a partire da questo testo —
+// il server non genera immagini, solo questa stringa).
+function buildTotpOtpauthUrl(email, secretBase32) {
+    const issuer = 'iAlgae';
+    const label = encodeURIComponent(issuer + ':' + email);
+    return 'otpauth://totp/' + label +
+        '?secret=' + secretBase32 +
+        '&issuer=' + encodeURIComponent(issuer) +
+        '&algorithm=SHA1&digits=6&period=30';
 }
 
 // ---- Account con email e password (alternativa al login Google) ----
@@ -1713,6 +1822,22 @@ const server = http.createServer((req, res) => {
                     });
                 }
 
+                // Se l'utente ha attivato la 2FA, la password da sola non basta:
+                // invece del token di sessione completo, diamo un token
+                // "temporaneo" valido solo 5 minuti e solo per completare il
+                // secondo passaggio — non permette nessun'altra azione sul sito.
+                if (user.totpEnabled) {
+                    const twoFactorToken = jwt.sign(
+                        { sub: user.sub, purpose: '2fa-pending' },
+                        SESSION_SECRET,
+                        { expiresIn: '5m' }
+                    );
+                    return sendJSON(res, 200, {
+                        requires2FA: true,
+                        twoFactorToken: twoFactorToken
+                    });
+                }
+
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
                     sessionToken: sessionToken,
@@ -1721,6 +1846,179 @@ const server = http.createServer((req, res) => {
 
             } catch (err) {
                 console.error('Errore login email/password:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Secondo passaggio del login quando la 2FA è attiva: riceve il token
+    // temporaneo (dato da /api/auth/login) più il codice a 6 cifre digitato
+    // dall'utente, e SOLO se corretto restituisce il vero token di sessione.
+    if (req.method === 'POST' && req.url === '/api/auth/2fa/login-verify') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+
+                const twoFactorToken = payload.twoFactorToken || '';
+                const code = (payload.code || '').toString();
+
+                let decoded;
+                try {
+                    decoded = jwt.verify(twoFactorToken, SESSION_SECRET);
+                } catch (err) {
+                    return sendJSON(res, 401, { error: 'Sessione di accesso scaduta. Rifai il login.' });
+                }
+                if (decoded.purpose !== '2fa-pending') {
+                    return sendJSON(res, 401, { error: 'Token non valido.' });
+                }
+
+                const user = await getUserById(decoded.sub);
+                if (!user || !user.totpEnabled || !user.totpSecret) {
+                    return sendJSON(res, 401, { error: 'La 2FA non risulta attiva su questo account.' });
+                }
+
+                // Limite di tentativi: un codice a 6 cifre ha "solo" un milione
+                // di combinazioni — senza un limite, sarebbe indovinabile a
+                // forza bruta in un tempo ragionevole. Max 8 tentativi ogni 10
+                // minuti per account, persistente su Postgres (sopravvive ai
+                // riavvii del server, come gli altri rate limit del sito).
+                const attemptCheck = await checkAndConsumeRateLimitPersistent(
+                    '2fa-verify', user.sub, 8, 10 * 60 * 1000, memory2faAttempts
+                );
+                if (!attemptCheck.allowed) {
+                    return sendJSON(res, 429, { error: 'Troppi tentativi. Riprova tra qualche minuto.' });
+                }
+
+                if (!verifyTotpCode(user.totpSecret, code)) {
+                    return sendJSON(res, 401, { error: 'Codice non valido o scaduto.' });
+                }
+
+                const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
+                return sendJSON(res, 200, {
+                    sessionToken: sessionToken,
+                    user: { email: user.email, name: user.name, picture: user.picture, isPro: user.isPro }
+                });
+
+            } catch (err) {
+                console.error('Errore verifica 2FA login:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Avvia la configurazione della 2FA per l'utente loggato: genera una nuova
+    // chiave segreta "in sospeso" (non ancora attiva finché non viene
+    // confermata con un codice reale, vedi /api/auth/2fa/confirm) e restituisce
+    // sia la chiave in chiaro (per l'inserimento manuale) sia l'URL "otpauth://"
+    // da cui il frontend genera il QR code da inquadrare con l'app.
+    if (req.method === 'POST' && req.url === '/api/auth/2fa/setup') {
+        (async function () {
+            try {
+                const user = await getUserFromRequest(req);
+                if (!user) return sendJSON(res, 401, { error: 'Devi essere loggato.' });
+                if (user.totpEnabled) {
+                    return sendJSON(res, 400, { error: 'La 2FA è già attiva su questo account.' });
+                }
+
+                const secret = generateTotpSecret();
+                user.totpPendingSecret = secret;
+                await saveUser(user);
+
+                return sendJSON(res, 200, {
+                    secret: secret,
+                    otpauthUrl: buildTotpOtpauthUrl(user.email, secret)
+                });
+            } catch (err) {
+                console.error('Errore setup 2FA:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Conferma la configurazione: l'utente inserisce il primo codice generato
+    // dalla sua app di autenticazione. Se è corretto, la chiave "in sospeso"
+    // diventa quella attiva — da questo momento la 2FA è davvero richiesta al
+    // login. Se sbagliato, la chiave in sospeso resta tale (nessuna modifica),
+    // così l'utente può semplicemente riprovare.
+    if (req.method === 'POST' && req.url === '/api/auth/2fa/confirm') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                const user = await getUserFromRequest(req);
+                if (!user) return sendJSON(res, 401, { error: 'Devi essere loggato.' });
+                if (!user.totpPendingSecret) {
+                    return sendJSON(res, 400, { error: 'Nessuna configurazione 2FA in corso. Ricomincia da /api/auth/2fa/setup.' });
+                }
+
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+                const code = (payload.code || '').toString();
+
+                if (!verifyTotpCode(user.totpPendingSecret, code)) {
+                    return sendJSON(res, 401, { error: 'Codice non valido. Controlla l\'app e riprova.' });
+                }
+
+                user.totpSecret = user.totpPendingSecret;
+                user.totpPendingSecret = null;
+                user.totpEnabled = true;
+                await saveUser(user);
+
+                return sendJSON(res, 200, { success: true, message: '2FA attivata con successo.' });
+            } catch (err) {
+                console.error('Errore conferma 2FA:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Disattiva la 2FA. Richiede la password attuale come riconferma (non
+    // basta essere loggati con un token già in tasca): evita che chi trova un
+    // dispositivo sbloccato di qualcun altro possa disattivare la protezione
+    // in pochi secondi.
+    if (req.method === 'POST' && req.url === '/api/auth/2fa/disable') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                const user = await getUserFromRequest(req);
+                if (!user) return sendJSON(res, 401, { error: 'Devi essere loggato.' });
+
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+                const password = payload.password || '';
+
+                if (!user.passwordHash || !verifyPassword(password, user.passwordHash)) {
+                    return sendJSON(res, 401, { error: 'Password non corretta.' });
+                }
+
+                user.totpEnabled = false;
+                user.totpSecret = null;
+                user.totpPendingSecret = null;
+                await saveUser(user);
+
+                return sendJSON(res, 200, { success: true, message: '2FA disattivata.' });
+            } catch (err) {
+                console.error('Errore disattivazione 2FA:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         });
@@ -2712,66 +3010,77 @@ const server = http.createServer((req, res) => {
                     }
                 });
 
+                // A differenza di prima, un errore di Brave (es. quota mensile
+                // esaurita, errore 429/402) NON interrompe subito la richiesta:
+                // per le ricerche web proviamo comunque la riserva Serper qui
+                // sotto, esattamente come già facevamo per "zero risultati".
+                let braveFailed = false;
+                let data = null;
                 if (!braveResponse.ok) {
                     const errText = await braveResponse.text();
                     console.error('Errore Brave Search API (' + type + '):', braveResponse.status, errText);
-                    return sendJSON(res, 502, { error: 'Servizio di ricerca non raggiungibile al momento.' });
+                    braveFailed = true;
+                } else {
+                    data = await braveResponse.json();
                 }
 
-                const data = await braveResponse.json();
                 let results = [];
 
-                if (type === 'web') {
-                    const webResults = (data.web && Array.isArray(data.web.results)) ? data.web.results : [];
-                    results = webResults.map(function (r) {
-                        return {
-                            title: r.title || '',
-                            url: r.url || '',
-                            description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, '')
-                        };
-                    });
-                } else if (type === 'images') {
-                    const imgResults = Array.isArray(data.results) ? data.results : [];
-                    results = imgResults.map(function (r) {
-                        return {
-                            title: r.title || '',
-                            url: r.url || '',
-                            imageUrl: (r.thumbnail && r.thumbnail.src) || (r.properties && r.properties.url) || '',
-                            source: (r.source || extractHost(r.url))
-                        };
-                    });
-                } else if (type === 'news') {
-                    const newsResults = Array.isArray(data.results) ? data.results : [];
-                    results = newsResults.map(function (r) {
-                        return {
-                            title: r.title || '',
-                            url: r.url || '',
-                            description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, ''),
-                            source: (r.meta_url && r.meta_url.hostname) || extractHost(r.url),
-                            age: r.age || '',
-                            thumbnail: (r.thumbnail && r.thumbnail.src) || ''
-                        };
-                    });
-                } else if (type === 'videos') {
-                    const videoResults = Array.isArray(data.results) ? data.results : [];
-                    results = videoResults.map(function (r) {
-                        return {
-                            title: r.title || '',
-                            url: r.url || '',
-                            description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, ''),
-                            thumbnail: (r.thumbnail && r.thumbnail.src) || '',
-                            duration: (r.video && r.video.duration) || ''
-                        };
-                    });
+                if (!braveFailed) {
+                    if (type === 'web') {
+                        const webResults = (data.web && Array.isArray(data.web.results)) ? data.web.results : [];
+                        results = webResults.map(function (r) {
+                            return {
+                                title: r.title || '',
+                                url: r.url || '',
+                                description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, '')
+                            };
+                        });
+                    } else if (type === 'images') {
+                        const imgResults = Array.isArray(data.results) ? data.results : [];
+                        results = imgResults.map(function (r) {
+                            return {
+                                title: r.title || '',
+                                url: r.url || '',
+                                imageUrl: (r.thumbnail && r.thumbnail.src) || (r.properties && r.properties.url) || '',
+                                source: (r.source || extractHost(r.url))
+                            };
+                        });
+                    } else if (type === 'news') {
+                        const newsResults = Array.isArray(data.results) ? data.results : [];
+                        results = newsResults.map(function (r) {
+                            return {
+                                title: r.title || '',
+                                url: r.url || '',
+                                description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, ''),
+                                source: (r.meta_url && r.meta_url.hostname) || extractHost(r.url),
+                                age: r.age || '',
+                                thumbnail: (r.thumbnail && r.thumbnail.src) || ''
+                            };
+                        });
+                    } else if (type === 'videos') {
+                        const videoResults = Array.isArray(data.results) ? data.results : [];
+                        results = videoResults.map(function (r) {
+                            return {
+                                title: r.title || '',
+                                url: r.url || '',
+                                description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, ''),
+                                thumbnail: (r.thumbnail && r.thumbnail.src) || '',
+                                duration: (r.video && r.video.duration) || ''
+                            };
+                        });
+                    }
                 }
 
-                // Riserva: se la ricerca web di Brave non trova nulla (capita più
-                // spesso su query locali/geografiche, dove l'indice di Brave è più
-                // debole), proviamo Serper come secondo tentativo prima di arrenderci.
-                // Solo sulla prima pagina, per non moltiplicare le chiamate a Serper
-                // (che ha una quota gratuita limitata) su paginazioni successive.
+                // Riserva Serper: scatta in DUE casi ora, non solo uno —
+                // 1) Brave ha risposto ma con zero risultati (query rare/locali)
+                // 2) Brave è fallito del tutto (quota mensile esaurita, errore
+                //    del servizio, ecc.) — questo è il caso NUOVO che prima
+                //    interrompeva subito la richiesta senza tentare la riserva.
+                // Solo sulla prima pagina della ricerca web, per non moltiplicare
+                // le chiamate a Serper (anche la sua quota gratuita è limitata).
                 let usedFallback = false;
-                if (type === 'web' && results.length === 0 && page === 1 && SERPER_API_KEY) {
+                if (type === 'web' && (braveFailed || results.length === 0) && page === 1 && SERPER_API_KEY) {
                     try {
                         const serperResponse = await fetch('https://google.serper.dev/search', {
                             method: 'POST',
@@ -2804,6 +3113,14 @@ const server = http.createServer((req, res) => {
                     }
                 }
 
+                // Se Brave è fallito del tutto E la riserva Serper non ha
+                // funzionato (chiave mancante, anche lei in errore, o non è
+                // una ricerca web/prima pagina), a questo punto sì restituiamo
+                // l'errore: non abbiamo nessun risultato reale da mostrare.
+                if (braveFailed && !usedFallback) {
+                    return sendJSON(res, 502, { error: 'Servizio di ricerca non raggiungibile al momento.' });
+                }
+
                 // Salviamo il risultato in cache (solo se abbiamo trovato qualcosa:
                 // non ha senso cachare una lista vuota, potrebbe essere un problema
                 // temporaneo del provider più che una vera assenza di risultati).
@@ -2818,8 +3135,9 @@ const server = http.createServer((req, res) => {
                     type: type,
                     query: q,
                     // "Forse cercavi...": Brave a volte corregge da sola un probabile errore
-                    // di battitura. Se lo fa, ce lo dice qui — non lo inventiamo noi.
-                    alteredQuery: (data.query && data.query.altered) ? data.query.altered : null,
+                    // di battitura. Se lo fa, ce lo dice qui — non lo inventiamo noi. Non
+                    // disponibile quando la riserva Serper ha risposto al posto di Brave.
+                    alteredQuery: (data && data.query && data.query.altered) ? data.query.altered : null,
                     source: usedFallback ? 'serper' : 'brave',
                     richResult: richResult
                 });
