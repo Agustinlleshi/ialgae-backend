@@ -172,7 +172,7 @@ async function verifyMicrosoftToken(idToken) {
     return payload; // { oid o sub, email o preferred_username, name, ... }
 }
 
-const MAX_DAILY_MESSAGES = 20;
+const MAX_DAILY_MESSAGES = 15;
 const RATE_LIMIT_WINDOW_MS = 4 * 60 * 60 * 1000; // 4 ore (solo per /api/ask, la chat su ia.html)
 
 // Conteggio per indirizzo IP di chi usa /api/ask senza essere loggato (stessa
@@ -189,21 +189,73 @@ const RESET_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ora
 const resetRateLimitByEmail = new Map(); // email -> { count, windowStart }
 const resetRateLimitByIp = new Map();    // ip -> { count, windowStart }
 
-// Controlla e aggiorna un contatore di rate limit in una Map. Ritorna true se
-// la richiesta è consentita (e in tal caso incrementa il contatore), false se
-// il limite è già stato raggiunto per la finestra corrente.
-function checkAndConsumeRateLimit(map, key, maxCount, windowMs) {
+// Controlla e aggiorna un contatore di rate limit in una Map. Ritorna
+// { allowed, windowStart }: allowed è true se la richiesta è consentita (e in
+// tal caso incrementa il contatore), false se il limite è già stato
+// raggiunto per la finestra corrente. windowStart serve a chi deve
+// comunicare "riprova tra X ore".
+function checkAndConsumeRateLimitMemory(map, key, maxCount, windowMs) {
     let entry = map.get(key);
     if (!entry || Date.now() - entry.windowStart > windowMs) {
         entry = { count: 0, windowStart: Date.now() };
     }
     if (entry.count >= maxCount) {
         map.set(key, entry);
-        return false;
+        return { allowed: false, windowStart: entry.windowStart };
     }
     entry.count += 1;
     map.set(key, entry);
-    return true;
+    return { allowed: true, windowStart: entry.windowStart };
+}
+
+// Come checkAndConsumeRateLimitMemory, ma con contatore salvato su Postgres
+// invece che in una Map in memoria: sopravvive ai riavvii del server
+// (frequenti su Render, specie col piano free che va in sleep). "prefix"
+// distingue i vari tipi di limite (es. "reset-email" vs "ask-anon") così la
+// stessa email/IP non condivide per sbaglio il contatore tra usi diversi.
+// "memoryMap" è la Map da usare come ripiego se il database non è
+// configurato o se una query fallisce per qualche motivo: un rate limit
+// temporaneamente più permissivo è preferibile a un endpoint che smette di
+// funzionare.
+async function checkAndConsumeRateLimitPersistent(prefix, key, maxCount, windowMs, memoryMap) {
+    if (!dbEnabled) {
+        return checkAndConsumeRateLimitMemory(memoryMap, key, maxCount, windowMs);
+    }
+    const limitKey = prefix + ':' + key;
+    try {
+        const result = await pool.query(
+            'SELECT attempt_count, window_start FROM rate_limits WHERE limit_key = $1',
+            [limitKey]
+        );
+        const row = result.rows[0];
+
+        // Nessuna voce ancora, oppure la finestra precedente è scaduta: si
+        // riparte da zero (contatore a 1, la richiesta corrente è la prima).
+        if (!row || (Date.now() - new Date(row.window_start).getTime()) > windowMs) {
+            const insertResult = await pool.query(
+                'INSERT INTO rate_limits (limit_key, attempt_count, window_start) VALUES ($1, 1, now()) ' +
+                'ON CONFLICT (limit_key) DO UPDATE SET attempt_count = 1, window_start = now() ' +
+                'RETURNING window_start',
+                [limitKey]
+            );
+            return { allowed: true, windowStart: new Date(insertResult.rows[0].window_start).getTime() };
+        }
+
+        const windowStart = new Date(row.window_start).getTime();
+        if (row.attempt_count >= maxCount) {
+            return { allowed: false, windowStart: windowStart };
+        }
+
+        await pool.query(
+            'UPDATE rate_limits SET attempt_count = attempt_count + 1 WHERE limit_key = $1',
+            [limitKey]
+        );
+        return { allowed: true, windowStart: windowStart };
+
+    } catch (err) {
+        console.error('Errore rate limit su Postgres, si passa alla memoria come ripiego:', err);
+        return checkAndConsumeRateLimitMemory(memoryMap, key, maxCount, windowMs);
+    }
 }
 
 // ---- DATABASE (Postgres su Neon) ----
@@ -315,6 +367,19 @@ async function initDb() {
         'UPDATE blog_posts SET sort_order = sub.rn FROM (' +
         '  SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rn FROM blog_posts' +
         ') sub WHERE blog_posts.id = sub.id AND blog_posts.sort_order = 0'
+    );
+
+    // Rate limiting persistente (es. richieste di reset password). Ogni riga
+    // rappresenta una "finestra" di conteggio per una chiave (es. "reset-email:x@y.it"
+    // oppure "reset-ip:1.2.3.4"). A differenza di una Map in memoria, questi contatori
+    // sopravvivono ai riavvii del server (frequenti su Render) e sono condivisi se in
+    // futuro ci fossero più istanze del backend.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS rate_limits (' +
+        '  limit_key TEXT PRIMARY KEY,' +
+        '  attempt_count INTEGER NOT NULL DEFAULT 1,' +
+        '  window_start TIMESTAMPTZ NOT NULL DEFAULT now()' +
+        ')'
     );
 
     console.log('Database pronto (tabella users verificata/creata).');
@@ -1454,9 +1519,9 @@ const server = http.createServer((req, res) => {
                 // email diverse). La risposta in caso di blocco resta
                 // generica, per non rivelare quali email sono registrate.
                 const resetIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
-                const emailAllowed = checkAndConsumeRateLimit(resetRateLimitByEmail, email, MAX_RESET_REQUESTS, RESET_RATE_LIMIT_WINDOW_MS);
-                const ipAllowed = checkAndConsumeRateLimit(resetRateLimitByIp, resetIp, MAX_RESET_REQUESTS, RESET_RATE_LIMIT_WINDOW_MS);
-                if (!emailAllowed || !ipAllowed) {
+                const emailCheck = await checkAndConsumeRateLimitPersistent('reset-email', email, MAX_RESET_REQUESTS, RESET_RATE_LIMIT_WINDOW_MS, resetRateLimitByEmail);
+                const ipCheck = await checkAndConsumeRateLimitPersistent('reset-ip', resetIp, MAX_RESET_REQUESTS, RESET_RATE_LIMIT_WINDOW_MS, resetRateLimitByIp);
+                if (!emailCheck.allowed || !ipCheck.allowed) {
                     return sendJSON(res, 429, {
                         error: 'limit_reached',
                         message: 'Hai richiesto troppi reset password di recente. Riprova tra qualche minuto.'
@@ -1762,20 +1827,15 @@ const server = http.createServer((req, res) => {
                     await saveUser(user);
                 } else {
                     const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
-                    let entry = askAnonymousRateLimit.get(ip);
-                    if (!entry || Date.now() - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
-                        entry = { count: 0, windowStart: Date.now() };
-                    }
-                    if (entry.count >= MAX_DAILY_MESSAGES) {
+                    const anonCheck = await checkAndConsumeRateLimitPersistent('ask-anon', ip, MAX_DAILY_MESSAGES, RATE_LIMIT_WINDOW_MS, askAnonymousRateLimit);
+                    if (!anonCheck.allowed) {
                         return sendJSON(res, 429, {
                             error: 'limit_reached',
                             message: 'Hai raggiunto il limite di ' + MAX_DAILY_MESSAGES + ' messaggi gratuiti. Passa a un piano Pro per continuare senza limiti, oppure riprova tra qualche ora.',
-                            unlockAt: new Date(entry.windowStart + RATE_LIMIT_WINDOW_MS).toISOString(),
+                            unlockAt: new Date(anonCheck.windowStart + RATE_LIMIT_WINDOW_MS).toISOString(),
                             upgradeUrl: SITE_BASE_URL + '/piani.html'
                         });
                     }
-                    entry.count += 1;
-                    askAnonymousRateLimit.set(ip, entry);
                 }
 
                 if (!ANTHROPIC_API_KEY) {
@@ -2612,6 +2672,18 @@ if (dbEnabled) {
         pool.query('DELETE FROM search_cache WHERE expires_at <= now()')
             .catch(function (err) {
                 console.error('Errore pulizia search_cache:', err);
+            });
+    }, 60 * 60 * 1000);
+
+    // Le voci di rate_limits più vecchie della finestra usata (1 ora per il
+    // reset password) non servono più: le finestre scadute vengono comunque
+    // ignorate dalla logica sopra, ma questa pulizia tiene la tabella snella.
+    // Usiamo un margine di sicurezza di 24 ore invece dell'ora esatta, così
+    // funziona anche se in futuro si aggiungono limiti con finestre più lunghe.
+    setInterval(function () {
+        pool.query("DELETE FROM rate_limits WHERE window_start <= now() - interval '24 hours'")
+            .catch(function (err) {
+                console.error('Errore pulizia rate_limits:', err);
             });
     }, 60 * 60 * 1000);
 }
