@@ -388,6 +388,127 @@ async function initDb() {
 // Usato SOLO se DATABASE_URL non è configurata (vedi sopra).
 const memoryUsers = new Map();
 
+// ---- RICH RESULT: calcoli e conversioni di unità ----
+// Prima di interrogare Brave/Serper, controlliamo se la query è un calcolo
+// matematico semplice (es. "45 * 3.7") o una conversione di unità (es.
+// "12 km in miglia"). Se sì, calcoliamo la risposta noi stessi e la
+// restituiamo insieme ai risultati di ricerca normali, così l'utente la vede
+// subito senza dover cliccare su un link esterno.
+
+// Valuta un'espressione aritmetica in modo sicuro: accetta SOLO cifre,
+// operatori (+ - * / ^ %), punto decimale, parentesi e spazi. Qualsiasi altro
+// carattere (lettere, punto e virgola, backtick, ecc.) fa fallire il
+// riconoscimento, quindi non è mai possibile eseguire codice arbitrario.
+function tryEvaluateMathExpression(query) {
+    const trimmed = query.trim();
+
+    // Deve contenere almeno un operatore matematico, altrimenti "2024" o
+    // "1" verrebbero trattati come calcoli invece che come ricerche normali.
+    if (!/[+\-*/^%]/.test(trimmed)) return null;
+
+    // Solo caratteri ammessi per un'espressione aritmetica.
+    if (!/^[0-9+\-*/^%().,\s]+$/.test(trimmed)) return null;
+
+    // Deve contenere almeno una cifra (evita che "---" o "()" passino il test).
+    if (!/[0-9]/.test(trimmed)) return null;
+
+    const normalized = trimmed
+        .replace(/,/g, '.')   // 3,5 -> 3.5 (notazione italiana)
+        .replace(/\^/g, '**'); // ^ come elevamento a potenza
+
+    try {
+        // new Function invece di eval(): stesso motore di valutazione, ma
+        // senza accesso allo scope esterno. Sicuro qui perché l'input è già
+        // stato ristretto ai soli caratteri aritmetici sopra.
+        const value = new Function('"use strict"; return (' + normalized + ')')();
+        if (typeof value !== 'number' || !isFinite(value)) return null;
+
+        const rounded = Math.round(value * 1e10) / 1e10; // ripulisce errori di virgola mobile
+        return {
+            kind: 'calc',
+            label: trimmed,
+            value: rounded,
+            display: rounded.toLocaleString('it-IT', { maximumFractionDigits: 10 })
+        };
+    } catch (err) {
+        return null;
+    }
+}
+
+// Tabella di conversioni supportate: ogni voce converte da un'unità "base"
+// (in cui sono espressi i fattori) verso tutte le altre nello stesso gruppo.
+const UNIT_GROUPS = [
+    {
+        base: 'm',
+        units: {
+            km: { factor: 1000, names: ['km', 'chilometri', 'chilometro'] },
+            m: { factor: 1, names: ['m', 'metri', 'metro'] },
+            cm: { factor: 0.01, names: ['cm', 'centimetri', 'centimetro'] },
+            mi: { factor: 1609.344, names: ['mi', 'miglia', 'miglio'] },
+            yd: { factor: 0.9144, names: ['yd', 'iarde', 'iarda'] },
+            ft: { factor: 0.3048, names: ['ft', 'piedi', 'piede'] }
+        }
+    },
+    {
+        base: 'kg',
+        units: {
+            kg: { factor: 1, names: ['kg', 'chilogrammi', 'chilogrammo', 'chili', 'chilo'] },
+            g: { factor: 0.001, names: ['g', 'grammi', 'grammo'] },
+            lb: { factor: 0.45359237, names: ['lb', 'libbre', 'libbra', 'lbs'] },
+            oz: { factor: 0.028349523125, names: ['oz', 'once', 'oncia'] }
+        }
+    },
+    {
+        base: 'l',
+        units: {
+            l: { factor: 1, names: ['l', 'litri', 'litro'] },
+            ml: { factor: 0.001, names: ['ml', 'millilitri', 'millilitro'] },
+            gal: { factor: 3.785411784, names: ['gal', 'galloni', 'gallone'] }
+        }
+    }
+];
+
+// Cerca "<numero> <unità> in <unità>" (es. "12 km in miglia", "5 kg a libbre").
+function tryEvaluateUnitConversion(query) {
+    const match = query.trim().toLowerCase().match(
+        /^([\d.,]+)\s*([a-zàèìòù]+)\s+(?:in|a)\s+([a-zàèìòù]+)$/i
+    );
+    if (!match) return null;
+
+    const amount = parseFloat(match[1].replace(',', '.'));
+    if (!isFinite(amount)) return null;
+
+    const fromToken = match[2];
+    const toToken = match[3];
+
+    for (const group of UNIT_GROUPS) {
+        let fromUnit = null, fromKey = null, toUnit = null, toKey = null;
+        for (const key in group.units) {
+            if (group.units[key].names.indexOf(fromToken) !== -1) { fromUnit = group.units[key]; fromKey = key; }
+            if (group.units[key].names.indexOf(toToken) !== -1) { toUnit = group.units[key]; toKey = key; }
+        }
+        if (fromUnit && toUnit) {
+            const valueInBase = amount * fromUnit.factor;
+            const converted = valueInBase / toUnit.factor;
+            const rounded = Math.round(converted * 100) / 100;
+            return {
+                kind: 'conversion',
+                fromLabel: amount.toLocaleString('it-IT') + ' ' + fromKey,
+                toLabel: rounded.toLocaleString('it-IT', { maximumFractionDigits: 2 }) + ' ' + toKey
+            };
+        }
+    }
+    return null;
+}
+
+// Punto d'ingresso unico: prova prima la conversione (più specifica), poi il
+// calcolo. Ritorna null se la query non corrisponde a nessuno dei due casi,
+// nel qual caso si procede con la ricerca web normale.
+function computeRichResult(query) {
+    if (!query || query.length > 200) return null;
+    return tryEvaluateUnitConversion(query) || tryEvaluateMathExpression(query);
+}
+
 // Quanto resta valida una voce di cache prima di essere ricalcolata.
 const SEARCH_CACHE_TTL_MS = 2 * 60 * 60 * 1000; // 2 ore
 
@@ -2475,6 +2596,11 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 200, { results: [], totalPages: 0, page: page, type: type });
                 }
 
+                // Il box "rich result" (calcolo o conversione) ha senso solo sulla
+                // prima pagina della ricerca web: per immagini/news/video, o per
+                // pagine successive, saltiamo direttamente alla ricerca normale.
+                const richResult = (type === 'web' && page === 1) ? computeRichResult(q) : null;
+
                 // Prima di chiamare Brave/Serper, controlliamo se qualcuno ha già
                 // cercato la stessa cosa di recente: se sì, rispondiamo subito da
                 // cache senza consumare quota delle API esterne.
@@ -2489,7 +2615,8 @@ const server = http.createServer((req, res) => {
                         query: q,
                         alteredQuery: null,
                         source: cached.source,
-                        fromCache: true
+                        fromCache: true,
+                        richResult: richResult
                     });
                 }
 
@@ -2631,7 +2758,8 @@ const server = http.createServer((req, res) => {
                     // "Forse cercavi...": Brave a volte corregge da sola un probabile errore
                     // di battitura. Se lo fa, ce lo dice qui — non lo inventiamo noi.
                     alteredQuery: (data.query && data.query.altered) ? data.query.altered : null,
-                    source: usedFallback ? 'serper' : 'brave'
+                    source: usedFallback ? 'serper' : 'brave',
+                    richResult: richResult
                 });
 
             } catch (err) {
