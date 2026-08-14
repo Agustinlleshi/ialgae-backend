@@ -1629,6 +1629,20 @@ const server = http.createServer((req, res) => {
                     [rangeStart, rangeEnd]
                 );
 
+                // Articoli del blog più letti: query separata da topPages qui
+                // sopra, altrimenti gli articoli finirebbero quasi sempre fuori
+                // dalla top 10 generale, schiacciati da index.html/results.html
+                // che hanno naturalmente molto più traffico. "page" qui è
+                // "/blog.html?post=lo-slug-dell-articolo" — lo slug viene
+                // separato dal titolo vero e proprio lato frontend (in
+                // admin.html), incrociandolo con l'elenco articoli già caricato.
+                const topBlogArticlesResult = await pool.query(
+                    'SELECT page, COUNT(*)::int AS count ' +
+                    'FROM page_views WHERE created_at >= $1 AND created_at <= $2 AND page LIKE \'/blog.html?post=%\' ' +
+                    'GROUP BY page ORDER BY count DESC LIMIT 10',
+                    [rangeStart, rangeEnd]
+                );
+
                 // Tempo medio sulla pagina: media di duration_ms, disponibile
                 // solo per le visite già tracciate col nuovo sistema (mandato
                 // dal browser quando l'utente lascia la pagina). Finché il
@@ -1700,7 +1714,8 @@ const server = http.createServer((req, res) => {
                     topCities: topCitiesResult.rows.map(function (r) {
                         return { city: r.city, country: r.country, countryCode: r.countryCode, lat: parseFloat(r.lat), lon: parseFloat(r.lon), count: r.count };
                     }),
-                    topPages: topPagesResult.rows
+                    topPages: topPagesResult.rows,
+                    topBlogArticles: topBlogArticlesResult.rows
                 });
             } catch (err) {
                 console.error('Errore statistiche pageviews:', err);
