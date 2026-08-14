@@ -1505,50 +1505,84 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 401, { error: 'Password errata.' });
                 }
 
-                const days = Math.min(Math.max(parseInt(parsedUrl.searchParams.get('days'), 10) || 30, 1), 90);
+                // Due modi di specificare il periodo: "ultimi N giorni" (days,
+                // come prima) oppure un intervallo preciso scelto dall'utente
+                // (from/to, formato AAAA-MM-GG). Se from/to sono presenti e
+                // validi, hanno la precedenza. In entrambi i casi calcoliamo
+                // qui in JavaScript le date esatte di inizio/fine, così le
+                // query sotto sono identiche indipendentemente da come è stato
+                // scelto il periodo.
+                const fromParam = parsedUrl.searchParams.get('from');
+                const toParam = parsedUrl.searchParams.get('to');
+                const isValidDate = /^\d{4}-\d{2}-\d{2}$/;
+
+                let rangeStart, rangeEnd;
+                if (fromParam && toParam && isValidDate.test(fromParam) && isValidDate.test(toParam)) {
+                    // Scambiamo le STRINGHE (non le date già costruite) se l'utente
+                    // ha scelto per sbaglio la data finale come "da": così l'inizio
+                    // giornata/fine giornata restano puliti (00:00:00 / 23:59:59)
+                    // indipendentemente dall'ordine in cui sono state scelte.
+                    let fromStr = fromParam, toStr = toParam;
+                    if (toStr < fromStr) {
+                        const swap = fromStr; fromStr = toStr; toStr = swap;
+                    }
+                    rangeStart = new Date(fromStr + 'T00:00:00.000Z');
+                    rangeEnd = new Date(toStr + 'T23:59:59.999Z');
+                    // Non oltre un anno di intervallo, per non far esplodere le query.
+                    const maxRangeMs = 366 * 24 * 60 * 60 * 1000;
+                    if (rangeEnd.getTime() - rangeStart.getTime() > maxRangeMs) {
+                        rangeStart = new Date(rangeEnd.getTime() - maxRangeMs);
+                    }
+                } else {
+                    const days = Math.min(Math.max(parseInt(parsedUrl.searchParams.get('days'), 10) || 30, 1), 90);
+                    rangeEnd = new Date();
+                    rangeStart = new Date(rangeEnd.getTime() - days * 24 * 60 * 60 * 1000);
+                }
+
+                const rangeDays = Math.max(1, Math.round((rangeEnd.getTime() - rangeStart.getTime()) / (24 * 60 * 60 * 1000)));
+                // Periodo precedente: stessa durata, subito prima dell'inizio
+                // del periodo corrente. Serve solo per calcolare "+18% rispetto
+                // al periodo precedente", non compare da nessun'altra parte.
+                const prevEnd = new Date(rangeStart.getTime());
+                const prevStart = new Date(rangeStart.getTime() - (rangeEnd.getTime() - rangeStart.getTime()));
 
                 const totalResult = await pool.query(
-                    "SELECT COUNT(*)::int AS total, COUNT(DISTINCT visitor_id)::int AS unique_visitors " +
-                    "FROM page_views WHERE created_at >= now() - ($1::int * interval '1 day')",
-                    [days]
+                    'SELECT COUNT(*)::int AS total, COUNT(DISTINCT visitor_id)::int AS unique_visitors ' +
+                    'FROM page_views WHERE created_at >= $1 AND created_at <= $2',
+                    [rangeStart, rangeEnd]
                 );
 
-                // Stesso numero di giorni, ma SUBITO PRIMA del periodo corrente:
-                // serve solo per calcolare "+18% rispetto al periodo precedente",
-                // non compare da nessun'altra parte.
                 const previousResult = await pool.query(
-                    "SELECT COUNT(*)::int AS total FROM page_views " +
-                    "WHERE created_at >= now() - ($1::int * interval '1 day') * 2 " +
-                    "  AND created_at < now() - ($1::int * interval '1 day')",
-                    [days]
+                    'SELECT COUNT(*)::int AS total FROM page_views WHERE created_at >= $1 AND created_at < $2',
+                    [prevStart, prevEnd]
                 );
 
                 const byDayResult = await pool.query(
                     "SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day, COUNT(*)::int AS count " +
-                    "FROM page_views WHERE created_at >= now() - ($1::int * interval '1 day') " +
+                    'FROM page_views WHERE created_at >= $1 AND created_at <= $2 ' +
                     'GROUP BY 1 ORDER BY 1',
-                    [days]
+                    [rangeStart, rangeEnd]
                 );
 
                 const topCountriesResult = await pool.query(
                     'SELECT country, country_code AS "countryCode", COUNT(*)::int AS count ' +
-                    "FROM page_views WHERE created_at >= now() - ($1::int * interval '1 day') AND country IS NOT NULL " +
+                    'FROM page_views WHERE created_at >= $1 AND created_at <= $2 AND country IS NOT NULL ' +
                     'GROUP BY country, country_code ORDER BY count DESC LIMIT 10',
-                    [days]
+                    [rangeStart, rangeEnd]
                 );
 
                 const topCitiesResult = await pool.query(
                     'SELECT city, country, country_code AS "countryCode", AVG(latitude) AS lat, AVG(longitude) AS lon, COUNT(*)::int AS count ' +
-                    "FROM page_views WHERE created_at >= now() - ($1::int * interval '1 day') AND city IS NOT NULL AND latitude IS NOT NULL " +
+                    'FROM page_views WHERE created_at >= $1 AND created_at <= $2 AND city IS NOT NULL AND latitude IS NOT NULL ' +
                     'GROUP BY city, country, country_code ORDER BY count DESC LIMIT 40',
-                    [days]
+                    [rangeStart, rangeEnd]
                 );
 
                 const topPagesResult = await pool.query(
                     'SELECT page, COUNT(*)::int AS count ' +
-                    "FROM page_views WHERE created_at >= now() - ($1::int * interval '1 day') " +
+                    'FROM page_views WHERE created_at >= $1 AND created_at <= $2 ' +
                     'GROUP BY page ORDER BY count DESC LIMIT 10',
-                    [days]
+                    [rangeStart, rangeEnd]
                 );
 
                 const total = totalResult.rows[0].total;
@@ -1565,6 +1599,9 @@ const server = http.createServer((req, res) => {
                     uniqueVisitors: totalResult.rows[0].unique_visitors,
                     previousTotalViews: previousTotal,
                     percentChange: percentChange,
+                    rangeDays: rangeDays,
+                    rangeStart: rangeStart.toISOString().slice(0, 10),
+                    rangeEnd: rangeEnd.toISOString().slice(0, 10),
                     viewsByDay: byDayResult.rows,
                     topCountries: topCountriesResult.rows,
                     topCities: topCitiesResult.rows.map(function (r) {
