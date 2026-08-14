@@ -381,6 +381,22 @@ async function initDb() {
     );
     await pool.query('CREATE INDEX IF NOT EXISTS idx_search_cache_expires ON search_cache (expires_at)');
 
+    // Cache delle risposte IA per domande singole (senza cronologia): vedi
+    // buildAiCacheKey/getCachedAiAnswer/saveCachedAiAnswer più sotto per la
+    // spiegazione completa. Niente scadenza dedicata come search_cache: la
+    // "freschezza" qui si controlla direttamente nella query (created_at
+    // recente), e la pulizia delle voci vecchie avviene nello stesso
+    // intervallo periodico già usato per search_cache.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS ai_response_cache (' +
+        '  cache_key TEXT PRIMARY KEY,' +
+        '  answer TEXT NOT NULL,' +
+        '  provider TEXT,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
+        ')'
+    );
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_ai_response_cache_created ON ai_response_cache (created_at)');
+
     // Blog: articoli scritti in markdown, con stato bozza/pubblicato.
     // "slug" è la versione URL-friendly del titolo (es. "la-mia-storia"),
     // usata nell'indirizzo della pagina dell'articolo.
@@ -713,6 +729,52 @@ async function saveCachedSearch(cacheKey, results, source) {
         );
     } catch (err) {
         console.error('Errore scrittura search_cache:', err);
+    }
+}
+
+// ---- Cache delle risposte IA (/api/ask e /api/overview) ----
+// Diverso dalla cache di ricerca qui sopra: qui mettiamo in cache SOLO le
+// domande "singole" (senza cronologia precedente) — una conversazione con più
+// messaggi è troppo specifica per essere riutilizzata da qualcun altro, quindi
+// non viene mai messa in cache. Le domande singole invece si ripetono spesso
+// (tante persone cercano le stesse cose), ed è lì che il risparmio è reale:
+// niente nuova chiamata a Claude/Gemini se qualcuno ha già fatto la stessa
+// identica domanda di recente.
+const AI_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 ore
+
+// Il prefisso ("ask" o "overview") tiene separate le cache dei due endpoint,
+// anche se la domanda è identica: sono due funzioni diverse del sito, meglio
+// non farle dipendere l'una dall'altra.
+function buildAiCacheKey(endpointName, question) {
+    const normalized = (question || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    return endpointName + ':' + normalized;
+}
+
+async function getCachedAiAnswer(cacheKey) {
+    if (!dbEnabled) return null;
+    try {
+        const result = await pool.query(
+            'SELECT answer, provider FROM ai_response_cache WHERE cache_key = $1 AND created_at > now() - interval \'24 hours\'',
+            [cacheKey]
+        );
+        if (result.rows.length === 0) return null;
+        return { answer: result.rows[0].answer, provider: result.rows[0].provider };
+    } catch (err) {
+        console.error('Errore lettura ai_response_cache:', err);
+        return null;
+    }
+}
+
+async function saveCachedAiAnswer(cacheKey, answer, provider) {
+    if (!dbEnabled) return;
+    try {
+        await pool.query(
+            'INSERT INTO ai_response_cache (cache_key, answer, provider, created_at) VALUES ($1, $2, $3, now()) ' +
+            'ON CONFLICT (cache_key) DO UPDATE SET answer = EXCLUDED.answer, provider = EXCLUDED.provider, created_at = now()',
+            [cacheKey, answer, provider]
+        );
+    } catch (err) {
+        console.error('Errore scrittura ai_response_cache:', err);
     }
 }
 
@@ -2773,11 +2835,28 @@ const server = http.createServer((req, res) => {
                 }
 
                 let aiResult;
+                // La cache si usa SOLO per domande singole (senza cronologia
+                // precedente): una conversazione con più messaggi è troppo
+                // specifica per essere condivisa con altri utenti.
+                const isCacheable = anthropicMessages.length === 1;
+                const aiCacheKey = isCacheable ? buildAiCacheKey('ask', anthropicMessages[0].content) : null;
+
+                if (isCacheable) {
+                    const cached = await getCachedAiAnswer(aiCacheKey);
+                    if (cached) {
+                        return sendJSON(res, 200, { answer: cached.answer, aiProvider: cached.provider, fromCache: true });
+                    }
+                }
+
                 try {
                     aiResult = await getAiAnswer(anthropicMessages);
                 } catch (aiErr) {
                     console.error('Errore IA (ask):', aiErr.message);
                     return sendJSON(res, 502, { error: 'Errore nel contattare il servizio IA. Riprova più tardi.' });
+                }
+
+                if (isCacheable) {
+                    await saveCachedAiAnswer(aiCacheKey, aiResult.answer, aiResult.provider);
                 }
 
                 return sendJSON(res, 200, { answer: aiResult.answer || 'Nessuna risposta ricevuta.', aiProvider: aiResult.provider });
@@ -2847,11 +2926,25 @@ const server = http.createServer((req, res) => {
                 }
 
                 let aiResult;
+                const isCacheable = anthropicMessages.length === 1;
+                const aiCacheKey = isCacheable ? buildAiCacheKey('overview', anthropicMessages[0].content) : null;
+
+                if (isCacheable) {
+                    const cached = await getCachedAiAnswer(aiCacheKey);
+                    if (cached) {
+                        return sendJSON(res, 200, { answer: cached.answer, aiProvider: cached.provider, fromCache: true });
+                    }
+                }
+
                 try {
                     aiResult = await getAiAnswer(anthropicMessages);
                 } catch (aiErr) {
                     console.error('Errore IA (overview):', aiErr.message);
                     return sendJSON(res, 502, { error: 'Errore nel contattare il servizio IA. Riprova più tardi.' });
+                }
+
+                if (isCacheable) {
+                    await saveCachedAiAnswer(aiCacheKey, aiResult.answer, aiResult.provider);
                 }
 
                 return sendJSON(res, 200, { answer: aiResult.answer || 'Nessuna risposta ricevuta.', aiProvider: aiResult.provider });
@@ -3565,6 +3658,16 @@ if (dbEnabled) {
         pool.query("DELETE FROM rate_limits WHERE window_start <= now() - interval '24 hours'")
             .catch(function (err) {
                 console.error('Errore pulizia rate_limits:', err);
+            });
+    }, 60 * 60 * 1000);
+
+    // Stessa idea, per la cache delle risposte IA: qui la "scadenza" non è
+    // una colonna dedicata (vedi AI_CACHE_TTL_MS più sopra), quindi puliamo
+    // usando lo stesso margine di 24 ore direttamente su created_at.
+    setInterval(function () {
+        pool.query("DELETE FROM ai_response_cache WHERE created_at <= now() - interval '24 hours'")
+            .catch(function (err) {
+                console.error('Errore pulizia ai_response_cache:', err);
             });
     }, 60 * 60 * 1000);
 }
