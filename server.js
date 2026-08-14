@@ -336,6 +336,30 @@ async function initDb() {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_pending_secret TEXT');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT false');
 
+    // Tracciamento visite (per la dashboard): una riga per ogni pagina
+    // caricata, con paese/città dedotti dall'IP del visitatore. Niente dati
+    // personali identificabili (no IP salvato, no cookie, no account collegato)
+    // — solo la posizione geografica approssimata e la pagina visitata.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS page_views (' +
+        '  id SERIAL PRIMARY KEY,' +
+        '  page TEXT NOT NULL,' +
+        '  country TEXT,' +
+        '  country_code TEXT,' +
+        '  city TEXT,' +
+        '  latitude DOUBLE PRECISION,' +
+        '  longitude DOUBLE PRECISION,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
+        ')'
+    );
+    // Indice sulla data: quasi tutte le query della dashboard filtrano per
+    // "ultimi N giorni", questo le mantiene veloci anche con molte righe.
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_page_views_created_at ON page_views (created_at)');
+    // ID anonimo generato dal browser (non un account, non un IP): permette
+    // di distinguere "5 visite di 5 persone diverse" da "5 visite della
+    // stessa persona", senza identificare nessuno.
+    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS visitor_id TEXT');
+
     // Cache dei risultati di ricerca: evita di richiamare Brave/Serper per
     // query già cercate di recente da qualsiasi utente. cache_key combina
     // query normalizzata + tipo + pagina, così "pizza" pagina 1 e pagina 2
@@ -930,6 +954,46 @@ function buildTotpOtpauthUrl(email, secretBase32) {
         '&algorithm=SHA1&digits=6&period=30';
 }
 
+// ---- Tracciamento visite: geolocalizzazione IP ----
+// Usa ip-api.com (gratuito, senza chiave API, fino a 45 richieste/minuto —
+// più che sufficiente: ogni IP viene comunque richiesto al massimo una volta
+// al giorno grazie alla cache qui sotto). Se il servizio non risponde, la
+// visita viene comunque registrata ma senza posizione, invece di bloccare
+// tutto.
+const geoIpCache = new Map(); // ip -> { data, timestamp }
+const GEO_IP_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 ore
+
+function isPrivateOrLocalIp(ip) {
+    if (!ip) return true;
+    return ip === '::1' || ip === '127.0.0.1' ||
+        ip.startsWith('10.') || ip.startsWith('192.168.') ||
+        /^172\.(1[6-9]|2\d|3[0-1])\./.test(ip);
+}
+
+async function getGeoForIp(ip) {
+    const empty = { country: null, countryCode: null, city: null, lat: null, lon: null };
+    if (isPrivateOrLocalIp(ip)) return empty;
+
+    const cached = geoIpCache.get(ip);
+    if (cached && (Date.now() - cached.timestamp) < GEO_IP_CACHE_TTL_MS) {
+        return cached.data;
+    }
+
+    try {
+        const response = await fetch(
+            'http://ip-api.com/json/' + encodeURIComponent(ip) + '?fields=status,country,countryCode,city,lat,lon'
+        );
+        const json = await response.json();
+        const data = (json.status === 'success')
+            ? { country: json.country || null, countryCode: json.countryCode || null, city: json.city || null, lat: json.lat != null ? json.lat : null, lon: json.lon != null ? json.lon : null }
+            : empty;
+        geoIpCache.set(ip, { data: data, timestamp: Date.now() });
+        return data;
+    } catch (err) {
+        return empty;
+    }
+}
+
 // ---- Account con email e password (alternativa al login Google) ----
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
@@ -1388,6 +1452,129 @@ const server = http.createServer((req, res) => {
             } catch (err) {
                 console.error('Errore delete-account:', err);
                 return sendJSON(res, 500, { error: 'Impossibile eliminare l\'account in questo momento.' });
+            }
+        })();
+        return;
+    }
+
+    // Tracciamento visite (pubblico, nessun login richiesto): chiamato dal
+    // frontend a ogni caricamento pagina (index.html, results.html, blog.html).
+    // Non blocca mai la pagina dell'utente: qualsiasi errore qui dentro viene
+    // ignorato in silenzio, la visita semplicemente non viene contata.
+    if (req.method === 'POST' && req.url === '/api/track') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    payload = {};
+                }
+                const page = (payload.page || '/').toString().slice(0, 200);
+                const visitorId = (payload.visitorId || '').toString().slice(0, 64) || null;
+                const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+                const geo = await getGeoForIp(ip);
+
+                await pool.query(
+                    'INSERT INTO page_views (page, country, country_code, city, latitude, longitude, visitor_id) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+                    [page, geo.country, geo.countryCode, geo.city, geo.lat, geo.lon, visitorId]
+                );
+                return sendJSON(res, 200, { ok: true });
+            } catch (err) {
+                console.error('Errore tracciamento visita (non bloccante):', err.message);
+                return sendJSON(res, 200, { ok: false });
+            }
+        });
+        return;
+    }
+
+    // Dati aggregati per la dashboard admin: totale visite, andamento nel
+    // tempo, classifica paesi/città, pagine più visitate. Stessa protezione
+    // con ADMIN_SECRET degli altri endpoint admin qui sotto.
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/pageviews/summary') === 0) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                const parsedUrl = new URL(req.url, 'http://localhost');
+                const secret = parsedUrl.searchParams.get('secret') || '';
+                if (secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+
+                const days = Math.min(Math.max(parseInt(parsedUrl.searchParams.get('days'), 10) || 30, 1), 90);
+
+                const totalResult = await pool.query(
+                    "SELECT COUNT(*)::int AS total, COUNT(DISTINCT visitor_id)::int AS unique_visitors " +
+                    "FROM page_views WHERE created_at >= now() - ($1::int * interval '1 day')",
+                    [days]
+                );
+
+                // Stesso numero di giorni, ma SUBITO PRIMA del periodo corrente:
+                // serve solo per calcolare "+18% rispetto al periodo precedente",
+                // non compare da nessun'altra parte.
+                const previousResult = await pool.query(
+                    "SELECT COUNT(*)::int AS total FROM page_views " +
+                    "WHERE created_at >= now() - ($1::int * interval '1 day') * 2 " +
+                    "  AND created_at < now() - ($1::int * interval '1 day')",
+                    [days]
+                );
+
+                const byDayResult = await pool.query(
+                    "SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day, COUNT(*)::int AS count " +
+                    "FROM page_views WHERE created_at >= now() - ($1::int * interval '1 day') " +
+                    'GROUP BY 1 ORDER BY 1',
+                    [days]
+                );
+
+                const topCountriesResult = await pool.query(
+                    'SELECT country, country_code AS "countryCode", COUNT(*)::int AS count ' +
+                    "FROM page_views WHERE created_at >= now() - ($1::int * interval '1 day') AND country IS NOT NULL " +
+                    'GROUP BY country, country_code ORDER BY count DESC LIMIT 10',
+                    [days]
+                );
+
+                const topCitiesResult = await pool.query(
+                    'SELECT city, country, country_code AS "countryCode", AVG(latitude) AS lat, AVG(longitude) AS lon, COUNT(*)::int AS count ' +
+                    "FROM page_views WHERE created_at >= now() - ($1::int * interval '1 day') AND city IS NOT NULL AND latitude IS NOT NULL " +
+                    'GROUP BY city, country, country_code ORDER BY count DESC LIMIT 40',
+                    [days]
+                );
+
+                const topPagesResult = await pool.query(
+                    'SELECT page, COUNT(*)::int AS count ' +
+                    "FROM page_views WHERE created_at >= now() - ($1::int * interval '1 day') " +
+                    'GROUP BY page ORDER BY count DESC LIMIT 10',
+                    [days]
+                );
+
+                const total = totalResult.rows[0].total;
+                const previousTotal = previousResult.rows[0].total;
+                // Variazione percentuale rispetto al periodo precedente. Se prima
+                // era zero, evitiamo una divisione per zero (mostriamo null: il
+                // frontend lo interpreta come "dato non disponibile", non "0%").
+                const percentChange = previousTotal > 0
+                    ? Math.round(((total - previousTotal) / previousTotal) * 1000) / 10
+                    : null;
+
+                return sendJSON(res, 200, {
+                    totalViews: total,
+                    uniqueVisitors: totalResult.rows[0].unique_visitors,
+                    previousTotalViews: previousTotal,
+                    percentChange: percentChange,
+                    viewsByDay: byDayResult.rows,
+                    topCountries: topCountriesResult.rows,
+                    topCities: topCitiesResult.rows.map(function (r) {
+                        return { city: r.city, country: r.country, countryCode: r.countryCode, lat: parseFloat(r.lat), lon: parseFloat(r.lon), count: r.count };
+                    }),
+                    topPages: topPagesResult.rows
+                });
+            } catch (err) {
+                console.error('Errore statistiche pageviews:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         })();
         return;
