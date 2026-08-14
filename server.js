@@ -359,6 +359,11 @@ async function initDb() {
     // di distinguere "5 visite di 5 persone diverse" da "5 visite della
     // stessa persona", senza identificare nessuno.
     await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS visitor_id TEXT');
+    // Quanto tempo (in millisecondi) l'utente è rimasto su quella pagina prima
+    // di andarsene: resta NULL finché il browser non manda l'aggiornamento
+    // (vedi /api/track/duration più sotto), quindi all'inizio non c'è nessun
+    // dato — si riempie mano a mano che la gente naviga il sito.
+    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS duration_ms INTEGER');
 
     // Cache dei risultati di ricerca: evita di richiamare Brave/Serper per
     // query già cercate di recente da qualsiasi utente. cache_key combina
@@ -1477,13 +1482,52 @@ const server = http.createServer((req, res) => {
                 const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
                 const geo = await getGeoForIp(ip);
 
-                await pool.query(
-                    'INSERT INTO page_views (page, country, country_code, city, latitude, longitude, visitor_id) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+                const insertResult = await pool.query(
+                    'INSERT INTO page_views (page, country, country_code, city, latitude, longitude, visitor_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id',
                     [page, geo.country, geo.countryCode, geo.city, geo.lat, geo.lon, visitorId]
                 );
-                return sendJSON(res, 200, { ok: true });
+                // L'id torna al browser, che lo terrà da parte per mandarlo
+                // insieme alla durata quando l'utente lascerà la pagina (vedi
+                // /api/track/duration qui sotto) — permette di aggiornare la
+                // stessa riga invece di doverne cercare una a caso.
+                return sendJSON(res, 200, { ok: true, id: insertResult.rows[0].id });
             } catch (err) {
                 console.error('Errore tracciamento visita (non bloccante):', err.message);
+                return sendJSON(res, 200, { ok: false });
+            }
+        });
+        return;
+    }
+
+    // Riceve quanto tempo l'utente è rimasto sulla pagina, mandato dal browser
+    // proprio nel momento in cui se ne va (evento "pagehide"/"visibilitychange",
+    // tramite navigator.sendBeacon — l'unico modo affidabile di mandare dati
+    // proprio mentre la pagina si sta chiudendo). Anche questo endpoint non
+    // deve mai disturbare l'utente: qualsiasi errore viene ignorato in silenzio.
+    if (req.method === 'POST' && req.url === '/api/track/duration') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    payload = {};
+                }
+                const id = parseInt(payload.id, 10);
+                const durationMs = parseInt(payload.durationMs, 10);
+                // Scarta valori assurdi (pagina rimasta aperta ore in un'altra
+                // scheda, orologio del browser strano, ecc.): oltre i 30 minuti
+                // non è più "tempo sulla pagina" in senso utile, meglio non
+                // contarlo che sballare la media.
+                if (!id || !durationMs || durationMs <= 0 || durationMs > 30 * 60 * 1000) {
+                    return sendJSON(res, 200, { ok: false });
+                }
+                await pool.query('UPDATE page_views SET duration_ms = $1 WHERE id = $2', [durationMs, id]);
+                return sendJSON(res, 200, { ok: true });
+            } catch (err) {
+                console.error('Errore tracciamento durata (non bloccante):', err.message);
                 return sendJSON(res, 200, { ok: false });
             }
         });
@@ -1585,6 +1629,43 @@ const server = http.createServer((req, res) => {
                     [rangeStart, rangeEnd]
                 );
 
+                // Tempo medio sulla pagina: media di duration_ms, disponibile
+                // solo per le visite già tracciate col nuovo sistema (mandato
+                // dal browser quando l'utente lascia la pagina). Finché il
+                // sito non gira per un po' con questa modifica attiva, questo
+                // numero parte vuoto — non lo inventiamo.
+                const avgTimeResult = await pool.query(
+                    'SELECT AVG(duration_ms) AS avg_ms, COUNT(duration_ms)::int AS sample_size ' +
+                    'FROM page_views WHERE created_at >= $1 AND created_at <= $2 AND duration_ms IS NOT NULL',
+                    [rangeStart, rangeEnd]
+                );
+
+                // Tasso di rimbalzo: percentuale di "sessioni" con una sola
+                // pagina vista. Una sessione è un gruppo di visite dello stesso
+                // visitor_id senza pause superiori a 30 minuti fra una e
+                // l'altra — la stessa definizione usata da Google Analytics e
+                // dalla maggior parte degli strumenti di analytics.
+                const bounceResult = await pool.query(
+                    'WITH ordered AS (' +
+                    '  SELECT visitor_id, created_at, ' +
+                    '         created_at - LAG(created_at) OVER (PARTITION BY visitor_id ORDER BY created_at) AS gap ' +
+                    '  FROM page_views ' +
+                    '  WHERE created_at >= $1 AND created_at <= $2 AND visitor_id IS NOT NULL' +
+                    '), sessioned AS (' +
+                    '  SELECT visitor_id, created_at, ' +
+                    "         SUM(CASE WHEN gap IS NULL OR gap > interval '30 minutes' THEN 1 ELSE 0 END) " +
+                    '           OVER (PARTITION BY visitor_id ORDER BY created_at) AS session_num ' +
+                    '  FROM ordered' +
+                    '), session_counts AS (' +
+                    '  SELECT visitor_id, session_num, COUNT(*) AS pages_in_session ' +
+                    '  FROM sessioned GROUP BY visitor_id, session_num' +
+                    ') ' +
+                    'SELECT COUNT(*)::int AS total_sessions, ' +
+                    '       COUNT(*) FILTER (WHERE pages_in_session = 1)::int AS bounced_sessions ' +
+                    'FROM session_counts',
+                    [rangeStart, rangeEnd]
+                );
+
                 const total = totalResult.rows[0].total;
                 const previousTotal = previousResult.rows[0].total;
                 // Variazione percentuale rispetto al periodo precedente. Se prima
@@ -1594,11 +1675,23 @@ const server = http.createServer((req, res) => {
                     ? Math.round(((total - previousTotal) / previousTotal) * 1000) / 10
                     : null;
 
+                const avgTimeOnPageSeconds = avgTimeResult.rows[0].sample_size > 0
+                    ? Math.round(avgTimeResult.rows[0].avg_ms / 1000)
+                    : null;
+
+                const totalSessions = bounceResult.rows[0].total_sessions;
+                const bounceRatePercent = totalSessions > 0
+                    ? Math.round((bounceResult.rows[0].bounced_sessions / totalSessions) * 1000) / 10
+                    : null;
+
                 return sendJSON(res, 200, {
                     totalViews: total,
                     uniqueVisitors: totalResult.rows[0].unique_visitors,
                     previousTotalViews: previousTotal,
                     percentChange: percentChange,
+                    avgTimeOnPageSeconds: avgTimeOnPageSeconds,
+                    avgTimeSampleSize: avgTimeResult.rows[0].sample_size,
+                    bounceRatePercent: bounceRatePercent,
                     rangeDays: rangeDays,
                     rangeStart: rangeStart.toISOString().slice(0, 10),
                     rangeEnd: rangeEnd.toISOString().slice(0, 10),
@@ -1614,6 +1707,47 @@ const server = http.createServer((req, res) => {
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         })();
+        return;
+    }
+
+    // Cancella le visite più VECCHIE di "keepDays" giorni, mantenendo intatti
+    // i dati recenti. Azione distruttiva e irreversibile: protetta con la
+    // stessa chiave admin, e con un minimo di "keepDays" per evitare di
+    // svuotare per sbaglio l'intera tabella con un valore a caso (es. 0).
+    if (req.method === 'POST' && req.url === '/api/admin/pageviews/cleanup') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+                if (payload.secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+
+                const keepDays = parseInt(payload.keepDays, 10);
+                if (!keepDays || keepDays < 7) {
+                    return sendJSON(res, 400, { error: 'keepDays deve essere almeno 7, per sicurezza.' });
+                }
+
+                const deleteResult = await pool.query(
+                    "DELETE FROM page_views WHERE created_at < now() - ($1::int * interval '1 day')",
+                    [keepDays]
+                );
+
+                return sendJSON(res, 200, { deletedCount: deleteResult.rowCount });
+            } catch (err) {
+                console.error('Errore pulizia pageviews:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
         return;
     }
 
