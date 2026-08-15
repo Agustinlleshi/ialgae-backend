@@ -379,6 +379,27 @@ async function initDb() {
     // Qui vogliamo solo capire "quanti visitatori usano il telefono", non chi sono.
     await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS device TEXT');
 
+    // Notifiche mostrate nella campanella del pannello admin: fallback IA,
+    // fallback ricerca, nuovi iscritti, traguardi raggiunti.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS admin_notifications (' +
+        '  id SERIAL PRIMARY KEY,' +
+        '  type TEXT NOT NULL,' +
+        '  message TEXT NOT NULL,' +
+        '  read BOOLEAN NOT NULL DEFAULT false,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
+        ')'
+    );
+    // Tiene traccia dell'ultima soglia di traguardo già notificata per ogni
+    // metrica (visite, iscritti, articoli), per non notificare la stessa
+    // soglia due volte.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS milestones_reached (' +
+        '  metric TEXT PRIMARY KEY,' +
+        '  last_threshold INTEGER NOT NULL DEFAULT 0' +
+        ')'
+    );
+
     // Cache dei risultati di ricerca: evita di richiamare Brave/Serper per
     // query già cercate di recente da qualsiasi utente. cache_key combina
     // query normalizzata + tipo + pagina, così "pizza" pagina 1 e pagina 2
@@ -557,6 +578,75 @@ async function callGemini(anthropicMessages) {
     return Array.isArray(parts) ? parts.map(function (p) { return p.text || ''; }).join('\n') : '';
 }
 
+// ---- Notifiche per il pannello admin (campanella) ----
+// Quattro tipi: fallback IA, fallback ricerca, nuovo iscritto, traguardo.
+// Le prime due sono "throttled" (non ripetute più di una volta ogni tot ore):
+// se Anthropic è giù per un'ora intera, non vogliamo cento notifiche identiche,
+// ne basta una che dice "attenzione, sta succedendo".
+
+async function createNotification(type, message) {
+    try {
+        await pool.query('INSERT INTO admin_notifications (type, message) VALUES ($1,$2)', [type, message]);
+    } catch (err) {
+        console.error('Errore creazione notifica:', err);
+    }
+}
+
+async function createNotificationThrottled(type, message, throttleHours) {
+    try {
+        const existing = await pool.query(
+            "SELECT id FROM admin_notifications WHERE type = $1 AND created_at > now() - ($2::int * interval '1 hour') LIMIT 1",
+            [type, throttleHours]
+        );
+        if (existing.rows.length > 0) return; // già avvisato di recente, non ripetiamo
+        await createNotification(type, message);
+    } catch (err) {
+        console.error('Errore creazione notifica (throttled):', err);
+    }
+}
+
+// Soglie "tonde" per i traguardi — visite, iscritti, articoli.
+const MILESTONE_THRESHOLDS = [10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000];
+
+async function checkMilestone(metric, currentValue, messageTemplate) {
+    try {
+        const result = await pool.query('SELECT last_threshold FROM milestones_reached WHERE metric = $1', [metric]);
+        const lastThreshold = result.rows.length > 0 ? result.rows[0].last_threshold : 0;
+
+        // Trova la soglia più alta già raggiunta ma non ancora notificata.
+        let newThreshold = null;
+        for (const t of MILESTONE_THRESHOLDS) {
+            if (currentValue >= t && t > lastThreshold) newThreshold = t;
+        }
+        if (newThreshold === null) return;
+
+        await pool.query(
+            'INSERT INTO milestones_reached (metric, last_threshold) VALUES ($1,$2) ' +
+            'ON CONFLICT (metric) DO UPDATE SET last_threshold = $2',
+            [metric, newThreshold]
+        );
+        await createNotification('milestone', messageTemplate.replace('{n}', newThreshold.toLocaleString('it-IT')));
+    } catch (err) {
+        console.error('Errore controllo traguardo (' + metric + '):', err);
+    }
+}
+
+async function checkAllMilestones() {
+    if (!dbEnabled) return;
+    try {
+        const visitsResult = await pool.query('SELECT COUNT(*)::int AS c FROM page_views');
+        await checkMilestone('total_visits', visitsResult.rows[0].c, '🎉 Hai superato le {n} visite totali!');
+
+        const usersResult = await pool.query('SELECT COUNT(*)::int AS c FROM users');
+        await checkMilestone('total_users', usersResult.rows[0].c, '🎉 Hai superato i {n} iscritti!');
+
+        const postsResult = await pool.query('SELECT COUNT(*)::int AS c FROM blog_posts WHERE published = true');
+        await checkMilestone('total_posts', postsResult.rows[0].c, '🎉 Hai pubblicato {n} articoli sul blog!');
+    } catch (err) {
+        console.error('Errore controllo traguardi:', err);
+    }
+}
+
 // Punto d'ingresso unico: prova prima Claude, e SOLO se fallisce passa a
 // Gemini come riserva. Ritorna { answer, provider } così i log (e volendo
 // anche il frontend) sanno sempre quale dei due ha risposto davvero. Se
@@ -570,6 +660,13 @@ async function getAiAnswer(anthropicMessages) {
         console.error('Anthropic non disponibile, provo con Gemini come riserva:', anthropicErr.message);
         try {
             const answer = await callGemini(anthropicMessages);
+            // Non aspettiamo questa chiamata (fire and forget): non deve mai
+            // rallentare la risposta vera all'utente per colpa di una notifica.
+            createNotificationThrottled(
+                'ai_fallback',
+                '⚠️ Il sito sta rispondendo con Gemini invece di Claude. Probabile credito Anthropic esaurito — controlla su console.anthropic.com.',
+                6
+            );
             return { answer: answer, provider: 'gemini' };
         } catch (geminiErr) {
             console.error('Anche Gemini non disponibile:', geminiErr.message);
@@ -1830,6 +1927,69 @@ function parseAdminDateRange(searchParams) {
     // Solo numeri aggregati (nuovi/di ritorno, dispositivo) e un elenco di
     // "sessioni" anonime — paese, dispositivo, quante pagine, quanto tempo,
     // ma MAI "chi". Protetto dalla stessa chiave admin degli altri endpoint.
+    // Notifiche per la campanella del pannello admin: le più recenti, con il
+    // conteggio di quelle non ancora lette.
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/notifications') === 0 && req.url.indexOf('/mark-read') === -1) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                const parsedUrl = new URL(req.url, 'http://localhost');
+                const secret = parsedUrl.searchParams.get('secret') || '';
+                if (secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+
+                const listResult = await pool.query(
+                    'SELECT id, type, message, read, created_at FROM admin_notifications ORDER BY created_at DESC LIMIT 30'
+                );
+                const unreadResult = await pool.query(
+                    'SELECT COUNT(*)::int AS count FROM admin_notifications WHERE read = false'
+                );
+
+                return sendJSON(res, 200, {
+                    notifications: listResult.rows,
+                    unreadCount: unreadResult.rows[0].count
+                });
+            } catch (err) {
+                console.error('Errore lettura notifiche:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Segna tutte le notifiche come lette (chiamato quando l'admin apre la
+    // campanella — un click, non una per una).
+    if (req.method === 'POST' && req.url === '/api/admin/notifications/mark-read') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+                if (payload.secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+
+                await pool.query('UPDATE admin_notifications SET read = true WHERE read = false');
+                return sendJSON(res, 200, { ok: true });
+            } catch (err) {
+                console.error('Errore aggiornamento notifiche:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/admin/pageviews/visitors') === 0) {
         (async function () {
             try {
@@ -2314,6 +2474,11 @@ function parseAdminDateRange(searchParams) {
                 user.verifyToken = null;
                 user.verifyTokenExpires = null;
                 await saveUser(user);
+
+                // Notifica un nuovo iscritto vero (email confermata, non solo
+                // una registrazione abbandonata a metà). Non aspettiamo questa
+                // chiamata: non deve mai rallentare l'accesso dell'utente.
+                createNotification('new_signup', '👤 Nuovo iscritto: ' + user.email);
 
                 // Una volta confermata l'email, colleghiamo subito l'utente:
                 // non deve rifare il login da capo.
@@ -3753,6 +3918,17 @@ function parseAdminDateRange(searchParams) {
                                     };
                                 });
                                 usedFallback = true;
+                                // Notifichiamo solo se Brave è DAVVERO fallito (quota
+                                // esaurita, errore del servizio) — non per una query
+                                // rara che semplicemente non ha risultati, quello è
+                                // normale e non indica nessun problema da segnalare.
+                                if (braveFailed) {
+                                    createNotificationThrottled(
+                                        'search_fallback',
+                                        '⚠️ La ricerca sta usando Serper invece di Brave. Probabile quota Brave esaurita.',
+                                        6
+                                    );
+                                }
                             }
                         } else {
                             console.error('Riserva Serper non riuscita:', serperResponse.status);
@@ -3853,6 +4029,23 @@ if (dbEnabled) {
         pool.query("DELETE FROM ai_response_cache WHERE created_at <= now() - interval '24 hours'")
             .catch(function (err) {
                 console.error('Errore pulizia ai_response_cache:', err);
+            });
+    }, 60 * 60 * 1000);
+
+    // Controlla i traguardi (visite, iscritti, articoli) sia subito all'avvio
+    // del server, sia ogni ora — così una soglia superata viene notificata
+    // entro un'ora al massimo, senza dover aspettare che qualcuno apra la
+    // dashboard per "farla scattare".
+    checkAllMilestones();
+    setInterval(checkAllMilestones, 60 * 60 * 1000);
+
+    // Elimina anche le notifiche più vecchie di 90 giorni, per non far
+    // crescere la tabella all'infinito — 90 giorni sono comunque più che
+    // sufficienti per uno storico utile nella campanella.
+    setInterval(function () {
+        pool.query("DELETE FROM admin_notifications WHERE created_at <= now() - interval '90 days'")
+            .catch(function (err) {
+                console.error('Errore pulizia admin_notifications:', err);
             });
     }, 60 * 60 * 1000);
 }
