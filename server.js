@@ -374,6 +374,10 @@ async function initDb() {
     // (vedi /api/track/duration più sotto), quindi all'inizio non c'è nessun
     // dato — si riempie mano a mano che la gente naviga il sito.
     await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS duration_ms INTEGER');
+    // Solo "mobile" o "desktop" — mai lo User-Agent completo del browser, che
+    // combinato con altri dati potrebbe rendere una persona identificabile.
+    // Qui vogliamo solo capire "quanti visitatori usano il telefono", non chi sono.
+    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS device TEXT');
 
     // Cache dei risultati di ricerca: evita di richiamare Brave/Serper per
     // query già cercate di recente da qualsiasi utente. cache_key combina
@@ -1568,12 +1572,16 @@ const server = http.createServer((req, res) => {
                 }
                 const page = (payload.page || '/').toString().slice(0, 200);
                 const visitorId = (payload.visitorId || '').toString().slice(0, 64) || null;
+                // Validazione rigida: accettiamo SOLO questi due valori esatti,
+                // qualsiasi altra cosa (compreso un tentativo di mandare dati
+                // più dettagliati) viene scartata.
+                const device = (payload.device === 'mobile' || payload.device === 'desktop') ? payload.device : null;
                 const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
                 const geo = await getGeoForIp(ip);
 
                 const insertResult = await pool.query(
-                    'INSERT INTO page_views (page, country, country_code, city, latitude, longitude, visitor_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id',
-                    [page, geo.country, geo.countryCode, geo.city, geo.lat, geo.lon, visitorId]
+                    'INSERT INTO page_views (page, country, country_code, city, latitude, longitude, visitor_id, device) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id',
+                    [page, geo.country, geo.countryCode, geo.city, geo.lat, geo.lon, visitorId, device]
                 );
                 // L'id torna al browser, che lo terrà da parte per mandarlo
                 // insieme alla durata quando l'utente lascerà la pagina (vedi
@@ -1623,6 +1631,40 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+// Calcola l'intervallo di date da usare per le query della dashboard admin,
+// condivisa tra /api/admin/pageviews/summary e /api/admin/pageviews/visitors
+// (e qualunque altro endpoint la usi in futuro) — così la logica "days oppure
+// from/to" resta identica ovunque, invece di essere riscritta più volte.
+function parseAdminDateRange(searchParams) {
+    const fromParam = searchParams.get('from');
+    const toParam = searchParams.get('to');
+    const isValidDate = /^\d{4}-\d{2}-\d{2}$/;
+
+    let rangeStart, rangeEnd;
+    if (fromParam && toParam && isValidDate.test(fromParam) && isValidDate.test(toParam)) {
+        let fromStr = fromParam, toStr = toParam;
+        if (toStr < fromStr) {
+            const swap = fromStr; fromStr = toStr; toStr = swap;
+        }
+        rangeStart = new Date(fromStr + 'T00:00:00.000Z');
+        rangeEnd = new Date(toStr + 'T23:59:59.999Z');
+        const maxRangeMs = 366 * 24 * 60 * 60 * 1000;
+        if (rangeEnd.getTime() - rangeStart.getTime() > maxRangeMs) {
+            rangeStart = new Date(rangeEnd.getTime() - maxRangeMs);
+        }
+    } else {
+        const days = Math.min(Math.max(parseInt(searchParams.get('days'), 10) || 30, 1), 90);
+        rangeEnd = new Date();
+        rangeStart = new Date(rangeEnd.getTime() - days * 24 * 60 * 60 * 1000);
+    }
+
+    const rangeDays = Math.max(1, Math.round((rangeEnd.getTime() - rangeStart.getTime()) / (24 * 60 * 60 * 1000)));
+    const prevEnd = new Date(rangeStart.getTime());
+    const prevStart = new Date(rangeStart.getTime() - (rangeEnd.getTime() - rangeStart.getTime()));
+
+    return { rangeStart: rangeStart, rangeEnd: rangeEnd, rangeDays: rangeDays, prevStart: prevStart, prevEnd: prevEnd };
+}
+
     // Dati aggregati per la dashboard admin: totale visite, andamento nel
     // tempo, classifica paesi/città, pagine più visitate. Stessa protezione
     // con ADMIN_SECRET degli altri endpoint admin qui sotto.
@@ -1641,43 +1683,8 @@ const server = http.createServer((req, res) => {
                 // Due modi di specificare il periodo: "ultimi N giorni" (days,
                 // come prima) oppure un intervallo preciso scelto dall'utente
                 // (from/to, formato AAAA-MM-GG). Se from/to sono presenti e
-                // validi, hanno la precedenza. In entrambi i casi calcoliamo
-                // qui in JavaScript le date esatte di inizio/fine, così le
-                // query sotto sono identiche indipendentemente da come è stato
-                // scelto il periodo.
-                const fromParam = parsedUrl.searchParams.get('from');
-                const toParam = parsedUrl.searchParams.get('to');
-                const isValidDate = /^\d{4}-\d{2}-\d{2}$/;
-
-                let rangeStart, rangeEnd;
-                if (fromParam && toParam && isValidDate.test(fromParam) && isValidDate.test(toParam)) {
-                    // Scambiamo le STRINGHE (non le date già costruite) se l'utente
-                    // ha scelto per sbaglio la data finale come "da": così l'inizio
-                    // giornata/fine giornata restano puliti (00:00:00 / 23:59:59)
-                    // indipendentemente dall'ordine in cui sono state scelte.
-                    let fromStr = fromParam, toStr = toParam;
-                    if (toStr < fromStr) {
-                        const swap = fromStr; fromStr = toStr; toStr = swap;
-                    }
-                    rangeStart = new Date(fromStr + 'T00:00:00.000Z');
-                    rangeEnd = new Date(toStr + 'T23:59:59.999Z');
-                    // Non oltre un anno di intervallo, per non far esplodere le query.
-                    const maxRangeMs = 366 * 24 * 60 * 60 * 1000;
-                    if (rangeEnd.getTime() - rangeStart.getTime() > maxRangeMs) {
-                        rangeStart = new Date(rangeEnd.getTime() - maxRangeMs);
-                    }
-                } else {
-                    const days = Math.min(Math.max(parseInt(parsedUrl.searchParams.get('days'), 10) || 30, 1), 90);
-                    rangeEnd = new Date();
-                    rangeStart = new Date(rangeEnd.getTime() - days * 24 * 60 * 60 * 1000);
-                }
-
-                const rangeDays = Math.max(1, Math.round((rangeEnd.getTime() - rangeStart.getTime()) / (24 * 60 * 60 * 1000)));
-                // Periodo precedente: stessa durata, subito prima dell'inizio
-                // del periodo corrente. Serve solo per calcolare "+18% rispetto
-                // al periodo precedente", non compare da nessun'altra parte.
-                const prevEnd = new Date(rangeStart.getTime());
-                const prevStart = new Date(rangeStart.getTime() - (rangeEnd.getTime() - rangeStart.getTime()));
+                // validi, hanno la precedenza.
+                const { rangeStart, rangeEnd, rangeDays, prevStart, prevEnd } = parseAdminDateRange(parsedUrl.searchParams);
 
                 const totalResult = await pool.query(
                     'SELECT COUNT(*)::int AS total, COUNT(DISTINCT visitor_id)::int AS unique_visitors ' +
@@ -1818,6 +1825,129 @@ const server = http.createServer((req, res) => {
     // i dati recenti. Azione distruttiva e irreversibile: protetta con la
     // stessa chiave admin, e con un minimo di "keepDays" per evitare di
     // svuotare per sbaglio l'intera tabella con un valore a caso (es. 0).
+    // Statistiche sui visitatori, in forma completamente anonima: nessun
+    // nome, email, IP o identificativo che possa risalire a una persona.
+    // Solo numeri aggregati (nuovi/di ritorno, dispositivo) e un elenco di
+    // "sessioni" anonime — paese, dispositivo, quante pagine, quanto tempo,
+    // ma MAI "chi". Protetto dalla stessa chiave admin degli altri endpoint.
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/pageviews/visitors') === 0) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                const parsedUrl = new URL(req.url, 'http://localhost');
+                const secret = parsedUrl.searchParams.get('secret') || '';
+                if (secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+
+                const { rangeStart, rangeEnd } = parseAdminDateRange(parsedUrl.searchParams);
+
+                // Nuovi visitatori OGGI: visitor_id la cui primissima visita
+                // (in assoluto, non solo nel periodo) cade nella giornata odierna.
+                const newTodayResult = await pool.query(
+                    "WITH first_seen AS (" +
+                    "  SELECT visitor_id, MIN(created_at) AS first_visit " +
+                    "  FROM page_views WHERE visitor_id IS NOT NULL GROUP BY visitor_id" +
+                    ") SELECT COUNT(*)::int AS count FROM first_seen WHERE first_visit >= date_trunc('day', now())"
+                );
+
+                // Tasso di ritorno: percentuale di visitor_id (tra quelli visti nel
+                // periodo) che avevano GIÀ visitato il sito prima dell'inizio del
+                // periodo stesso — quindi non è la prima volta che li vediamo.
+                const returningResult = await pool.query(
+                    "WITH in_range AS (" +
+                    "  SELECT DISTINCT visitor_id FROM page_views " +
+                    "  WHERE visitor_id IS NOT NULL AND created_at >= $1 AND created_at <= $2" +
+                    "), first_seen AS (" +
+                    "  SELECT visitor_id, MIN(created_at) AS first_visit FROM page_views " +
+                    "  WHERE visitor_id IS NOT NULL GROUP BY visitor_id" +
+                    ") SELECT COUNT(*)::int AS total, " +
+                    "         COUNT(*) FILTER (WHERE fs.first_visit < $1)::int AS returning " +
+                    "  FROM in_range ir JOIN first_seen fs ON fs.visitor_id = ir.visitor_id",
+                    [rangeStart, rangeEnd]
+                );
+
+                // Sessioni (stessa definizione usata per il tasso di rimbalzo:
+                // pause superiori a 30 minuti separano una sessione dalla
+                // successiva) — servono sia per "sessioni medie a testa" sia per
+                // l'elenco delle sessioni recenti qui sotto.
+                const sessionsResult = await pool.query(
+                    "WITH ordered AS (" +
+                    "  SELECT visitor_id, created_at, country, country_code, device, duration_ms, " +
+                    "         created_at - LAG(created_at) OVER (PARTITION BY visitor_id ORDER BY created_at) AS gap " +
+                    "  FROM page_views " +
+                    "  WHERE created_at >= $1 AND created_at <= $2 AND visitor_id IS NOT NULL" +
+                    "), sessioned AS (" +
+                    "  SELECT visitor_id, created_at, country, country_code, device, duration_ms, " +
+                    "         SUM(CASE WHEN gap IS NULL OR gap > interval '30 minutes' THEN 1 ELSE 0 END) " +
+                    "           OVER (PARTITION BY visitor_id ORDER BY created_at) AS session_num " +
+                    "  FROM ordered" +
+                    ") SELECT visitor_id, session_num, " +
+                    "         COUNT(*)::int AS page_count, " +
+                    "         MIN(created_at) AS session_start, MAX(created_at) AS session_end, " +
+                    "         MAX(country) AS country, MAX(country_code) AS country_code, " +
+                    "         MODE() WITHIN GROUP (ORDER BY device) AS device, " +
+                    "         AVG(duration_ms) AS avg_duration_ms " +
+                    "  FROM sessioned GROUP BY visitor_id, session_num",
+                    [rangeStart, rangeEnd]
+                );
+
+                const allSessions = sessionsResult.rows;
+                const totalSessions = allSessions.length;
+                const uniqueVisitorsInSessions = new Set(allSessions.map(function (s) { return s.visitor_id; })).size;
+                const avgSessionsPerVisitor = uniqueVisitorsInSessions > 0
+                    ? Math.round((totalSessions / uniqueVisitorsInSessions) * 10) / 10
+                    : 0;
+
+                const deviceBreakdown = { mobile: 0, desktop: 0, sconosciuto: 0 };
+                allSessions.forEach(function (s) {
+                    if (s.device === 'mobile') deviceBreakdown.mobile++;
+                    else if (s.device === 'desktop') deviceBreakdown.desktop++;
+                    else deviceBreakdown.sconosciuto++;
+                });
+
+                // Le 20 sessioni più recenti, in forma anonima: NESSUN
+                // identificativo del visitatore viene incluso nella risposta —
+                // solo paese, dispositivo, numero di pagine e durata.
+                const recentSessions = allSessions
+                    .sort(function (a, b) { return new Date(b.session_end) - new Date(a.session_end); })
+                    .slice(0, 20)
+                    .map(function (s) {
+                        const durationSec = Math.max(0, Math.round((new Date(s.session_end) - new Date(s.session_start)) / 1000));
+                        return {
+                            country: s.country,
+                            countryCode: s.country_code,
+                            device: s.device || 'sconosciuto',
+                            pageCount: s.page_count,
+                            durationSeconds: durationSec,
+                            lastSeen: s.session_end
+                        };
+                    });
+
+                const returningTotal = returningResult.rows[0].total;
+                const returningCount = returningResult.rows[0].returning;
+                const returningRatePercent = returningTotal > 0
+                    ? Math.round((returningCount / returningTotal) * 1000) / 10
+                    : null;
+
+                return sendJSON(res, 200, {
+                    newVisitorsToday: newTodayResult.rows[0].count,
+                    returningRatePercent: returningRatePercent,
+                    avgSessionsPerVisitor: avgSessionsPerVisitor,
+                    totalSessions: totalSessions,
+                    deviceBreakdown: deviceBreakdown,
+                    recentSessions: recentSessions
+                });
+            } catch (err) {
+                console.error('Errore statistiche visitatori:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'POST' && req.url === '/api/admin/pageviews/cleanup') {
         let body = '';
         req.on('data', function (chunk) { body += chunk; });
