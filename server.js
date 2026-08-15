@@ -106,6 +106,16 @@ const SERPER_API_KEY = process.env.SERPER_API_KEY;
 // giornaliere). Impostala su Render come stringa lunga e casuale, inventata
 // da te: chi non la conosce non può vedere i dati statistici del sito.
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
+
+// IndexNow: avvisa Bing (e gli altri motori che lo supportano: Yandex, Naver,
+// Seznam, Yep) non appena un articolo del blog viene pubblicato, modificato
+// o rimosso, invece di aspettare che se ne accorgano da soli — a volte ci
+// mettono giorni/settimane. Questa chiave NON è un segreto: va anzi
+// pubblicata in chiaro sul sito (vedi il file .txt di verifica), serve solo
+// a dimostrare che sei tu il proprietario del dominio, non a proteggere
+// nulla.
+const INDEXNOW_KEY = '7b5401f882bef385bdf1de896f589156';
+const INDEXNOW_KEY_LOCATION = 'https://www.ialgae.com/' + INDEXNOW_KEY + '.txt';
 const MAX_QUESTION_LENGTH = 2000;
 const MAX_IMAGE_BASE64_LENGTH = 6000000; // ~4.5 MB di immagine decodificata
 const RESULTS_PER_PAGE = 10;
@@ -1058,6 +1068,23 @@ async function getGeoForIp(ip) {
         return data;
     } catch (err) {
         return empty;
+    }
+}
+
+// Avvisa IndexNow che una pagina è cambiata (pubblicata, modificata, o
+// rimossa). "Fire and forget" di proposito, come il tracciamento visite: se
+// fallisce (rete assente, IndexNow irraggiungibile, ecc.) non deve MAI far
+// fallire la pubblicazione dell'articolo — è solo un avviso in più, non
+// un'operazione critica.
+async function pingIndexNow(changedUrl) {
+    try {
+        const pingUrl = 'https://api.indexnow.org/indexnow' +
+            '?url=' + encodeURIComponent(changedUrl) +
+            '&key=' + INDEXNOW_KEY +
+            '&keyLocation=' + encodeURIComponent(INDEXNOW_KEY_LOCATION);
+        await fetch(pingUrl);
+    } catch (err) {
+        console.error('Errore avviso IndexNow (non bloccante):', err.message);
     }
 }
 
@@ -3278,6 +3305,13 @@ const server = http.createServer((req, res) => {
                     'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, ' + (published ? 'now()' : 'NULL') + ') RETURNING id, slug',
                     [slug, title, excerpt, content, coverImage, category, author, tags, readTime, cardSize, sortOrder, published]
                 );
+
+                // Solo se l'articolo va online subito: una bozza non ha ancora
+                // un indirizzo pubblico da segnalare a nessuno.
+                if (published) {
+                    pingIndexNow('https://www.ialgae.com/blog.html?post=' + encodeURIComponent(result.rows[0].slug));
+                }
+
                 return sendJSON(res, 200, { id: result.rows[0].id, slug: result.rows[0].slug });
             } catch (err) {
                 console.error('Errore /api/blog/admin/create:', err);
@@ -3342,6 +3376,16 @@ const server = http.createServer((req, res) => {
                     ' WHERE id = $12',
                     [slug, title, excerpt, content, coverImage, category, author, tags, readTime, cardSize, published, id]
                 );
+
+                // Avvisiamo IndexNow sia per un articolo appena pubblicato,
+                // sia per uno già pubblico che è stato modificato (il
+                // contenuto è comunque cambiato per chi lo legge). Se invece
+                // resta (o torna) una bozza, non c'è nessun indirizzo
+                // pubblico da segnalare.
+                if (published) {
+                    pingIndexNow('https://www.ialgae.com/blog.html?post=' + encodeURIComponent(slug));
+                }
+
                 return sendJSON(res, 200, { message: 'Articolo aggiornato.', slug: slug });
             } catch (err) {
                 console.error('Errore /api/blog/admin/update:', err);
@@ -3393,7 +3437,18 @@ const server = http.createServer((req, res) => {
                 if (payload.secret !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Chiave non valida.' });
                 if (!payload.id) return sendJSON(res, 400, { error: 'ID articolo mancante.' });
 
+                // Recuperiamo slug e stato PRIMA di cancellare: dopo non ci
+                // sarebbero più, e ci servono per sapere quale indirizzo
+                // segnalare a IndexNow (solo se l'articolo era pubblico —
+                // una bozza cancellata non aveva nessun indirizzo da togliere).
+                const toDelete = await pool.query('SELECT slug, published FROM blog_posts WHERE id = $1', [payload.id]);
+
                 await pool.query('DELETE FROM blog_posts WHERE id = $1', [payload.id]);
+
+                if (toDelete.rows.length > 0 && toDelete.rows[0].published) {
+                    pingIndexNow('https://www.ialgae.com/blog.html?post=' + encodeURIComponent(toDelete.rows[0].slug));
+                }
+
                 return sendJSON(res, 200, { message: 'Articolo eliminato.' });
             } catch (err) {
                 console.error('Errore /api/blog/admin/delete:', err);
