@@ -424,6 +424,40 @@ async function initDb() {
         ')'
     );
 
+    // Core Web Vitals misurate DAVVERO sui visitatori reali (non un singolo
+    // test da un solo posto): ogni riga è una misura di LCP, CLS o INP presa
+    // dal browser di qualcuno che ha visitato il sito. Nessun dato personale
+    // — solo la metrica, il valore, la pagina, e il dispositivo (mobile/
+    // desktop, stessa distinzione già usata per page_views).
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS web_vitals (' +
+        '  id SERIAL PRIMARY KEY,' +
+        '  page TEXT NOT NULL,' +
+        '  metric TEXT NOT NULL,' +
+        '  value NUMERIC NOT NULL,' +
+        '  device TEXT,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
+        ')'
+    );
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_web_vitals_created ON web_vitals (created_at)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_web_vitals_metric ON web_vitals (metric)');
+
+    // 2FA per l'ACCESSO AL PANNELLO ADMIN, via codice mandato per EMAIL (non
+    // un'app di autenticazione — scelta deliberata per restare semplice).
+    // "enabled": attiva/disattiva. "code"/"code_expires_at": il codice a
+    // 6 cifre mandato all'ultimo accesso, valido 10 minuti, monouso (si
+    // azzera dopo essere stato usato o scaduto).
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS admin_email_2fa (' +
+        '  id INTEGER PRIMARY KEY DEFAULT 1,' +
+        '  enabled BOOLEAN NOT NULL DEFAULT false,' +
+        '  code TEXT,' +
+        '  code_expires_at TIMESTAMPTZ,' +
+        '  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),' +
+        '  CONSTRAINT admin_email_2fa_single_row CHECK (id = 1)' +
+        ')'
+    );
+
     // Cache dei risultati di ricerca: evita di richiamare Brave/Serper per
     // query già cercate di recente da qualsiasi utente. cache_key combina
     // query normalizzata + tipo + pagina, così "pizza" pagina 1 e pagina 2
@@ -1844,6 +1878,44 @@ const server = http.createServer((req, res) => {
     // tramite navigator.sendBeacon — l'unico modo affidabile di mandare dati
     // proprio mentre la pagina si sta chiudendo). Anche questo endpoint non
     // deve mai disturbare l'utente: qualsiasi errore viene ignorato in silenzio.
+    // Riceve le misure REALI di velocità (LCP, CLS, INP) dal browser di chi
+    // sta visitando il sito — mandate dalla libreria ufficiale "web-vitals"
+    // di Google. Come tutto il resto del tracciamento: "fire and forget",
+    // non deve mai disturbare l'utente, e nessun errore qui deve fermare
+    // la navigazione.
+    const VALID_VITAL_METRICS = ['LCP', 'CLS', 'INP'];
+    if (req.method === 'POST' && req.url === '/api/vitals') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    payload = {};
+                }
+                const page = (payload.page || '/').toString().slice(0, 200);
+                const metric = VALID_VITAL_METRICS.indexOf(payload.metric) !== -1 ? payload.metric : null;
+                const value = parseFloat(payload.value);
+                const device = (payload.device === 'mobile' || payload.device === 'desktop') ? payload.device : null;
+
+                if (!metric || isNaN(value) || value < 0) {
+                    return sendJSON(res, 200, { ok: false });
+                }
+                await pool.query(
+                    'INSERT INTO web_vitals (page, metric, value, device) VALUES ($1,$2,$3,$4)',
+                    [page, metric, value, device]
+                );
+                return sendJSON(res, 200, { ok: true });
+            } catch (err) {
+                console.error('Errore tracciamento web vitals (non bloccante):', err.message);
+                return sendJSON(res, 200, { ok: false });
+            }
+        });
+        return;
+    }
+
     if (req.method === 'POST' && req.url === '/api/track/duration') {
         let body = '';
         req.on('data', function (chunk) { body += chunk; });
@@ -2079,6 +2151,204 @@ function parseAdminDateRange(searchParams) {
     // consenso di Google. Non è un endpoint da chiamare con fetch, ma da
     // aprire direttamente (window.location.href = ...) perché deve navigare
     // via a Google e poi tornare indietro.
+    // Dati reali di velocità (Core Web Vitals), aggregati con la percentile
+    // 75 — lo stesso metodo che usa Google per giudicare "buono/da
+    // migliorare/scarso": una media si lascia ingannare da pochi casi
+    // estremi, il percentile 75 invece dice "il 75% dei visitatori ha avuto
+    // un'esperienza uguale o migliore di questa", molto più rappresentativo.
+    const VITALS_THRESHOLDS = {
+        LCP: { good: 2500, needsImprovement: 4000 },   // millisecondi
+        CLS: { good: 0.1, needsImprovement: 0.25 },     // punteggio, senza unità
+        INP: { good: 200, needsImprovement: 500 }       // millisecondi
+    };
+    function vitalsRating(metric, p75Value) {
+        if (p75Value == null) return null;
+        const t = VITALS_THRESHOLDS[metric];
+        if (p75Value <= t.good) return 'good';
+        if (p75Value <= t.needsImprovement) return 'needs_improvement';
+        return 'poor';
+    }
+
+    // Stato della 2FA admin: attiva o no. Chiamato PRIMA di sapere se la
+    // password è giusta (serve per decidere se mostrare subito lo step del
+    // codice), quindi qui NON verifichiamo ADMIN_SECRET — non c'è nulla di
+    // sensibile da proteggere in un semplice "sì/no, è attiva".
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/2fa/status') === 0) {
+        (async function () {
+            try {
+                const result = await pool.query('SELECT enabled FROM admin_email_2fa WHERE id = 1');
+                return sendJSON(res, 200, { enabled: result.rows.length > 0 && result.rows[0].enabled });
+            } catch (err) {
+                console.error('Errore stato 2FA admin:', err);
+                return sendJSON(res, 200, { enabled: false });
+            }
+        })();
+        return;
+    }
+
+    // Attiva/disattiva: un semplice interruttore, protetto solo dalla
+    // password admin — niente da configurare, nessun QR code, nessun
+    // segreto da custodire. Appena attiva, ogni accesso manderà un codice
+    // all'indirizzo email fisso qui sotto.
+    const ADMIN_2FA_EMAIL = 'algae.italia@gmail.com';
+    if (req.method === 'POST' && req.url === '/api/admin/2fa/toggle') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                let payload;
+                try { payload = JSON.parse(body || '{}'); } catch (e) { return sendJSON(res, 400, { error: 'Corpo non valido.' }); }
+                if (payload.secret !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Password errata.' });
+
+                const enabled = !!payload.enabled;
+                await pool.query(
+                    'INSERT INTO admin_email_2fa (id, enabled, code, code_expires_at) VALUES (1, $1, NULL, NULL) ' +
+                    'ON CONFLICT (id) DO UPDATE SET enabled = EXCLUDED.enabled, code = NULL, code_expires_at = NULL, updated_at = now()',
+                    [enabled]
+                );
+                return sendJSON(res, 200, { ok: true, enabled: enabled });
+            } catch (err) {
+                console.error('Errore attivazione/disattivazione 2FA admin:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Manda il codice via email (secondo step, dopo la password corretta).
+    // Il codice dura 10 minuti ed è monouso — si azzera non appena verificato,
+    // o quando ne viene richiesto uno nuovo.
+    if (req.method === 'POST' && req.url === '/api/admin/2fa/send-code') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                let payload;
+                try { payload = JSON.parse(body || '{}'); } catch (e) { return sendJSON(res, 400, { error: 'Corpo non valido.' }); }
+                if (payload.secret !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Password errata.' });
+
+                const statusResult = await pool.query('SELECT enabled FROM admin_email_2fa WHERE id = 1');
+                if (statusResult.rows.length === 0 || !statusResult.rows[0].enabled) {
+                    return sendJSON(res, 400, { error: 'La 2FA non è attiva.' });
+                }
+
+                const code = String(Math.floor(100000 + Math.random() * 900000)); // 6 cifre, 100000-999999
+                const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+                await pool.query(
+                    'UPDATE admin_email_2fa SET code = $1, code_expires_at = $2, updated_at = now() WHERE id = 1',
+                    [code, expiresAt]
+                );
+
+                await sendEmail(
+                    ADMIN_2FA_EMAIL,
+                    'Codice di accesso — Pannello admin iAlgae',
+                    '<p>Qualcuno (probabilmente tu) sta cercando di accedere al pannello admin di iAlgae.</p>' +
+                    '<p style="font-size:28px;font-weight:700;letter-spacing:4px;">' + code + '</p>' +
+                    '<p>Il codice scade tra 10 minuti. Se non sei stato tu, ignora questa email — nessun accesso è stato concesso.</p>'
+                );
+
+                return sendJSON(res, 200, { ok: true });
+            } catch (err) {
+                console.error('Errore invio codice 2FA admin:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Verifica il codice durante il login. Rate limit in memoria: max 8
+    // tentativi ogni 10 minuti — un codice a 6 cifre è indovinabile per
+    // forza bruta se non si limitano i tentativi.
+    const admin2faAttempts = {};
+    if (req.method === 'POST' && req.url === '/api/admin/2fa/login-verify') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                let payload;
+                try { payload = JSON.parse(body || '{}'); } catch (e) { return sendJSON(res, 400, { error: 'Corpo non valido.' }); }
+                if (payload.secret !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Password errata.' });
+
+                const now = Date.now();
+                const attempts = (admin2faAttempts['admin'] || []).filter(function (t) { return now - t < 10 * 60 * 1000; });
+                if (attempts.length >= 8) {
+                    return sendJSON(res, 429, { error: 'Troppi tentativi. Riprova tra qualche minuto.' });
+                }
+                attempts.push(now);
+                admin2faAttempts['admin'] = attempts;
+
+                const result = await pool.query('SELECT code, code_expires_at, enabled FROM admin_email_2fa WHERE id = 1');
+                if (result.rows.length === 0 || !result.rows[0].enabled) {
+                    return sendJSON(res, 400, { error: 'La 2FA non è attiva.' });
+                }
+                const row = result.rows[0];
+                const cleanCode = (payload.code || '').toString().trim();
+                if (!row.code || !row.code_expires_at || new Date(row.code_expires_at) < new Date()) {
+                    return sendJSON(res, 401, { error: 'Codice scaduto. Richiedine uno nuovo.' });
+                }
+                if (cleanCode !== row.code) {
+                    return sendJSON(res, 401, { error: 'Codice errato.' });
+                }
+
+                // Monouso: appena verificato, si azzera — non può essere riusato.
+                await pool.query('UPDATE admin_email_2fa SET code = NULL, code_expires_at = NULL WHERE id = 1');
+                return sendJSON(res, 200, { ok: true });
+            } catch (err) {
+                console.error('Errore verifica 2FA admin al login:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/performance/summary') === 0) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                const parsedUrl = new URL(req.url, 'http://localhost');
+                if ((parsedUrl.searchParams.get('secret') || '') !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+
+                const { rangeStart, rangeEnd } = parseAdminDateRange(parsedUrl.searchParams);
+
+                const result = await pool.query(
+                    'SELECT metric, ' +
+                    '       PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY value) AS p75, ' +
+                    '       COUNT(*)::int AS sample_size ' +
+                    'FROM web_vitals WHERE created_at >= $1 AND created_at <= $2 ' +
+                    'GROUP BY metric',
+                    [rangeStart, rangeEnd]
+                );
+
+                const byMetric = { LCP: null, CLS: null, INP: null };
+                result.rows.forEach(function (r) {
+                    byMetric[r.metric] = { p75: parseFloat(r.p75), sampleSize: r.sample_size };
+                });
+
+                const metrics = {};
+                ['LCP', 'CLS', 'INP'].forEach(function (m) {
+                    const row = byMetric[m];
+                    metrics[m] = {
+                        p75: row ? Math.round(row.p75 * (m === 'CLS' ? 1000 : 1)) / (m === 'CLS' ? 1000 : 1) : null,
+                        sampleSize: row ? row.sampleSize : 0,
+                        rating: row ? vitalsRating(m, row.p75) : null
+                    };
+                });
+
+                return sendJSON(res, 200, { metrics: metrics });
+            } catch (err) {
+                console.error('Errore riepilogo performance:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/admin/searchconsole/connect') === 0) {
         const parsedUrl = new URL(req.url, 'http://localhost');
         const secret = parsedUrl.searchParams.get('secret') || '';
