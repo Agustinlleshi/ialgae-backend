@@ -2305,6 +2305,72 @@ function parseAdminDateRange(searchParams) {
     }
 
 
+    // Dati per la scheda "Iscritti": persone che si sono registrate DAVVERO
+    // sul sito (non visitatori anonimi) — è la tua lista utenti, dato che
+    // hanno già acconsentito dando email/nome per creare l'account.
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/users/summary') === 0) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                const parsedUrl = new URL(req.url, 'http://localhost');
+                if ((parsedUrl.searchParams.get('secret') || '') !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+                if (!dbEnabled) return sendJSON(res, 500, { error: 'Database non configurato.' });
+
+                const { rangeStart, rangeEnd } = parseAdminDateRange(parsedUrl.searchParams);
+
+                const totalsResult = await pool.query(
+                    'SELECT COUNT(*)::int AS total, ' +
+                    'COUNT(*) FILTER (WHERE is_pro)::int AS pro_count, ' +
+                    'COUNT(*) FILTER (WHERE email_verified)::int AS verified_count, ' +
+                    "COUNT(*) FILTER (WHERE created_at >= date_trunc('day', now()))::int AS new_today " +
+                    'FROM users'
+                );
+
+                const dailyResult = await pool.query(
+                    "SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day, COUNT(*)::int AS count " +
+                    'FROM users WHERE created_at >= $1 AND created_at <= $2 ' +
+                    'GROUP BY 1 ORDER BY 1',
+                    [rangeStart, rangeEnd]
+                );
+
+                // I 20 iscritti più recenti in assoluto (non solo nel periodo
+                // scelto) — è un elenco "chi si è appena iscritto", ha senso
+                // che sia sempre aggiornato indipendentemente dal filtro data.
+                const recentResult = await pool.query(
+                    'SELECT name, surname, email, is_pro, created_at ' +
+                    'FROM users ORDER BY created_at DESC LIMIT 20'
+                );
+
+                const total = totalsResult.rows[0].total;
+                const verifiedPercent = total > 0
+                    ? Math.round((totalsResult.rows[0].verified_count / total) * 1000) / 10
+                    : null;
+
+                return sendJSON(res, 200, {
+                    totalUsers: total,
+                    newToday: totalsResult.rows[0].new_today,
+                    proCount: totalsResult.rows[0].pro_count,
+                    verifiedPercent: verifiedPercent,
+                    dailySignups: dailyResult.rows,
+                    recentUsers: recentResult.rows.map(function (r) {
+                        return {
+                            name: [r.name, r.surname].filter(Boolean).join(' ') || '(senza nome)',
+                            email: r.email,
+                            isPro: r.is_pro,
+                            createdAt: r.created_at
+                        };
+                    })
+                });
+            } catch (err) {
+                console.error('Errore riepilogo iscritti:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/admin/performance/summary') === 0) {
         (async function () {
             try {
