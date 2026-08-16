@@ -458,6 +458,18 @@ async function initDb() {
         ')'
     );
 
+    // Tiene traccia di quando è stato mandato l'ultimo backup via email —
+    // serve a rispettare "una volta a settimana" anche attraverso i
+    // riavvii del server (Render può riavviare il servizio in qualsiasi
+    // momento), invece di un semplice timer che si azzererebbe ogni volta.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS backup_log (' +
+        '  id INTEGER PRIMARY KEY DEFAULT 1,' +
+        '  last_sent_at TIMESTAMPTZ,' +
+        '  CONSTRAINT backup_log_single_row CHECK (id = 1)' +
+        ')'
+    );
+
     // Cache dei risultati di ricerca: evita di richiamare Brave/Serper per
     // query già cercate di recente da qualsiasi utente. cache_key combina
     // query normalizzata + tipo + pagina, così "pizza" pagina 1 e pagina 2
@@ -705,6 +717,85 @@ async function checkAllMilestones() {
     }
 }
 
+// Converte righe (array di oggetti) in un vero file CSV, con le virgolette
+// giuste per i campi che contengono virgole, virgolette o "a capo" —
+// altrimenti un titolo di articolo con una virgola dentro spaccherebbe
+// silenziosamente le colonne quando lo si apre con Excel.
+function rowsToCsv(rows, columns) {
+    function escapeCsvField(value) {
+        if (value === null || value === undefined) return '';
+        const str = String(value);
+        if (str.indexOf(',') !== -1 || str.indexOf('"') !== -1 || str.indexOf('\n') !== -1) {
+            return '"' + str.replace(/"/g, '""') + '"';
+        }
+        return str;
+    }
+    const header = columns.join(',');
+    const lines = rows.map(function (row) {
+        return columns.map(function (col) { return escapeCsvField(row[col]); }).join(',');
+    });
+    return '\uFEFF' + [header].concat(lines).join('\n'); // \uFEFF: accenti corretti aprendo con Excel
+}
+
+// Backup settimanale via email: manda una copia di utenti e articoli del
+// blog (i due tipi di dati impossibili da "ricreare" se andassero persi —
+// a differenza delle statistiche di traffico, che si ripopolano da sole nel
+// tempo) all'indirizzo email fisso, come copia indipendente FUORI da Neon.
+// Deliberatamente NON include password, token di reset/verifica, o ID
+// Stripe: sono dati sensibili che non devono viaggiare per email, nemmeno
+// verso una casella che controlli solo tu.
+const BACKUP_EMAIL = 'algae.italia@gmail.com';
+const BACKUP_INTERVAL_DAYS = 7;
+
+async function runWeeklyBackupIfDue() {
+    if (!dbEnabled) return;
+    try {
+        const logResult = await pool.query('SELECT last_sent_at FROM backup_log WHERE id = 1');
+        const lastSentAt = logResult.rows.length > 0 ? logResult.rows[0].last_sent_at : null;
+        const dueSince = lastSentAt
+            ? new Date(new Date(lastSentAt).getTime() + BACKUP_INTERVAL_DAYS * 24 * 60 * 60 * 1000)
+            : new Date(0); // mai mandato prima: è "dovuto" da subito
+        if (new Date() < dueSince) return; // non è ancora passata una settimana
+
+        const usersResult = await pool.query(
+            'SELECT id, email, name, surname, is_pro, email_verified, provider, created_at ' +
+            'FROM users ORDER BY created_at'
+        );
+        const postsResult = await pool.query(
+            'SELECT id, slug, title, excerpt, content, category, author, published, created_at, published_at ' +
+            'FROM blog_posts ORDER BY created_at'
+        );
+
+        const usersCsv = rowsToCsv(usersResult.rows, ['id', 'email', 'name', 'surname', 'is_pro', 'email_verified', 'provider', 'created_at']);
+        const postsCsv = rowsToCsv(postsResult.rows, ['id', 'slug', 'title', 'excerpt', 'content', 'category', 'author', 'published', 'created_at', 'published_at']);
+
+        const todayLabel = new Date().toISOString().slice(0, 10);
+        const sent = await sendEmail(
+            BACKUP_EMAIL,
+            'Backup settimanale iAlgae — ' + todayLabel,
+            '<p>Backup automatico di questa settimana.</p>' +
+            '<p><b>' + usersResult.rows.length + '</b> utenti registrati, <b>' + postsResult.rows.length + '</b> articoli del blog (bozze incluse).</p>' +
+            '<p>In allegato due file CSV, apribili con Excel/Fogli Google. Non contengono password né token — solo i dati che servirebbero per ricostruire il sito in caso di problema serio con il database.</p>',
+            [
+                { filename: 'utenti-' + todayLabel + '.csv', content: Buffer.from(usersCsv, 'utf8').toString('base64') },
+                { filename: 'articoli-blog-' + todayLabel + '.csv', content: Buffer.from(postsCsv, 'utf8').toString('base64') }
+            ]
+        );
+
+        if (sent) {
+            await pool.query(
+                'INSERT INTO backup_log (id, last_sent_at) VALUES (1, now()) ' +
+                'ON CONFLICT (id) DO UPDATE SET last_sent_at = now()'
+            );
+        }
+        // Se l'invio fallisce, NON aggiorniamo last_sent_at di proposito: al
+        // prossimo controllo (entro un'ora) riprova, invece di aspettare
+        // un'altra settimana intera per un errore magari solo temporaneo.
+    } catch (err) {
+        console.error('Errore backup settimanale:', err);
+    }
+}
+
 // Punto d'ingresso unico: prova prima Claude, e SOLO se fallisce passa a
 // Gemini come riserva. Ritorna { answer, provider } così i log (e volendo
 // anche il frontend) sanno sempre quale dei due ha risposto davvero. Se
@@ -860,9 +951,12 @@ const SEARCH_CACHE_TTL_MS = 2 * 60 * 60 * 1000; // 2 ore
 // Costruisce una chiave di cache stabile per una combinazione di ricerca.
 // Query normalizzata (minuscolo, spazi ripuliti) così "Pizza " e "pizza"
 // condividono la stessa voce di cache.
-function buildSearchCacheKey(query, type, page) {
+function buildSearchCacheKey(query, type, page, safesearch, freshness) {
     const normalizedQuery = (query || '').trim().toLowerCase().replace(/\s+/g, ' ');
-    return type + ':' + page + ':' + normalizedQuery;
+    // safesearch e freshness fanno parte della chiave: una ricerca già in
+    // cache con un filtro diverso (di sicurezza o di data) NON deve mai
+    // essere riusata.
+    return type + ':' + page + ':' + (safesearch || 'strict') + ':' + (freshness || 'any') + ':' + normalizedQuery;
 }
 
 // Ritorna { results, source } se una voce valida (non scaduta) esiste in
@@ -1411,19 +1505,26 @@ function escapeHtmlServer(str) {
         .replace(/"/g, '&quot;');
 }
 
-async function sendEmail(to, subject, html) {
+// "attachments" è opzionale (array di { filename, content }, con "content"
+// già in base64) — tutte le chiamate esistenti che non lo passano continuano
+// a funzionare esattamente come prima, semplice testo/HTML senza allegati.
+async function sendEmail(to, subject, html, attachments) {
     if (!RESEND_API_KEY) {
         console.warn('RESEND_API_KEY non configurata: email NON inviata a', to, '- oggetto:', subject);
         return false;
     }
     try {
+        const body = { from: RESEND_FROM_EMAIL, to: [to], subject: subject, html: html };
+        if (attachments && attachments.length > 0) {
+            body.attachments = attachments;
+        }
         const response = await fetch('https://api.resend.com/emails', {
             method: 'POST',
             headers: {
                 'Authorization': 'Bearer ' + RESEND_API_KEY,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ from: RESEND_FROM_EMAIL, to: [to], subject: subject, html: html })
+            body: JSON.stringify(body)
         });
         if (!response.ok) {
             const errText = await response.text();
@@ -4388,6 +4489,35 @@ function parseAdminDateRange(searchParams) {
                 let type = (fullUrl.searchParams.get('type') || 'web').toLowerCase();
                 if (allowedTypes.indexOf(type) === -1) type = 'web';
 
+                // SafeSearch: distinguiamo due casi diversi apposta —
+                // 1) parametro DEL TUTTO ASSENTE dalla richiesta: vuol dire
+                //    che chi ha chiamato l'API non sa/non vuole nulla su
+                //    SafeSearch (è il caso della pagina senza-safesearch,
+                //    che non lo manda mai) → nessun filtro applicato.
+                // 2) parametro PRESENTE ma con un valore inventato/non
+                //    valido: qualcuno ha provato a specificarlo ma ha
+                //    sbagliato (o un tentativo di manomissione) → qui
+                //    restiamo prudenti e filtriamo comunque ("strict").
+                // La pagina con-safesearch manda SEMPRE un valore esplicito
+                // (anche "strict" per chi non è loggato), quindi non passa
+                // mai dal caso 1 — questa modifica non la tocca per niente.
+                const allowedSafesearch = ['off', 'moderate', 'strict'];
+                const rawSafesearch = fullUrl.searchParams.get('safesearch');
+                let safesearch;
+                if (rawSafesearch === null) {
+                    safesearch = 'off';
+                } else {
+                    safesearch = rawSafesearch.toLowerCase();
+                    if (allowedSafesearch.indexOf(safesearch) === -1) safesearch = 'strict';
+                }
+
+                // Filtro per data: stessi 4 valori che offre davvero Brave
+                // (pd=24 ore, pw=settimana, pm=mese, py=anno) — stringa vuota
+                // vuol dire "qualsiasi momento", nessun filtro.
+                const allowedFreshness = ['', 'pd', 'pw', 'pm', 'py'];
+                let freshness = (fullUrl.searchParams.get('freshness') || '').toLowerCase();
+                if (allowedFreshness.indexOf(freshness) === -1) freshness = '';
+
                 if (!q) {
                     return sendJSON(res, 200, { results: [], totalPages: 0, page: page, type: type });
                 }
@@ -4400,7 +4530,7 @@ function parseAdminDateRange(searchParams) {
                 // Prima di chiamare Brave/Serper, controlliamo se qualcuno ha già
                 // cercato la stessa cosa di recente: se sì, rispondiamo subito da
                 // cache senza consumare quota delle API esterne.
-                const cacheKey = buildSearchCacheKey(q, type, page);
+                const cacheKey = buildSearchCacheKey(q, type, page, safesearch, freshness);
                 const cached = await getCachedSearch(cacheKey);
                 if (cached) {
                     return sendJSON(res, 200, {
@@ -4434,7 +4564,8 @@ function parseAdminDateRange(searchParams) {
                 // Le Immagini di Brave non supportano la paginazione con "offset": restituiscono
                 // sempre la prima pagina di risultati, quindi la omettiamo per quel tipo.
                 const countForType = (type === 'images') ? IMAGES_COUNT : RESULTS_PER_PAGE;
-                let searchUrl = endpoints[type] + '?q=' + encodeURIComponent(q) + '&count=' + countForType + '&country=it&search_lang=it';
+                let searchUrl = endpoints[type] + '?q=' + encodeURIComponent(q) + '&count=' + countForType + '&country=it&search_lang=it&safesearch=' + safesearch;
+                if (freshness) searchUrl += '&freshness=' + freshness;
                 if (type !== 'images') {
                     searchUrl += '&offset=' + offset;
                 }
@@ -4518,13 +4649,26 @@ function parseAdminDateRange(searchParams) {
                 let usedFallback = false;
                 if (type === 'web' && (braveFailed || results.length === 0) && page === 1 && SERPER_API_KEY) {
                     try {
+                        // Serper mira a rispecchiare i parametri nativi di una vera
+                        // ricerca Google, che usa "safe": "active"/"off" (solo due
+                        // livelli, non tre come Brave) — quindi "strict" e "moderate"
+                        // diventano entrambi "active", solo "off" resta "off".
+                        const serperBody = { q: q, gl: 'it', hl: 'it' };
+                        if (safesearch !== 'off') serperBody.safe = 'active';
+                        // Stesso parametro nativo di Google (tbs=qdr:X), che
+                        // Serper rispecchia direttamente — a differenza del
+                        // parametro "safe", questo è documentato con esempi
+                        // reali, non solo dedotto per analogia.
+                        const freshnessToTbs = { pd: 'qdr:d', pw: 'qdr:w', pm: 'qdr:m', py: 'qdr:y' };
+                        if (freshnessToTbs[freshness]) serperBody.tbs = freshnessToTbs[freshness];
+
                         const serperResponse = await fetch('https://google.serper.dev/search', {
                             method: 'POST',
                             headers: {
                                 'X-API-KEY': SERPER_API_KEY,
                                 'Content-Type': 'application/json'
                             },
-                            body: JSON.stringify({ q: q, gl: 'it', hl: 'it' })
+                            body: JSON.stringify(serperBody)
                         });
                         if (serperResponse.ok) {
                             const serperData = await serperResponse.json();
@@ -4658,6 +4802,12 @@ if (dbEnabled) {
     // dashboard per "farla scattare".
     checkAllMilestones();
     setInterval(checkAllMilestones, 60 * 60 * 1000);
+
+    // Backup settimanale: controlliamo ogni ora se è "dovuto" (sono passati
+    // 7 giorni dall'ultimo mandato) — questo, invece di un timer fisso,
+    // gestisce bene anche i riavvii del server nel mezzo della settimana.
+    runWeeklyBackupIfDue();
+    setInterval(runWeeklyBackupIfDue, 60 * 60 * 1000);
 
     // Elimina anche le notifiche più vecchie di 90 giorni, per non far
     // crescere la tabella all'infinito — 90 giorni sono comunque più che
