@@ -107,6 +107,17 @@ const SERPER_API_KEY = process.env.SERPER_API_KEY;
 // da te: chi non la conosce non può vedere i dati statistici del sito.
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
+// Google Search Console: collegamento OAuth (non una semplice chiave API,
+// perché deve accedere ai TUOI dati specifici, non a un servizio generico).
+// GOOGLE_OAUTH_CLIENT_ID/SECRET vanno prese dalla Google Cloud Console dopo
+// aver creato le credenziali OAuth (vedi istruzioni). SEARCH_CONSOLE_SITE_URL
+// deve combaciare ESATTAMENTE con la proprietà verificata su Search Console
+// (di solito con lo slash finale, es. "https://www.ialgae.com/").
+const GOOGLE_OAUTH_CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID;
+const GOOGLE_OAUTH_CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+const GOOGLE_OAUTH_REDIRECT_URI = 'https://ialgae-backend.onrender.com/api/admin/searchconsole/callback';
+const SEARCH_CONSOLE_SITE_URL = process.env.SEARCH_CONSOLE_SITE_URL || 'https://www.ialgae.com/';
+
 // IndexNow: avvisa Bing (e gli altri motori che lo supportano: Yandex, Naver,
 // Seznam, Yep) non appena un articolo del blog viene pubblicato, modificato
 // o rimosso, invece di aspettare che se ne accorgano da soli — a volte ci
@@ -397,6 +408,19 @@ async function initDb() {
         'CREATE TABLE IF NOT EXISTS milestones_reached (' +
         '  metric TEXT PRIMARY KEY,' +
         '  last_threshold INTEGER NOT NULL DEFAULT 0' +
+        ')'
+    );
+
+    // Token OAuth di Google Search Console. Il "refresh_token" non scade mai
+    // (finché non lo revochi tu da myaccount.google.com/permissions) e serve
+    // per ottenere un nuovo "access_token" (quello sì scade ogni ora) ogni
+    // volta che ci serve interrogare l'API. Una sola riga: un solo account
+    // amministratore collegato, non serve altro per questo sito.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS oauth_tokens (' +
+        '  provider TEXT PRIMARY KEY,' +
+        '  refresh_token TEXT NOT NULL,' +
+        '  connected_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
         ')'
     );
 
@@ -1172,6 +1196,128 @@ async function getGeoForIp(ip) {
     }
 }
 
+// ---- Google Search Console: collegamento OAuth ----
+// A differenza delle altre chiavi API del sito (Brave, Gemini, ecc.), qui non
+// basta una chiave: serve che TU autorizzi esplicitamente il sito ad accedere
+// ai TUOI dati, tramite la schermata di consenso di Google.
+
+function buildGoogleAuthUrl() {
+    const params = new URLSearchParams({
+        client_id: GOOGLE_OAUTH_CLIENT_ID,
+        redirect_uri: GOOGLE_OAUTH_REDIRECT_URI,
+        response_type: 'code',
+        scope: 'https://www.googleapis.com/auth/webmasters.readonly',
+        access_type: 'offline', // ci serve un refresh_token, non solo l'access_token temporaneo
+        prompt: 'consent'       // forza la schermata di consenso: senza, Google a volte non manda un refresh_token
+    });
+    return 'https://accounts.google.com/o/oauth2/v2/auth?' + params.toString();
+}
+
+async function exchangeCodeForTokens(code) {
+    const response = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+            code: code,
+            client_id: GOOGLE_OAUTH_CLIENT_ID,
+            client_secret: GOOGLE_OAUTH_CLIENT_SECRET,
+            redirect_uri: GOOGLE_OAUTH_REDIRECT_URI,
+            grant_type: 'authorization_code'
+        })
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error('Scambio codice OAuth fallito: ' + response.status + ' ' + errText);
+    }
+    return response.json(); // { access_token, refresh_token, expires_in, ... }
+}
+
+// Cache in memoria dell'access_token (valido un'ora): evita di chiedere un
+// nuovo token a Google ad ogni singola richiesta — lo riusiamo finché non
+// sta per scadere.
+let cachedAccessToken = null;
+let cachedAccessTokenExpiry = 0;
+
+async function getFreshAccessToken() {
+    if (cachedAccessToken && Date.now() < cachedAccessTokenExpiry) {
+        return cachedAccessToken;
+    }
+    const tokenRow = await pool.query("SELECT refresh_token FROM oauth_tokens WHERE provider = 'search_console'");
+    if (tokenRow.rows.length === 0) {
+        throw new Error('Search Console non è ancora collegato.');
+    }
+    const response = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+            refresh_token: tokenRow.rows[0].refresh_token,
+            client_id: GOOGLE_OAUTH_CLIENT_ID,
+            client_secret: GOOGLE_OAUTH_CLIENT_SECRET,
+            grant_type: 'refresh_token'
+        })
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error('Rinnovo token Search Console fallito: ' + response.status + ' ' + errText);
+    }
+    const data = await response.json();
+    cachedAccessToken = data.access_token;
+    // Un margine di sicurezza di 2 minuti prima della scadenza reale, per
+    // non rischiare di usare un token appena scaduto per una manciata di secondi.
+    cachedAccessTokenExpiry = Date.now() + (data.expires_in - 120) * 1000;
+    return cachedAccessToken;
+}
+
+// Interroga davvero i dati di Search Console: totali (clic, impressioni,
+// CTR, posizione media), andamento giornaliero, e le query più cercate.
+async function fetchSearchConsoleData(startDate, endDate) {
+    const accessToken = await getFreshAccessToken();
+    const siteUrlEncoded = encodeURIComponent(SEARCH_CONSOLE_SITE_URL);
+    const endpoint = 'https://searchconsole.googleapis.com/webmasters/v3/sites/' + siteUrlEncoded + '/searchAnalytics/query';
+
+    async function query(dimensions, rowLimit) {
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + accessToken },
+            body: JSON.stringify({ startDate: startDate, endDate: endDate, dimensions: dimensions, rowLimit: rowLimit || 1000 })
+        });
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error('Search Console API: ' + response.status + ' ' + errText);
+        }
+        const data = await response.json();
+        return data.rows || [];
+    }
+
+    const [dailyRows, queryRows] = await Promise.all([
+        query(['date'], 1000),
+        query(['query'], 20)
+    ]);
+
+    let totalClicks = 0, totalImpressions = 0, positionSum = 0;
+    dailyRows.forEach(function (r) {
+        totalClicks += r.clicks;
+        totalImpressions += r.impressions;
+        positionSum += r.position * r.impressions; // media pesata sulle impressioni, più corretta di una media semplice
+    });
+    const avgPosition = totalImpressions > 0 ? Math.round((positionSum / totalImpressions) * 10) / 10 : null;
+    const avgCtr = totalImpressions > 0 ? Math.round((totalClicks / totalImpressions) * 1000) / 10 : null;
+
+    return {
+        totalClicks: totalClicks,
+        totalImpressions: totalImpressions,
+        avgPosition: avgPosition,
+        avgCtr: avgCtr,
+        dailyTrend: dailyRows.map(function (r) { return { date: r.keys[0], clicks: r.clicks, impressions: r.impressions }; }),
+        topQueries: queryRows.map(function (r) {
+            return {
+                query: r.keys[0], clicks: r.clicks, impressions: r.impressions,
+                ctr: Math.round(r.ctr * 1000) / 10, position: Math.round(r.position * 10) / 10
+            };
+        })
+    };
+}
+
 // Avvisa IndexNow che una pagina è cambiata (pubblicata, modificata, o
 // rimossa). "Fire and forget" di proposito, come il tracciamento visite: se
 // fallisce (rete assente, IndexNow irraggiungibile, ecc.) non deve MAI far
@@ -1929,6 +2075,144 @@ function parseAdminDateRange(searchParams) {
     // ma MAI "chi". Protetto dalla stessa chiave admin degli altri endpoint.
     // Notifiche per la campanella del pannello admin: le più recenti, con il
     // conteggio di quelle non ancora lette.
+    // Avvia il collegamento: reindirizza il browser alla schermata di
+    // consenso di Google. Non è un endpoint da chiamare con fetch, ma da
+    // aprire direttamente (window.location.href = ...) perché deve navigare
+    // via a Google e poi tornare indietro.
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/searchconsole/connect') === 0) {
+        const parsedUrl = new URL(req.url, 'http://localhost');
+        const secret = parsedUrl.searchParams.get('secret') || '';
+        if (!ADMIN_SECRET || secret !== ADMIN_SECRET) {
+            res.writeHead(401, { 'Content-Type': 'text/plain' });
+            res.end('Non autorizzato.');
+            return;
+        }
+        if (!GOOGLE_OAUTH_CLIENT_ID || !GOOGLE_OAUTH_CLIENT_SECRET) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET non configurate sul server.');
+            return;
+        }
+        res.writeHead(302, { Location: buildGoogleAuthUrl() });
+        res.end();
+        return;
+    }
+
+    // Google reindirizza qui dopo che hai dato (o negato) il consenso.
+    // Scambiamo il "code" temporaneo con un vero refresh_token da salvare,
+    // poi rimandiamo il browser alla dashboard.
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/searchconsole/callback') === 0) {
+        (async function () {
+            const parsedUrl = new URL(req.url, 'http://localhost');
+            const code = parsedUrl.searchParams.get('code');
+            const errorParam = parsedUrl.searchParams.get('error');
+            const redirectBase = 'https://www.ialgae.com/admin.html';
+
+            if (errorParam || !code) {
+                res.writeHead(302, { Location: redirectBase + '?searchconsole=denied' });
+                return res.end();
+            }
+            try {
+                const tokens = await exchangeCodeForTokens(code);
+                if (!tokens.refresh_token) {
+                    // Capita se l'app era già stata autorizzata prima e Google
+                    // non manda un nuovo refresh_token: bisogna revocare
+                    // l'accesso da myaccount.google.com/permissions e riprovare.
+                    res.writeHead(302, { Location: redirectBase + '?searchconsole=norefresh' });
+                    return res.end();
+                }
+                await pool.query(
+                    'INSERT INTO oauth_tokens (provider, refresh_token, connected_at) VALUES (\'search_console\', $1, now()) ' +
+                    'ON CONFLICT (provider) DO UPDATE SET refresh_token = EXCLUDED.refresh_token, connected_at = now()',
+                    [tokens.refresh_token]
+                );
+                res.writeHead(302, { Location: redirectBase + '?searchconsole=connected' });
+                res.end();
+            } catch (err) {
+                console.error('Errore callback Search Console:', err);
+                res.writeHead(302, { Location: redirectBase + '?searchconsole=error' });
+                res.end();
+            }
+        })();
+        return;
+    }
+
+    // Stato del collegamento: connesso o no, e da quando.
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/searchconsole/status') === 0) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                const parsedUrl = new URL(req.url, 'http://localhost');
+                if ((parsedUrl.searchParams.get('secret') || '') !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+                const result = await pool.query("SELECT connected_at FROM oauth_tokens WHERE provider = 'search_console'");
+                return sendJSON(res, 200, {
+                    connected: result.rows.length > 0,
+                    connectedAt: result.rows.length > 0 ? result.rows[0].connected_at : null
+                });
+            } catch (err) {
+                console.error('Errore stato Search Console:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Scollega (elimina il token salvato).
+    if (req.method === 'POST' && req.url === '/api/admin/searchconsole/disconnect') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                let payload;
+                try { payload = JSON.parse(body || '{}'); } catch (e) { return sendJSON(res, 400, { error: 'Corpo non valido.' }); }
+                if (payload.secret !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Password errata.' });
+
+                await pool.query("DELETE FROM oauth_tokens WHERE provider = 'search_console'");
+                cachedAccessToken = null;
+                return sendJSON(res, 200, { ok: true });
+            } catch (err) {
+                console.error('Errore disconnessione Search Console:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // I dati veri: totali, andamento, query principali. Stesso sistema di
+    // intervallo di date già usato nel resto della dashboard (from/to o days).
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/searchconsole/data') === 0) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                const parsedUrl = new URL(req.url, 'http://localhost');
+                if ((parsedUrl.searchParams.get('secret') || '') !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+
+                const { rangeStart, rangeEnd } = parseAdminDateRange(parsedUrl.searchParams);
+                // Search Console vuole date AAAA-MM-GG semplici, non orari precisi.
+                // Inoltre i suoi dati arrivano con 2-3 giorni di ritardo rispetto a
+                // oggi: se chiediamo "fino a oggi" otteniamo giorni finali vuoti,
+                // quindi tronchiamo la fine a 3 giorni fa.
+                const toDate = new Date(Math.min(rangeEnd.getTime(), Date.now() - 3 * 24 * 60 * 60 * 1000));
+                const startDateStr = rangeStart.toISOString().slice(0, 10);
+                const endDateStr = toDate.toISOString().slice(0, 10);
+
+                const data = await fetchSearchConsoleData(startDateStr, endDateStr);
+                return sendJSON(res, 200, data);
+            } catch (err) {
+                console.error('Errore dati Search Console:', err.message);
+                const notConnected = err.message.indexOf('non è ancora collegato') !== -1;
+                return sendJSON(res, notConnected ? 409 : 500, {
+                    error: notConnected ? 'not_connected' : 'Errore nel recuperare i dati da Search Console.'
+                });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/admin/notifications') === 0 && req.url.indexOf('/mark-read') === -1) {
         (async function () {
             try {
