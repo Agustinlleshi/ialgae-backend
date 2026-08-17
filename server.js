@@ -1806,7 +1806,7 @@ const server = http.createServer((req, res) => {
                 return sendJSON(res, 401, { error: 'not_logged_in' });
             }
             return sendJSON(res, 200, {
-                user: { email: user.email, name: user.name, picture: user.picture || null, isPro: !!user.isPro }
+                user: { email: user.email, name: user.name, picture: user.picture || null, isPro: !!user.isPro, twoFactorEnabled: !!user.totpEnabled, hasPassword: !!user.passwordHash }
             });
         })();
         return;
