@@ -1576,6 +1576,33 @@ const server = http.createServer((req, res) => {
         return res.end(req.method === 'HEAD' ? undefined : 'Server iAlgae attivo. Endpoint disponibili: POST /api/ask , GET /api/suggest?q=...');
     }
 
+    // Controllo di salute vero, per il monitoraggio esterno (es. Hyperping,
+    // UptimeRobot). A differenza di "/" (che dice solo "il server risponde"),
+    // questo controlla ANCHE se il database è raggiungibile — così, quando
+    // qualcosa non va, si capisce subito se il problema è il server (Render)
+    // o il database (Neon), senza dover indovinare.
+    if (req.url === '/api/health' && req.method === 'GET') {
+        (async function () {
+            let dbStatus = 'not_configured';
+            if (dbEnabled) {
+                try {
+                    await pool.query('SELECT 1');
+                    dbStatus = 'ok';
+                } catch (err) {
+                    dbStatus = 'error';
+                }
+            }
+            const allOk = dbStatus === 'ok' || dbStatus === 'not_configured';
+            return sendJSON(res, allOk ? 200 : 503, {
+                status: allOk ? 'ok' : 'degraded',
+                server: 'ok',
+                database: dbStatus,
+                timestamp: new Date().toISOString()
+            });
+        })();
+        return;
+    }
+
     // Endpoint suggerimenti di ricerca in tempo reale (proxy verso DuckDuckGo)
     if (req.method === 'GET' && req.url.indexOf('/api/suggest') === 0) {
         (async function () {
