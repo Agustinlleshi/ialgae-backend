@@ -1603,6 +1603,79 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // Sitemap generata al volo: le pagine fisse del sito + tutti gli
+    // articoli del blog VERAMENTE pubblicati, presi in tempo reale dal
+    // database — niente da rigenerare o ricaricare manualmente ogni volta
+    // che pubblichi un articolo nuovo, è sempre aggiornata da sola.
+    // Vive qui (sul backend) invece che sul sito vero perché gli articoli
+    // sono dati dinamici — www.ialgae.com/robots.txt la referenzia da qui,
+    // un pattern esplicitamente supportato da Google per le sitemap
+    // "incrociate" tra domini diversi dello stesso proprietario.
+    if (req.url === '/sitemap.xml' && req.method === 'GET') {
+        (async function () {
+            try {
+                const SITE = 'https://www.ialgae.com';
+                function escapeXml(str) {
+                    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                }
+                function urlEntry(loc, lastmod) {
+                    return '  <url><loc>' + escapeXml(loc) + '</loc>' +
+                        (lastmod ? '<lastmod>' + lastmod + '</lastmod>' : '') +
+                        '</url>';
+                }
+
+                // Pagine fisse: solo quelle pensate per essere indicizzate
+                // (escluse admin.html, login.html, profilo.html,
+                // pagamento-completato.html, reset-password.html — già
+                // "noindex" nel loro tag <meta> — e results.html/en.results.html/
+                // 404.html, che non sono pagine di destinazione con un unico
+                // indirizzo fisso). Le prime 14 sono confermate direttamente
+                // dai file veri presenti su wePanel; le ultime 8 (versioni
+                // inglesi + donazioni/images) sono confermate a voce
+                // dall'utente, senza verifica diretta del file da parte mia.
+                const staticPages = [
+                    '/', '/blog.html', '/news.html', '/ia.html', '/piani.html',
+                    '/traduttore.html', '/travel.html', '/fai-pubblicita.html',
+                    '/come-impostare-ialgae-come-pagina-iniziale.html',
+                    '/cookie-policy.html', '/privacy.html', '/storia.html',
+                    '/chi-siamo.html', '/report-motori-di-ricerca.html',
+                    '/en.html', '/images.html', '/en.images.html', '/en.news.html',
+                    '/en.travel.html', '/en.translate.html', '/en.about.html',
+                    '/donazioni.html'
+                ];
+
+                let postEntries = [];
+                if (dbEnabled) {
+                    const result = await pool.query(
+                        "SELECT slug, updated_at, created_at FROM blog_posts WHERE published = true ORDER BY created_at DESC"
+                    );
+                    postEntries = result.rows.map(function (p) {
+                        const date = (p.updated_at || p.created_at);
+                        const lastmod = date ? new Date(date).toISOString().slice(0, 10) : null;
+                        return urlEntry(SITE + '/blog.html?post=' + encodeURIComponent(p.slug), lastmod);
+                    });
+                }
+
+                const staticEntries = staticPages.map(function (path) { return urlEntry(SITE + path, null); });
+
+                const xml =
+                    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+                    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
+                    staticEntries.join('\n') + '\n' +
+                    postEntries.join('\n') + '\n' +
+                    '</urlset>';
+
+                res.writeHead(200, { 'Content-Type': 'application/xml; charset=utf-8' });
+                return res.end(xml);
+            } catch (err) {
+                console.error('Errore generazione sitemap:', err);
+                res.writeHead(500, { 'Content-Type': 'text/plain' });
+                return res.end('Errore nella generazione della sitemap.');
+            }
+        })();
+        return;
+    }
+
     // Endpoint suggerimenti di ricerca in tempo reale (proxy verso DuckDuckGo)
     if (req.method === 'GET' && req.url.indexOf('/api/suggest') === 0) {
         (async function () {
