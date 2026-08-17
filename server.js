@@ -1640,8 +1640,7 @@ const server = http.createServer((req, res) => {
                     '/cookie-policy.html', '/privacy.html', '/storia.html',
                     '/chi-siamo.html', '/report-motori-di-ricerca.html',
                     '/en.html', '/images.html', '/en.images.html', '/en.news.html',
-                    '/en.travel.html', '/en.translate.html', '/en.about.html',
-                    '/donazioni.html'
+                    '/en.travel.html', '/en.translate.html', '/en.about.html'
                 ];
 
                 let postEntries = [];
