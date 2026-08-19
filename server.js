@@ -561,11 +561,11 @@ async function initDb() {
 // Usato SOLO se DATABASE_URL non è configurata (vedi sopra).
 const memoryUsers = new Map();
 
-// ---- IA: Anthropic (Claude) con Gemini come riserva ----
+// ---- IA: Gemini con Anthropic (Claude) come riserva ----
 // Le tre funzioni sotto sono usate da /api/ask, /api/overview e /api/vision.
-// getAiAnswer() prova sempre prima Claude; solo se quella chiamata fallisce
+// getAiAnswer() prova sempre prima Gemini; solo se quella chiamata fallisce
 // (credito esaurito, chiave mancante, errore del servizio, timeout) passa
-// automaticamente a Gemini, senza che l'utente se ne accorga.
+// automaticamente a Claude (Anthropic), senza che l'utente se ne accorga.
 
 // Converte i messaggi in formato Anthropic (role "user"/"assistant", content
 // stringa o array di blocchi tipo {type:"text"} / {type:"image"}) nel formato
@@ -796,29 +796,29 @@ async function runWeeklyBackupIfDue() {
     }
 }
 
-// Punto d'ingresso unico: prova prima Claude, e SOLO se fallisce passa a
-// Gemini come riserva. Ritorna { answer, provider } così i log (e volendo
-// anche il frontend) sanno sempre quale dei due ha risposto davvero. Se
-// falliscono entrambi (o nessuno dei due è configurato), lancia un errore
-// che il chiamante trasforma in una risposta 502 per l'utente.
+// Punto d'ingresso unico: prova prima Gemini, e SOLO se fallisce passa a
+// Claude (Anthropic) come riserva. Ritorna { answer, provider } così i log
+// (e volendo anche il frontend) sanno sempre quale dei due ha risposto
+// davvero. Se falliscono entrambi (o nessuno dei due è configurato), lancia
+// un errore che il chiamante trasforma in una risposta 502 per l'utente.
 async function getAiAnswer(anthropicMessages) {
     try {
-        const answer = await callAnthropic(anthropicMessages);
-        return { answer: answer, provider: 'anthropic' };
-    } catch (anthropicErr) {
-        console.error('Anthropic non disponibile, provo con Gemini come riserva:', anthropicErr.message);
+        const answer = await callGemini(anthropicMessages);
+        return { answer: answer, provider: 'gemini' };
+    } catch (geminiErr) {
+        console.error('Gemini non disponibile, provo con Claude (Anthropic) come riserva:', geminiErr.message);
         try {
-            const answer = await callGemini(anthropicMessages);
+            const answer = await callAnthropic(anthropicMessages);
             // Non aspettiamo questa chiamata (fire and forget): non deve mai
             // rallentare la risposta vera all'utente per colpa di una notifica.
             createNotificationThrottled(
                 'ai_fallback',
-                '⚠️ Il sito sta rispondendo con Gemini invece di Claude. Probabile credito Anthropic esaurito — controlla su console.anthropic.com.',
+                '⚠️ Il sito sta rispondendo con Claude invece di Gemini. Probabile problema con Gemini — controlla la sua disponibilità.',
                 6
             );
-            return { answer: answer, provider: 'gemini' };
-        } catch (geminiErr) {
-            console.error('Anche Gemini non disponibile:', geminiErr.message);
+            return { answer: answer, provider: 'anthropic' };
+        } catch (anthropicErr) {
+            console.error('Anche Claude (Anthropic) non disponibile:', anthropicErr.message);
             throw new Error('Nessun servizio IA disponibile al momento.');
         }
     }
@@ -1638,7 +1638,7 @@ const server = http.createServer((req, res) => {
                     '/traduttore.html', '/travel.html', '/fai-pubblicita.html',
                     '/come-impostare-ialgae-come-pagina-iniziale.html',
                     '/cookie-policy.html', '/privacy.html', '/storia.html',
-                    '/chi-siamo.html', '/report-motori-di-ricerca.html',
+                    '/chi-siamo.html', '/report-motori-di-ricerca.html', '/faq.html',
                     '/en.html', '/images.html', '/en.images.html', '/en.news.html',
                     '/en.travel.html', '/en.translate.html', '/en.about.html'
                 ];
