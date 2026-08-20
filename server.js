@@ -951,12 +951,13 @@ const SEARCH_CACHE_TTL_MS = 2 * 60 * 60 * 1000; // 2 ore
 // Costruisce una chiave di cache stabile per una combinazione di ricerca.
 // Query normalizzata (minuscolo, spazi ripuliti) così "Pizza " e "pizza"
 // condividono la stessa voce di cache.
-function buildSearchCacheKey(query, type, page, safesearch, freshness) {
+function buildSearchCacheKey(query, type, page, safesearch, freshness, lang) {
     const normalizedQuery = (query || '').trim().toLowerCase().replace(/\s+/g, ' ');
-    // safesearch e freshness fanno parte della chiave: una ricerca già in
-    // cache con un filtro diverso (di sicurezza o di data) NON deve mai
-    // essere riusata.
-    return type + ':' + page + ':' + (safesearch || 'strict') + ':' + (freshness || 'any') + ':' + normalizedQuery;
+    // safesearch, freshness e lang fanno parte della chiave: una ricerca
+    // già in cache con un filtro diverso (sicurezza, data o LINGUA) NON
+    // deve mai essere riusata — altrimenti una ricerca inglese potrebbe
+    // ricevere risultati italiani già in cache (o viceversa).
+    return type + ':' + page + ':' + (safesearch || 'strict') + ':' + (freshness || 'any') + ':' + (lang || 'it') + ':' + normalizedQuery;
 }
 
 // Ritorna { results, source } se una voce valida (non scaduta) esiste in
@@ -4617,6 +4618,21 @@ function parseAdminDateRange(searchParams) {
                 let freshness = (fullUrl.searchParams.get('freshness') || '').toLowerCase();
                 if (allowedFreshness.indexOf(freshness) === -1) freshness = '';
 
+                // Lingua dei risultati: il frontend la manda esplicitamente
+                // (results.html -> "it", en_results.html -> "en"). Se manca
+                // o non è tra quelle supportate, restiamo su "it" come prima
+                // per non rompere le pagine esistenti che non la mandano ancora.
+                const allowedLangs = ['it', 'en'];
+                let lang = (fullUrl.searchParams.get('lang') || 'it').toLowerCase();
+                if (allowedLangs.indexOf(lang) === -1) lang = 'it';
+                // Brave vuole codici paese/lingua separati; Serper vuole gl/hl.
+                // Per ora mappiamo 1:1 IT<->IT ed EN<->US (risultati in inglese,
+                // paese USA, la combinazione più neutra per l'inglese generico).
+                const braveCountry = (lang === 'en') ? 'us' : 'it';
+                const braveSearchLang = lang; // 'it' o 'en', combacia già coi codici Brave
+                const serperGl = (lang === 'en') ? 'us' : 'it';
+                const serperHl = lang;
+
                 if (!q) {
                     return sendJSON(res, 200, { results: [], totalPages: 0, page: page, type: type });
                 }
@@ -4629,7 +4645,7 @@ function parseAdminDateRange(searchParams) {
                 // Prima di chiamare Brave/Serper, controlliamo se qualcuno ha già
                 // cercato la stessa cosa di recente: se sì, rispondiamo subito da
                 // cache senza consumare quota delle API esterne.
-                const cacheKey = buildSearchCacheKey(q, type, page, safesearch, freshness);
+                const cacheKey = buildSearchCacheKey(q, type, page, safesearch, freshness, lang);
                 const cached = await getCachedSearch(cacheKey);
                 if (cached) {
                     return sendJSON(res, 200, {
@@ -4663,7 +4679,7 @@ function parseAdminDateRange(searchParams) {
                 // Le Immagini di Brave non supportano la paginazione con "offset": restituiscono
                 // sempre la prima pagina di risultati, quindi la omettiamo per quel tipo.
                 const countForType = (type === 'images') ? IMAGES_COUNT : RESULTS_PER_PAGE;
-                let searchUrl = endpoints[type] + '?q=' + encodeURIComponent(q) + '&count=' + countForType + '&country=it&search_lang=it&safesearch=' + safesearch;
+                let searchUrl = endpoints[type] + '?q=' + encodeURIComponent(q) + '&count=' + countForType + '&country=' + braveCountry + '&search_lang=' + braveSearchLang + '&safesearch=' + safesearch;
                 if (freshness) searchUrl += '&freshness=' + freshness;
                 if (type !== 'images') {
                     searchUrl += '&offset=' + offset;
@@ -4752,7 +4768,7 @@ function parseAdminDateRange(searchParams) {
                         // ricerca Google, che usa "safe": "active"/"off" (solo due
                         // livelli, non tre come Brave) — quindi "strict" e "moderate"
                         // diventano entrambi "active", solo "off" resta "off".
-                        const serperBody = { q: q, gl: 'it', hl: 'it' };
+                        const serperBody = { q: q, gl: serperGl, hl: serperHl };
                         if (safesearch !== 'off') serperBody.safe = 'active';
                         // Stesso parametro nativo di Google (tbs=qdr:X), che
                         // Serper rispecchia direttamente — a differenza del
