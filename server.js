@@ -648,6 +648,28 @@ async function callGemini(anthropicMessages) {
     return Array.isArray(parts) ? parts.map(function (p) { return p.text || ''; }).join('\n') : '';
 }
 
+// Codici di errore HTTP di Gemini considerati "transitori": quasi sempre un
+// intoppo momentaneo (modello sovraccarico, timeout lato Google) che si
+// risolve da solo in pochi secondi. Per questi vale la pena ritentare una
+// volta sola prima di arrendersi e passare a Claude come riserva — invece
+// di sprecare la riserva per un problema che si sarebbe risolto da sé.
+const TRANSIENT_GEMINI_STATUS = [429, 500, 502, 503, 504];
+
+async function callGeminiWithRetry(anthropicMessages) {
+    try {
+        return await callGemini(anthropicMessages);
+    } catch (err) {
+        const match = /^Gemini (\d+):/.exec(err.message || '');
+        const status = match ? parseInt(match[1], 10) : null;
+        if (status && TRANSIENT_GEMINI_STATUS.indexOf(status) !== -1) {
+            console.error('Gemini ' + status + ' (probabile intoppo momentaneo), ritento tra mezzo secondo:', err.message);
+            await new Promise(function (resolve) { setTimeout(resolve, 500); });
+            return await callGemini(anthropicMessages);
+        }
+        throw err; // errore non transitorio (es. chiave mancante/non valida): non ha senso ritentare
+    }
+}
+
 // ---- Notifiche per il pannello admin (campanella) ----
 // Quattro tipi: fallback IA, fallback ricerca, nuovo iscritto, traguardo.
 // Le prime due sono "throttled" (non ripetute più di una volta ogni tot ore):
@@ -803,7 +825,7 @@ async function runWeeklyBackupIfDue() {
 // un errore che il chiamante trasforma in una risposta 502 per l'utente.
 async function getAiAnswer(anthropicMessages) {
     try {
-        const answer = await callGemini(anthropicMessages);
+        const answer = await callGeminiWithRetry(anthropicMessages);
         return { answer: answer, provider: 'gemini' };
     } catch (geminiErr) {
         console.error('Gemini non disponibile, provo con Claude (Anthropic) come riserva:', geminiErr.message);
@@ -4628,9 +4650,9 @@ function parseAdminDateRange(searchParams) {
                 // Brave vuole codici paese/lingua separati; Serper vuole gl/hl.
                 // Per ora mappiamo 1:1 IT<->IT ed EN<->US (risultati in inglese,
                 // paese USA, la combinazione più neutra per l'inglese generico).
-                const braveCountry = (lang === 'en') ? 'us' : 'it';
+                const braveCountry = (lang === 'en') ? 'gb' : 'it';
                 const braveSearchLang = lang; // 'it' o 'en', combacia già coi codici Brave
-                const serperGl = (lang === 'en') ? 'us' : 'it';
+                const serperGl = (lang === 'en') ? 'gb' : 'it';
                 const serperHl = lang;
 
                 if (!q) {
