@@ -1578,22 +1578,44 @@ function extractHost(url) {
     }
 }
 
-function sendJSON(res, statusCode, data) {
-    const body = JSON.stringify(data);
-    res.writeHead(statusCode, {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization'
-    });
-    res.end(body);
+// Domini del sito da cui accettiamo richieste con credenziali (cookie). Un
+// wildcard "*" non è permesso dai browser quando la richiesta include
+// credenziali (es. navigator.sendBeacon() le include sempre in automatico,
+// anche se non lo chiediamo esplicitamente) — va quindi specificato il
+// dominio esatto che ha fatto la richiesta, non "chiunque".
+const ALLOWED_ORIGINS = [
+    'https://www.ialgae.com',
+    'https://ialgae.com'
+];
+
+function corsOriginFor(req) {
+    const origin = req.headers.origin;
+    return (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) ? origin : ALLOWED_ORIGINS[0];
 }
 
 const server = http.createServer((req, res) => {
+    // "sendJSON" è definita QUI DENTRO (non a livello globale) apposta: così
+    // cattura automaticamente "req" della richiesta in corso — comprese
+    // tutte le funzioni async annidate più sotto che la richiamano — senza
+    // dover modificare ognuna delle centinaia di chiamate già presenti nel
+    // file per passargli esplicitamente "req".
+    function sendJSON(res, statusCode, data) {
+        const body = JSON.stringify(data);
+        res.writeHead(statusCode, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': corsOriginFor(req),
+            'Access-Control-Allow-Credentials': 'true',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+        });
+        res.end(body);
+    }
+
     // Richiesta preliminare CORS del browser
     if (req.method === 'OPTIONS') {
         res.writeHead(204, {
-            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Origin': corsOriginFor(req),
+            'Access-Control-Allow-Credentials': 'true',
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type, Authorization'
         });
