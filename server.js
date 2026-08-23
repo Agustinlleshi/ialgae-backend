@@ -354,6 +354,10 @@ async function initDb() {
     // App personalizzate aggiunte liberamente dall'utente (nome + indirizzo),
     // salvate come JSON: [{ "name": "...", "url": "..." }, ...]
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_apps JSONB NOT NULL DEFAULT \'[]\'');
+    // Ordine personalizzato delle app nel menu "I tuoi preferiti", quando
+    // l'utente le ha trascinate per riordinarle (tenendo premuto su un'app).
+    // Elenco di nomi app nell'ordine scelto; le app non presenti restano in coda.
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS app_order TEXT[] NOT NULL DEFAULT \'{}\'');
 
     // 2FA (autenticazione a due fattori, standard TOTP compatibile con Google
     // Authenticator, Authy, ecc.). totp_secret è la chiave segreta attiva
@@ -614,7 +618,7 @@ async function callAnthropic(anthropicMessages) {
         },
         body: JSON.stringify({
             model: ANTHROPIC_MODEL,
-            max_tokens: 1000,
+            max_tokens: 2000,
             messages: anthropicMessages
         })
     });
@@ -642,7 +646,7 @@ async function callGemini(anthropicMessages) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             contents: toGeminiContents(anthropicMessages),
-            generationConfig: { maxOutputTokens: 1000 }
+            generationConfig: { maxOutputTokens: 2000 }
         })
     });
 
@@ -1988,11 +1992,12 @@ const server = http.createServer((req, res) => {
             const user = await getUserFromRequest(req);
             if (!user) return sendJSON(res, 401, { error: 'not_logged_in' });
             try {
-                const result = await pool.query('SELECT hidden_apps, custom_apps FROM users WHERE id = $1', [user.sub]);
+                const result = await pool.query('SELECT hidden_apps, custom_apps, app_order FROM users WHERE id = $1', [user.sub]);
                 const row = result.rows[0] || {};
                 return sendJSON(res, 200, {
                     hiddenApps: row.hidden_apps || [],
-                    customApps: row.custom_apps || []
+                    customApps: row.custom_apps || [],
+                    appOrder: row.app_order || []
                 });
             } catch (err) {
                 console.error('Errore /api/user/hidden-apps GET:', err);
@@ -2035,11 +2040,17 @@ const server = http.createServer((req, res) => {
                         .slice(0, 30)
                     : [];
 
+                // Ordine personalizzato: un semplice elenco di nomi app, nel
+                // nuovo ordine scelto dall'utente trascinandole.
+                const appOrder = Array.isArray(payload.appOrder)
+                    ? payload.appOrder.map(function (n) { return String(n).trim(); }).filter(Boolean).slice(0, 200)
+                    : [];
+
                 await pool.query(
-                    'UPDATE users SET hidden_apps = $1, custom_apps = $2 WHERE id = $3',
-                    [hiddenApps, JSON.stringify(customApps), user.sub]
+                    'UPDATE users SET hidden_apps = $1, custom_apps = $2, app_order = $3 WHERE id = $4',
+                    [hiddenApps, JSON.stringify(customApps), appOrder, user.sub]
                 );
-                return sendJSON(res, 200, { message: 'Preferenze salvate.', hiddenApps: hiddenApps, customApps: customApps });
+                return sendJSON(res, 200, { message: 'Preferenze salvate.', hiddenApps: hiddenApps, customApps: customApps, appOrder: appOrder });
             } catch (err) {
                 console.error('Errore /api/user/hidden-apps POST:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
