@@ -98,6 +98,15 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
 const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
+// Duffel: prezzi voli reali per la pagina Viaggiare/Travel.
+// Registrazione gratuita e immediata su duffel.com (niente approvazione
+// commerciale, a differenza di Amadeus che ha chiuso il self-service a
+// luglio 2026). Un solo token, non serve OAuth: si usa direttamente come
+// "Bearer" in ogni chiamata. Comincia con "duffel_test_" per l'ambiente di
+// prova (gratuito, dati reali ma solo compagnie di test/partner limitate);
+// passa a "duffel_live_" quando sei pronto per prezzi reali e prenotazioni.
+const DUFFEL_API_KEY = process.env.DUFFEL_API_KEY;
+const DUFFEL_BASE_URL = 'https://api.duffel.com';
 // Chiave di test per la demo di Serper.dev (facoltativa, non usata dal
 // resto del sito): serve solo per la pagina test-serper.html, per
 // verificare come sarebbero i risultati usando Serper invece di Brave.
@@ -4597,6 +4606,95 @@ function parseAdminDateRange(searchParams) {
     }
 
     // ===== FINE BLOG =====
+
+    // ===== VOLI (Duffel) =====
+    // A differenza di Amadeus, Duffel non richiede uno scambio OAuth: il
+    // token creato nella dashboard si usa direttamente come "Bearer" in ogni
+    // chiamata, senza scadenza da gestire qui.
+
+    // Duffel manda ogni offerta con moltissimi campi tecnici (condizioni
+    // tariffarie, bagagli per segmento, servizi extra, ecc.): qui teniamo
+    // solo quello che serve a mostrare una card di volo comprensibile.
+    function simplifyDuffelOffer(offer) {
+        const slice = offer.slices[0];
+        const segments = slice.segments;
+        const firstSeg = segments[0];
+        const lastSeg = segments[segments.length - 1];
+
+        return {
+            price: offer.total_amount,
+            currency: offer.total_currency,
+            departureTime: firstSeg.departing_at,
+            arrivalTime: lastSeg.arriving_at,
+            originCode: firstSeg.origin.iata_code,
+            destinationCode: lastSeg.destination.iata_code,
+            durationIso: slice.duration, // es. "PT2H35M"
+            stops: segments.length - 1,
+            carrierCode: firstSeg.marketing_carrier.iata_code,
+            flightNumber: firstSeg.marketing_carrier.iata_code + firstSeg.marketing_carrier_flight_number
+        };
+    }
+
+    if (req.method === 'GET' && req.url.indexOf('/api/flights') === 0) {
+        (async function () {
+            try {
+                if (!DUFFEL_API_KEY) {
+                    return sendJSON(res, 503, { error: 'Ricerca voli non ancora configurata: manca DUFFEL_API_KEY su Render.' });
+                }
+
+                const fullUrl = new URL(req.url, 'http://localhost');
+                const origin = (fullUrl.searchParams.get('from') || '').trim().toUpperCase();
+                const destination = (fullUrl.searchParams.get('to') || '').trim().toUpperCase();
+                const date = (fullUrl.searchParams.get('date') || '').trim();
+                let adults = parseInt(fullUrl.searchParams.get('adults'), 10);
+                if (!adults || adults < 1) adults = 1;
+                if (adults > 9) adults = 9;
+
+                if (!origin || !destination || !date) {
+                    return sendJSON(res, 400, { error: 'Parametri mancanti: servono from, to e date (es. ?from=FCO&to=LON&date=2026-09-15).' });
+                }
+                // Duffel vuole i codici IATA dei singoli aeroporti (3 lettere),
+                // non i "codici città" a più aeroporti come LON o NYC.
+                if (!/^[A-Z]{3}$/.test(origin) || !/^[A-Z]{3}$/.test(destination)) {
+                    return sendJSON(res, 400, { error: 'from e to devono essere codici aeroporto IATA di 3 lettere (es. FCO, non LON o città per esteso).' });
+                }
+
+                const passengers = [];
+                for (let i = 0; i < adults; i++) passengers.push({ type: 'adult' });
+
+                const flightRes = await fetch(DUFFEL_BASE_URL + '/air/offer_requests?return_offers=true', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': 'Bearer ' + DUFFEL_API_KEY,
+                        'Duffel-Version': 'v2',
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        data: {
+                            slices: [{ origin: origin, destination: destination, departure_date: date }],
+                            passengers: passengers,
+                            cabin_class: 'economy'
+                        }
+                    })
+                });
+                const flightData = await flightRes.json();
+
+                if (!flightRes.ok) {
+                    const detail = (flightData.errors && flightData.errors[0] && (flightData.errors[0].message || flightData.errors[0].title)) || ('HTTP ' + flightRes.status);
+                    return sendJSON(res, flightRes.status, { error: 'Duffel: ' + detail });
+                }
+
+                const offers = ((flightData.data && flightData.data.offers) || []).slice(0, 6).map(simplifyDuffelOffer);
+                return sendJSON(res, 200, { offers: offers });
+            } catch (err) {
+                console.error('Errore /api/flights:', err);
+                return sendJSON(res, 500, { error: 'Errore nella ricerca voli. Riprova tra poco.' });
+            }
+        })();
+        return;
+    }
+    // ===== FINE VOLI =====
 
     if (req.method === 'GET' && req.url.indexOf('/api/search') === 0) {
         (async function () {
