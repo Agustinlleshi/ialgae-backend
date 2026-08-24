@@ -606,8 +606,15 @@ function toGeminiContents(anthropicMessages) {
 // Chiama Claude (Anthropic). Ritorna il testo della risposta, oppure lancia
 // un errore se la chiamata fallisce per qualsiasi motivo — l'errore viene
 // intercettato da getAiAnswer() per tentare automaticamente Gemini.
-async function callAnthropic(anthropicMessages) {
+async function callAnthropic(anthropicMessages, systemPrompt, maxTokens) {
     if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY non configurata');
+
+    const requestBody = {
+        model: ANTHROPIC_MODEL,
+        max_tokens: maxTokens || 2000,
+        messages: anthropicMessages
+    };
+    if (systemPrompt) requestBody.system = systemPrompt;
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -616,11 +623,7 @@ async function callAnthropic(anthropicMessages) {
             'x-api-key': ANTHROPIC_API_KEY,
             'anthropic-version': '2023-06-01'
         },
-        body: JSON.stringify({
-            model: ANTHROPIC_MODEL,
-            max_tokens: 2000,
-            messages: anthropicMessages
-        })
+        body: JSON.stringify(requestBody)
     });
 
     if (!response.ok) {
@@ -637,17 +640,20 @@ async function callAnthropic(anthropicMessages) {
 
 // Chiama Gemini (Google) con lo stesso formato di messaggi, convertito da
 // toGeminiContents(). Usato SOLO come riserva quando Anthropic non risponde.
-async function callGemini(anthropicMessages) {
+async function callGemini(anthropicMessages, systemPrompt, maxTokens) {
     if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY non configurata');
+
+    const requestBody = {
+        contents: toGeminiContents(anthropicMessages),
+        generationConfig: { maxOutputTokens: maxTokens || 2000 }
+    };
+    if (systemPrompt) requestBody.systemInstruction = { parts: [{ text: systemPrompt }] };
 
     const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_API_KEY;
     const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            contents: toGeminiContents(anthropicMessages),
-            generationConfig: { maxOutputTokens: 2000 }
-        })
+        body: JSON.stringify(requestBody)
     });
 
     if (!response.ok) {
@@ -668,16 +674,16 @@ async function callGemini(anthropicMessages) {
 // di sprecare la riserva per un problema che si sarebbe risolto da sé.
 const TRANSIENT_GEMINI_STATUS = [429, 500, 502, 503, 504];
 
-async function callGeminiWithRetry(anthropicMessages) {
+async function callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens) {
     try {
-        return await callGemini(anthropicMessages);
+        return await callGemini(anthropicMessages, systemPrompt, maxTokens);
     } catch (err) {
         const match = /^Gemini (\d+):/.exec(err.message || '');
         const status = match ? parseInt(match[1], 10) : null;
         if (status && TRANSIENT_GEMINI_STATUS.indexOf(status) !== -1) {
             console.error('Gemini ' + status + ' (probabile intoppo momentaneo), ritento tra mezzo secondo:', err.message);
             await new Promise(function (resolve) { setTimeout(resolve, 500); });
-            return await callGemini(anthropicMessages);
+            return await callGemini(anthropicMessages, systemPrompt, maxTokens);
         }
         throw err; // errore non transitorio (es. chiave mancante/non valida): non ha senso ritentare
     }
@@ -836,14 +842,14 @@ async function runWeeklyBackupIfDue() {
 // (e volendo anche il frontend) sanno sempre quale dei due ha risposto
 // davvero. Se falliscono entrambi (o nessuno dei due è configurato), lancia
 // un errore che il chiamante trasforma in una risposta 502 per l'utente.
-async function getAiAnswer(anthropicMessages) {
+async function getAiAnswer(anthropicMessages, systemPrompt, maxTokens) {
     try {
-        const answer = await callGeminiWithRetry(anthropicMessages);
+        const answer = await callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens);
         return { answer: answer, provider: 'gemini' };
     } catch (geminiErr) {
         console.error('Gemini non disponibile, provo con Claude (Anthropic) come riserva:', geminiErr.message);
         try {
-            const answer = await callAnthropic(anthropicMessages);
+            const answer = await callAnthropic(anthropicMessages, systemPrompt, maxTokens);
             // Non aspettiamo questa chiamata (fire and forget): non deve mai
             // rallentare la risposta vera all'utente per colpa di una notifica.
             createNotificationThrottled(
@@ -4044,9 +4050,25 @@ function parseAdminDateRange(searchParams) {
                 let aiResult;
                 // La cache si usa SOLO per domande singole (senza cronologia
                 // precedente): una conversazione con più messaggi è troppo
-                // specifica per essere condivisa con altri utenti.
+                // specifica per essere condivisa con altri utenti. Le risposte
+                // in inglese e in italiano vengono tenute separate in cache
+                // (altrimenti chi chiede in inglese potrebbe ricevere una
+                // risposta italiana già salvata per la stessa domanda).
+                const lang = payload.lang === 'en' ? 'en' : 'it';
+                // L'assistente di ia.html/en_ia.html deve dare risposte brevi
+                // (circa 500 caratteri): l'istruzione nel prompt di sistema
+                // guida lo stile della risposta, il limite di token più basso
+                // (rispetto ai 2000 usati altrove sul sito, es. AI Overview)
+                // funge da rete di sicurezza contro risposte troppo lunghe.
+                // Solo questo endpoint usa questi valori: le altre funzionalità
+                // IA del sito (ricerca, AI Overview) restano invariate.
+                const brevityInstruction = lang === 'en'
+                    ? 'Answer briefly and clearly, in no more than about 500 characters. Be complete and helpful within that space, but do not pad or ramble. Always answer in English, regardless of the language the question is written in.'
+                    : 'Rispondi in modo breve e chiaro, non più di circa 500 caratteri. Sii comunque completo e utile in quello spazio, senza aggiungere contenuto superfluo.';
+                const systemPrompt = brevityInstruction;
+                const ASK_MAX_TOKENS = 300;
                 const isCacheable = anthropicMessages.length === 1;
-                const aiCacheKey = isCacheable ? buildAiCacheKey('ask', anthropicMessages[0].content) : null;
+                const aiCacheKey = isCacheable ? buildAiCacheKey('ask-' + lang, anthropicMessages[0].content) : null;
 
                 if (isCacheable) {
                     const cached = await getCachedAiAnswer(aiCacheKey);
@@ -4056,7 +4078,7 @@ function parseAdminDateRange(searchParams) {
                 }
 
                 try {
-                    aiResult = await getAiAnswer(anthropicMessages);
+                    aiResult = await getAiAnswer(anthropicMessages, systemPrompt, ASK_MAX_TOKENS);
                 } catch (aiErr) {
                     console.error('Errore IA (ask):', aiErr.message);
                     return sendJSON(res, 502, { error: 'Errore nel contattare il servizio IA. Riprova più tardi.' });
