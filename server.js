@@ -1055,35 +1055,6 @@ function buildAiCacheKey(endpointName, question) {
     return endpointName + ':' + normalized;
 }
 
-// Garantisce che una risposta non superi mai un tetto di caratteri, qualsiasi
-// cosa faccia il modello (l'istruzione nel prompt di sistema è solo
-// un'indicazione, non una garanzia: il modello può comunque sforare). Taglia
-// all'ultima frase completa entro il limite; se non trova un punto/domanda/
-// esclamativo abbastanza vicino, taglia comunque ma all'ultimo spazio (mai a
-// metà parola), aggiungendo "…" per segnalare che è stata accorciata.
-function enforceMaxChars(text, maxChars) {
-    if (!text || text.length <= maxChars) return text;
-
-    const truncated = text.slice(0, maxChars);
-    const lastSentenceEnd = Math.max(
-        truncated.lastIndexOf('. '),
-        truncated.lastIndexOf('! '),
-        truncated.lastIndexOf('? '),
-        truncated.lastIndexOf('.\n'),
-        truncated.lastIndexOf('!\n'),
-        truncated.lastIndexOf('?\n')
-    );
-    // Accettiamo il taglio a fine frase solo se non perdiamo troppo spazio
-    // utile (almeno metà del limite): altrimenti è meglio tagliare più vicino
-    // al limite richiesto, anche se cade a metà frase.
-    if (lastSentenceEnd > maxChars * 0.5) {
-        return truncated.slice(0, lastSentenceEnd + 1).trim();
-    }
-    const lastSpace = truncated.lastIndexOf(' ');
-    const cut = lastSpace > 0 ? truncated.slice(0, lastSpace) : truncated;
-    return cut.trim() + '…';
-}
-
 async function getCachedAiAnswer(cacheKey) {
     if (!dbEnabled) return null;
     try {
@@ -4084,38 +4055,23 @@ function parseAdminDateRange(searchParams) {
                 // (altrimenti chi chiede in inglese potrebbe ricevere una
                 // risposta italiana già salvata per la stessa domanda).
                 const lang = payload.lang === 'en' ? 'en' : 'it';
-                // L'assistente di ia.html/en_ia.html deve dare risposte brevi
-                // (circa 500 caratteri): l'istruzione nel prompt di sistema
-                // guida lo stile della risposta, il limite di token più basso
-                // (rispetto ai 2000 usati altrove sul sito, es. AI Overview)
-                // funge da rete di sicurezza contro risposte troppo lunghe.
-                // Solo questo endpoint usa questi valori: le altre funzionalità
-                // IA del sito (ricerca, AI Overview) restano invariate.
-                const brevityInstruction = lang === 'en'
-                    ? 'Answer briefly and clearly, in no more than about 500 characters. Be complete and helpful within that space, but do not pad or ramble. Always answer in English, regardless of the language the question is written in.'
-                    : 'Rispondi in modo breve e chiaro, non più di circa 500 caratteri. Sii comunque completo e utile in quello spazio, senza aggiungere contenuto superfluo.';
-                const systemPrompt = brevityInstruction;
-                // 300 token si è rivelato troppo poco in pratica: per domande
-                // che invitano naturalmente a una risposta strutturata (es.
-                // "come cambio il filtro aria"), il modello viene interrotto
-                // quasi subito, prima ancora di arrivare al contenuto vero.
-                // 700 token lasciano margine per completare una risposta
-                // realmente contenuta in ~500 caratteri come richiesto
-                // dall'istruzione qui sopra, restando comunque molto più
-                // basso dei 2000 usati dal resto del sito.
-                const ASK_MAX_TOKENS = 700;
-                // Limite duro sui caratteri della risposta finale, applicato
-                // SEMPRE prima di mandarla al client (vedi enforceMaxChars più
-                // sopra nel file) — a differenza dell'istruzione nel prompt di
-                // sistema, questo è un vincolo che non dipende dal modello.
-                const ASK_MAX_CHARS = 500;
+                // Avevamo provato a forzare risposte brevi (~500 caratteri)
+                // per l'assistente di ia.html/en_ia.html, ma il modello si
+                // "confondeva" con l'istruzione di brevità mentre provava a
+                // scrivere un elenco puntato, fermandosi da solo a metà frase
+                // molto prima di qualsiasi limite di token o di caratteri —
+                // quindi non era un problema risolvibile alzando i numeri.
+                // Torniamo al comportamento invariato del resto del sito:
+                // nessun vincolo di lunghezza, stesso tetto di 2000 token.
+                const systemPrompt = lang === 'en' ? 'Always answer in English, regardless of the language the question is written in.' : null;
+                const ASK_MAX_TOKENS = 2000;
                 const isCacheable = anthropicMessages.length === 1;
                 const aiCacheKey = isCacheable ? buildAiCacheKey('ask-' + lang, anthropicMessages[0].content) : null;
 
                 if (isCacheable) {
                     const cached = await getCachedAiAnswer(aiCacheKey);
                     if (cached) {
-                        return sendJSON(res, 200, { answer: enforceMaxChars(cached.answer, ASK_MAX_CHARS), aiProvider: cached.provider, fromCache: true });
+                        return sendJSON(res, 200, { answer: cached.answer, aiProvider: cached.provider, fromCache: true });
                     }
                 }
 
@@ -4130,12 +4086,7 @@ function parseAdminDateRange(searchParams) {
                     await saveCachedAiAnswer(aiCacheKey, aiResult.answer, aiResult.provider);
                 }
 
-                // Taglio finale garantito: l'istruzione "circa 500 caratteri"
-                // nel prompt è solo un'indicazione che il modello può comunque
-                // non rispettare alla lettera — questo taglio invece si
-                // applica sempre, qualunque cosa risponda il modello.
-                const trimmedAnswer = enforceMaxChars(aiResult.answer || 'Nessuna risposta ricevuta.', ASK_MAX_CHARS);
-                return sendJSON(res, 200, { answer: trimmedAnswer, aiProvider: aiResult.provider });
+                return sendJSON(res, 200, { answer: aiResult.answer || 'Nessuna risposta ricevuta.', aiProvider: aiResult.provider });
 
             } catch (err) {
                 console.error('Errore interno:', err);
