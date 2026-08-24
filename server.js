@@ -1055,6 +1055,35 @@ function buildAiCacheKey(endpointName, question) {
     return endpointName + ':' + normalized;
 }
 
+// Garantisce che una risposta non superi mai un tetto di caratteri, qualsiasi
+// cosa faccia il modello (l'istruzione nel prompt di sistema è solo
+// un'indicazione, non una garanzia: il modello può comunque sforare). Taglia
+// all'ultima frase completa entro il limite; se non trova un punto/domanda/
+// esclamativo abbastanza vicino, taglia comunque ma all'ultimo spazio (mai a
+// metà parola), aggiungendo "…" per segnalare che è stata accorciata.
+function enforceMaxChars(text, maxChars) {
+    if (!text || text.length <= maxChars) return text;
+
+    const truncated = text.slice(0, maxChars);
+    const lastSentenceEnd = Math.max(
+        truncated.lastIndexOf('. '),
+        truncated.lastIndexOf('! '),
+        truncated.lastIndexOf('? '),
+        truncated.lastIndexOf('.\n'),
+        truncated.lastIndexOf('!\n'),
+        truncated.lastIndexOf('?\n')
+    );
+    // Accettiamo il taglio a fine frase solo se non perdiamo troppo spazio
+    // utile (almeno metà del limite): altrimenti è meglio tagliare più vicino
+    // al limite richiesto, anche se cade a metà frase.
+    if (lastSentenceEnd > maxChars * 0.5) {
+        return truncated.slice(0, lastSentenceEnd + 1).trim();
+    }
+    const lastSpace = truncated.lastIndexOf(' ');
+    const cut = lastSpace > 0 ? truncated.slice(0, lastSpace) : truncated;
+    return cut.trim() + '…';
+}
+
 async function getCachedAiAnswer(cacheKey) {
     if (!dbEnabled) return null;
     try {
@@ -4075,13 +4104,18 @@ function parseAdminDateRange(searchParams) {
                 // dall'istruzione qui sopra, restando comunque molto più
                 // basso dei 2000 usati dal resto del sito.
                 const ASK_MAX_TOKENS = 700;
+                // Limite duro sui caratteri della risposta finale, applicato
+                // SEMPRE prima di mandarla al client (vedi enforceMaxChars più
+                // sopra nel file) — a differenza dell'istruzione nel prompt di
+                // sistema, questo è un vincolo che non dipende dal modello.
+                const ASK_MAX_CHARS = 500;
                 const isCacheable = anthropicMessages.length === 1;
                 const aiCacheKey = isCacheable ? buildAiCacheKey('ask-' + lang, anthropicMessages[0].content) : null;
 
                 if (isCacheable) {
                     const cached = await getCachedAiAnswer(aiCacheKey);
                     if (cached) {
-                        return sendJSON(res, 200, { answer: cached.answer, aiProvider: cached.provider, fromCache: true });
+                        return sendJSON(res, 200, { answer: enforceMaxChars(cached.answer, ASK_MAX_CHARS), aiProvider: cached.provider, fromCache: true });
                     }
                 }
 
@@ -4096,7 +4130,12 @@ function parseAdminDateRange(searchParams) {
                     await saveCachedAiAnswer(aiCacheKey, aiResult.answer, aiResult.provider);
                 }
 
-                return sendJSON(res, 200, { answer: aiResult.answer || 'Nessuna risposta ricevuta.', aiProvider: aiResult.provider });
+                // Taglio finale garantito: l'istruzione "circa 500 caratteri"
+                // nel prompt è solo un'indicazione che il modello può comunque
+                // non rispettare alla lettera — questo taglio invece si
+                // applica sempre, qualunque cosa risponda il modello.
+                const trimmedAnswer = enforceMaxChars(aiResult.answer || 'Nessuna risposta ricevuta.', ASK_MAX_CHARS);
+                return sendJSON(res, 200, { answer: trimmedAnswer, aiProvider: aiResult.provider });
 
             } catch (err) {
                 console.error('Errore interno:', err);
