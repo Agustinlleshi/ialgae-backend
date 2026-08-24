@@ -4066,7 +4066,15 @@ function parseAdminDateRange(searchParams) {
                     ? 'Answer briefly and clearly, in no more than about 500 characters. Be complete and helpful within that space, but do not pad or ramble. Always answer in English, regardless of the language the question is written in.'
                     : 'Rispondi in modo breve e chiaro, non più di circa 500 caratteri. Sii comunque completo e utile in quello spazio, senza aggiungere contenuto superfluo.';
                 const systemPrompt = brevityInstruction;
-                const ASK_MAX_TOKENS = 300;
+                // 300 token si è rivelato troppo poco in pratica: per domande
+                // che invitano naturalmente a una risposta strutturata (es.
+                // "come cambio il filtro aria"), il modello viene interrotto
+                // quasi subito, prima ancora di arrivare al contenuto vero.
+                // 700 token lasciano margine per completare una risposta
+                // realmente contenuta in ~500 caratteri come richiesto
+                // dall'istruzione qui sopra, restando comunque molto più
+                // basso dei 2000 usati dal resto del sito.
+                const ASK_MAX_TOKENS = 700;
                 const isCacheable = anthropicMessages.length === 1;
                 const aiCacheKey = isCacheable ? buildAiCacheKey('ask-' + lang, anthropicMessages[0].content) : null;
 
