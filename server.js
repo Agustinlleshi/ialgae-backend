@@ -231,6 +231,14 @@ const resetRateLimitByIp = new Map();    // ip -> { count, windowStart }
 // tempo ragionevole automatizzando i tentativi.
 const memory2faAttempts = new Map(); // userId -> { count, windowStart }
 
+// Buffer in memoria per la durata delle visite (vedi /api/track/duration più
+// sotto). Invece di scrivere sul database ad ogni singola visita che si
+// chiude, teniamo i valori qui e li scriviamo tutti insieme ogni 5 minuti
+// con un'unica query — così una manciata di visitatori sparsi durante il
+// giorno non tengono sveglio il database in continuazione (che su Neon,
+// sul piano gratuito, si traduce in ore di calcolo consumate inutilmente).
+const pendingDurations = new Map(); // page_view id -> durationMs
+
 // Controlla e aggiorna un contatore di rate limit in una Map. Ritorna
 // { allowed, windowStart }: allowed è true se la richiesta è consentita (e in
 // tal caso incrementa il contatore), false se il limite è già stato
@@ -2207,7 +2215,11 @@ const server = http.createServer((req, res) => {
                 if (!id || !durationMs || durationMs <= 0 || durationMs > 30 * 60 * 1000) {
                     return sendJSON(res, 200, { ok: false });
                 }
-                await pool.query('UPDATE page_views SET duration_ms = $1 WHERE id = $2', [durationMs, id]);
+                // Non scriviamo subito sul database: accumuliamo in memoria e
+                // lasciamo che sia il flush periodico (vedi più in basso nel
+                // file) a scrivere tutto insieme. Il valore più recente vince
+                // se per qualche motivo arrivasse due volte per lo stesso id.
+                pendingDurations.set(id, durationMs);
                 return sendJSON(res, 200, { ok: true });
             } catch (err) {
                 console.error('Errore tracciamento durata (non bloccante):', err.message);
@@ -5106,4 +5118,32 @@ if (dbEnabled) {
                 console.error('Errore pulizia admin_notifications:', err);
             });
     }, 60 * 60 * 1000);
+
+    // Scrive sul database, tutte insieme, le durate di visita accumulate in
+    // memoria (vedi pendingDurations e /api/track/duration più sopra).
+    // Se in questi 5 minuti non è successo nulla, il buffer è vuoto e non
+    // facciamo nessuna query: è proprio questo il punto — non svegliare il
+    // database quando non c'è davvero nulla da scrivere.
+    setInterval(async function () {
+        if (pendingDurations.size === 0) return;
+
+        const ids = [];
+        const durations = [];
+        for (const [id, durationMs] of pendingDurations) {
+            ids.push(id);
+            durations.push(durationMs);
+        }
+        pendingDurations.clear();
+
+        try {
+            await pool.query(
+                'UPDATE page_views AS pv SET duration_ms = dati.durata ' +
+                'FROM (SELECT unnest($1::int[]) AS id, unnest($2::int[]) AS durata) AS dati ' +
+                'WHERE pv.id = dati.id',
+                [ids, durations]
+            );
+        } catch (err) {
+            console.error('Errore scrittura raggruppata delle durate di visita:', err.message);
+        }
+    }, 5 * 60 * 1000);
 }
