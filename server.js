@@ -2305,14 +2305,14 @@ function parseAdminDateRange(searchParams) {
                 const topCountriesResult = await pool.query(
                     'SELECT country, country_code AS "countryCode", COUNT(*)::int AS count ' +
                     'FROM page_views WHERE created_at >= $1 AND created_at <= $2 AND country IS NOT NULL ' +
-                    'GROUP BY country, country_code ORDER BY count DESC LIMIT 10',
+                    'GROUP BY country, country_code ORDER BY count DESC LIMIT 250',
                     [rangeStart, rangeEnd]
                 );
 
                 const topCitiesResult = await pool.query(
                     'SELECT city, country, country_code AS "countryCode", AVG(latitude) AS lat, AVG(longitude) AS lon, COUNT(*)::int AS count ' +
                     'FROM page_views WHERE created_at >= $1 AND created_at <= $2 AND city IS NOT NULL AND latitude IS NOT NULL ' +
-                    'GROUP BY city, country, country_code ORDER BY count DESC LIMIT 40',
+                    'GROUP BY city, country, country_code ORDER BY count DESC LIMIT 300',
                     [rangeStart, rangeEnd]
                 );
 
