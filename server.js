@@ -1768,7 +1768,16 @@ const server = http.createServer((req, res) => {
 
                 const ddgResponse = await fetch(
                     'https://duckduckgo.com/ac/?q=' + encodeURIComponent(q) + '&type=list',
-                    { headers: { 'User-Agent': 'Mozilla/5.0' } }
+                    {
+                        headers: { 'User-Agent': 'Mozilla/5.0' },
+                        // Senza un limite esplicito, Node aspetta fino a 10
+                        // secondi prima di arrendersi se DuckDuckGo non
+                        // risponde — troppo lento per una casella di ricerca
+                        // che deve sembrare istantanea. Con 2.5 secondi,
+                        // falliamo in fretta e il sito passa subito ai
+                        // suggerimenti locali di riserva.
+                        signal: AbortSignal.timeout(2500),
+                    }
                 );
 
                 if (!ddgResponse.ok) {
