@@ -98,6 +98,15 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
 const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
+// Duffel: prezzi voli reali per la pagina Viaggiare/Travel.
+// Registrazione gratuita e immediata su duffel.com (niente approvazione
+// commerciale, a differenza di Amadeus che ha chiuso il self-service a
+// luglio 2026). Un solo token, non serve OAuth: si usa direttamente come
+// "Bearer" in ogni chiamata. Comincia con "duffel_test_" per l'ambiente di
+// prova (gratuito, dati reali ma solo compagnie di test/partner limitate);
+// passa a "duffel_live_" quando sei pronto per prezzi reali e prenotazioni.
+const DUFFEL_API_KEY = process.env.DUFFEL_API_KEY;
+const DUFFEL_BASE_URL = 'https://api.duffel.com';
 // Chiave di test per la demo di Serper.dev (facoltativa, non usata dal
 // resto del sito): serve solo per la pagina test-serper.html, per
 // verificare come sarebbero i risultati usando Serper invece di Brave.
@@ -222,6 +231,14 @@ const resetRateLimitByIp = new Map();    // ip -> { count, windowStart }
 // tempo ragionevole automatizzando i tentativi.
 const memory2faAttempts = new Map(); // userId -> { count, windowStart }
 
+// Buffer in memoria per la durata delle visite (vedi /api/track/duration più
+// sotto). Invece di scrivere sul database ad ogni singola visita che si
+// chiude, teniamo i valori qui e li scriviamo tutti insieme ogni 5 minuti
+// con un'unica query — così una manciata di visitatori sparsi durante il
+// giorno non tengono sveglio il database in continuazione (che su Neon,
+// sul piano gratuito, si traduce in ore di calcolo consumate inutilmente).
+const pendingDurations = new Map(); // page_view id -> durationMs
+
 // Controlla e aggiorna un contatore di rate limit in una Map. Ritorna
 // { allowed, windowStart }: allowed è true se la richiesta è consentita (e in
 // tal caso incrementa il contatore), false se il limite è già stato
@@ -345,6 +362,10 @@ async function initDb() {
     // App personalizzate aggiunte liberamente dall'utente (nome + indirizzo),
     // salvate come JSON: [{ "name": "...", "url": "..." }, ...]
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_apps JSONB NOT NULL DEFAULT \'[]\'');
+    // Ordine personalizzato delle app nel menu "I tuoi preferiti", quando
+    // l'utente le ha trascinate per riordinarle (tenendo premuto su un'app).
+    // Elenco di nomi app nell'ordine scelto; le app non presenti restano in coda.
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS app_order TEXT[] NOT NULL DEFAULT \'{}\'');
 
     // 2FA (autenticazione a due fattori, standard TOTP compatibile con Google
     // Authenticator, Authy, ecc.). totp_secret è la chiave segreta attiva
@@ -561,11 +582,11 @@ async function initDb() {
 // Usato SOLO se DATABASE_URL non è configurata (vedi sopra).
 const memoryUsers = new Map();
 
-// ---- IA: Anthropic (Claude) con Gemini come riserva ----
+// ---- IA: Gemini con Anthropic (Claude) come riserva ----
 // Le tre funzioni sotto sono usate da /api/ask, /api/overview e /api/vision.
-// getAiAnswer() prova sempre prima Claude; solo se quella chiamata fallisce
+// getAiAnswer() prova sempre prima Gemini; solo se quella chiamata fallisce
 // (credito esaurito, chiave mancante, errore del servizio, timeout) passa
-// automaticamente a Gemini, senza che l'utente se ne accorga.
+// automaticamente a Claude (Anthropic), senza che l'utente se ne accorga.
 
 // Converte i messaggi in formato Anthropic (role "user"/"assistant", content
 // stringa o array di blocchi tipo {type:"text"} / {type:"image"}) nel formato
@@ -593,8 +614,15 @@ function toGeminiContents(anthropicMessages) {
 // Chiama Claude (Anthropic). Ritorna il testo della risposta, oppure lancia
 // un errore se la chiamata fallisce per qualsiasi motivo — l'errore viene
 // intercettato da getAiAnswer() per tentare automaticamente Gemini.
-async function callAnthropic(anthropicMessages) {
+async function callAnthropic(anthropicMessages, systemPrompt, maxTokens) {
     if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY non configurata');
+
+    const requestBody = {
+        model: ANTHROPIC_MODEL,
+        max_tokens: maxTokens || 2000,
+        messages: anthropicMessages
+    };
+    if (systemPrompt) requestBody.system = systemPrompt;
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -603,11 +631,7 @@ async function callAnthropic(anthropicMessages) {
             'x-api-key': ANTHROPIC_API_KEY,
             'anthropic-version': '2023-06-01'
         },
-        body: JSON.stringify({
-            model: ANTHROPIC_MODEL,
-            max_tokens: 1000,
-            messages: anthropicMessages
-        })
+        body: JSON.stringify(requestBody)
     });
 
     if (!response.ok) {
@@ -624,17 +648,20 @@ async function callAnthropic(anthropicMessages) {
 
 // Chiama Gemini (Google) con lo stesso formato di messaggi, convertito da
 // toGeminiContents(). Usato SOLO come riserva quando Anthropic non risponde.
-async function callGemini(anthropicMessages) {
+async function callGemini(anthropicMessages, systemPrompt, maxTokens) {
     if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY non configurata');
+
+    const requestBody = {
+        contents: toGeminiContents(anthropicMessages),
+        generationConfig: { maxOutputTokens: maxTokens || 2000 }
+    };
+    if (systemPrompt) requestBody.systemInstruction = { parts: [{ text: systemPrompt }] };
 
     const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_API_KEY;
     const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            contents: toGeminiContents(anthropicMessages),
-            generationConfig: { maxOutputTokens: 1000 }
-        })
+        body: JSON.stringify(requestBody)
     });
 
     if (!response.ok) {
@@ -646,6 +673,28 @@ async function callGemini(anthropicMessages) {
     const candidate = (data.candidates && data.candidates[0]) || null;
     const parts = candidate && candidate.content && candidate.content.parts;
     return Array.isArray(parts) ? parts.map(function (p) { return p.text || ''; }).join('\n') : '';
+}
+
+// Codici di errore HTTP di Gemini considerati "transitori": quasi sempre un
+// intoppo momentaneo (modello sovraccarico, timeout lato Google) che si
+// risolve da solo in pochi secondi. Per questi vale la pena ritentare una
+// volta sola prima di arrendersi e passare a Claude come riserva — invece
+// di sprecare la riserva per un problema che si sarebbe risolto da sé.
+const TRANSIENT_GEMINI_STATUS = [429, 500, 502, 503, 504];
+
+async function callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens) {
+    try {
+        return await callGemini(anthropicMessages, systemPrompt, maxTokens);
+    } catch (err) {
+        const match = /^Gemini (\d+):/.exec(err.message || '');
+        const status = match ? parseInt(match[1], 10) : null;
+        if (status && TRANSIENT_GEMINI_STATUS.indexOf(status) !== -1) {
+            console.error('Gemini ' + status + ' (probabile intoppo momentaneo), ritento tra mezzo secondo:', err.message);
+            await new Promise(function (resolve) { setTimeout(resolve, 500); });
+            return await callGemini(anthropicMessages, systemPrompt, maxTokens);
+        }
+        throw err; // errore non transitorio (es. chiave mancante/non valida): non ha senso ritentare
+    }
 }
 
 // ---- Notifiche per il pannello admin (campanella) ----
@@ -796,29 +845,29 @@ async function runWeeklyBackupIfDue() {
     }
 }
 
-// Punto d'ingresso unico: prova prima Claude, e SOLO se fallisce passa a
-// Gemini come riserva. Ritorna { answer, provider } così i log (e volendo
-// anche il frontend) sanno sempre quale dei due ha risposto davvero. Se
-// falliscono entrambi (o nessuno dei due è configurato), lancia un errore
-// che il chiamante trasforma in una risposta 502 per l'utente.
-async function getAiAnswer(anthropicMessages) {
+// Punto d'ingresso unico: prova prima Gemini, e SOLO se fallisce passa a
+// Claude (Anthropic) come riserva. Ritorna { answer, provider } così i log
+// (e volendo anche il frontend) sanno sempre quale dei due ha risposto
+// davvero. Se falliscono entrambi (o nessuno dei due è configurato), lancia
+// un errore che il chiamante trasforma in una risposta 502 per l'utente.
+async function getAiAnswer(anthropicMessages, systemPrompt, maxTokens) {
     try {
-        const answer = await callAnthropic(anthropicMessages);
-        return { answer: answer, provider: 'anthropic' };
-    } catch (anthropicErr) {
-        console.error('Anthropic non disponibile, provo con Gemini come riserva:', anthropicErr.message);
+        const answer = await callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens);
+        return { answer: answer, provider: 'gemini' };
+    } catch (geminiErr) {
+        console.error('Gemini non disponibile, provo con Claude (Anthropic) come riserva:', geminiErr.message);
         try {
-            const answer = await callGemini(anthropicMessages);
+            const answer = await callAnthropic(anthropicMessages, systemPrompt, maxTokens);
             // Non aspettiamo questa chiamata (fire and forget): non deve mai
             // rallentare la risposta vera all'utente per colpa di una notifica.
             createNotificationThrottled(
                 'ai_fallback',
-                '⚠️ Il sito sta rispondendo con Gemini invece di Claude. Probabile credito Anthropic esaurito — controlla su console.anthropic.com.',
+                '⚠️ Il sito sta rispondendo con Claude invece di Gemini. Probabile problema con Gemini — controlla la sua disponibilità.',
                 6
             );
-            return { answer: answer, provider: 'gemini' };
-        } catch (geminiErr) {
-            console.error('Anche Gemini non disponibile:', geminiErr.message);
+            return { answer: answer, provider: 'anthropic' };
+        } catch (anthropicErr) {
+            console.error('Anche Claude (Anthropic) non disponibile:', anthropicErr.message);
             throw new Error('Nessun servizio IA disponibile al momento.');
         }
     }
@@ -951,9 +1000,13 @@ const SEARCH_CACHE_TTL_MS = 2 * 60 * 60 * 1000; // 2 ore
 // Costruisce una chiave di cache stabile per una combinazione di ricerca.
 // Query normalizzata (minuscolo, spazi ripuliti) così "Pizza " e "pizza"
 // condividono la stessa voce di cache.
-function buildSearchCacheKey(query, type, page) {
+function buildSearchCacheKey(query, type, page, safesearch, freshness, lang) {
     const normalizedQuery = (query || '').trim().toLowerCase().replace(/\s+/g, ' ');
-    return type + ':' + page + ':' + normalizedQuery;
+    // safesearch, freshness e lang fanno parte della chiave: una ricerca
+    // già in cache con un filtro diverso (sicurezza, data o LINGUA) NON
+    // deve mai essere riusata — altrimenti una ricerca inglese potrebbe
+    // ricevere risultati italiani già in cache (o viceversa).
+    return type + ':' + page + ':' + (safesearch || 'strict') + ':' + (freshness || 'any') + ':' + (lang || 'it') + ':' + normalizedQuery;
 }
 
 // Ritorna { results, source } se una voce valida (non scaduta) esiste in
@@ -1543,22 +1596,44 @@ function extractHost(url) {
     }
 }
 
-function sendJSON(res, statusCode, data) {
-    const body = JSON.stringify(data);
-    res.writeHead(statusCode, {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization'
-    });
-    res.end(body);
+// Domini del sito da cui accettiamo richieste con credenziali (cookie). Un
+// wildcard "*" non è permesso dai browser quando la richiesta include
+// credenziali (es. navigator.sendBeacon() le include sempre in automatico,
+// anche se non lo chiediamo esplicitamente) — va quindi specificato il
+// dominio esatto che ha fatto la richiesta, non "chiunque".
+const ALLOWED_ORIGINS = [
+    'https://www.ialgae.com',
+    'https://ialgae.com'
+];
+
+function corsOriginFor(req) {
+    const origin = req.headers.origin;
+    return (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) ? origin : ALLOWED_ORIGINS[0];
 }
 
 const server = http.createServer((req, res) => {
+    // "sendJSON" è definita QUI DENTRO (non a livello globale) apposta: così
+    // cattura automaticamente "req" della richiesta in corso — comprese
+    // tutte le funzioni async annidate più sotto che la richiamano — senza
+    // dover modificare ognuna delle centinaia di chiamate già presenti nel
+    // file per passargli esplicitamente "req".
+    function sendJSON(res, statusCode, data) {
+        const body = JSON.stringify(data);
+        res.writeHead(statusCode, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': corsOriginFor(req),
+            'Access-Control-Allow-Credentials': 'true',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+        });
+        res.end(body);
+    }
+
     // Richiesta preliminare CORS del browser
     if (req.method === 'OPTIONS') {
         res.writeHead(204, {
-            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Origin': corsOriginFor(req),
+            'Access-Control-Allow-Credentials': 'true',
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type, Authorization'
         });
@@ -1571,6 +1646,113 @@ const server = http.createServer((req, res) => {
     if (req.url === '/' && (req.method === 'GET' || req.method === 'HEAD')) {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
         return res.end(req.method === 'HEAD' ? undefined : 'Server iAlgae attivo. Endpoint disponibili: POST /api/ask , GET /api/suggest?q=...');
+    }
+
+    // Controllo di salute vero, per il monitoraggio esterno (es. Hyperping,
+    // UptimeRobot). A differenza di "/" (che dice solo "il server risponde"),
+    // questo controlla ANCHE se il database è raggiungibile — così, quando
+    // qualcosa non va, si capisce subito se il problema è il server (Render)
+    // o il database (Neon), senza dover indovinare.
+    if (req.url === '/api/health' && req.method === 'GET') {
+        (async function () {
+            let dbStatus = 'not_configured';
+            if (dbEnabled) {
+                try {
+                    await pool.query('SELECT 1');
+                    dbStatus = 'ok';
+                } catch (err) {
+                    dbStatus = 'error';
+                }
+            }
+            const allOk = dbStatus === 'ok' || dbStatus === 'not_configured';
+            return sendJSON(res, allOk ? 200 : 503, {
+                status: allOk ? 'ok' : 'degraded',
+                server: 'ok',
+                database: dbStatus,
+                timestamp: new Date().toISOString()
+            });
+        })();
+        return;
+    }
+
+    // Sitemap generata al volo: le pagine fisse del sito + tutti gli
+    // articoli del blog VERAMENTE pubblicati, presi in tempo reale dal
+    // database — niente da rigenerare o ricaricare manualmente ogni volta
+    // che pubblichi un articolo nuovo, è sempre aggiornata da sola.
+    // Vive qui (sul backend) invece che sul sito vero perché gli articoli
+    // sono dati dinamici — www.ialgae.com/robots.txt la referenzia da qui,
+    // un pattern esplicitamente supportato da Google per le sitemap
+    // "incrociate" tra domini diversi dello stesso proprietario.
+    if (req.url === '/sitemap.xml' && req.method === 'GET') {
+        (async function () {
+            try {
+                const SITE = 'https://www.ialgae.com';
+                function escapeXml(str) {
+                    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                }
+                function urlEntry(loc, lastmod) {
+                    return '  <url><loc>' + escapeXml(loc) + '</loc>' +
+                        (lastmod ? '<lastmod>' + lastmod + '</lastmod>' : '') +
+                        '</url>';
+                }
+
+                // Pagine fisse: solo quelle pensate per essere indicizzate
+                // (escluse admin.html, login.html, profilo.html,
+                // pagamento-completato.html, reset-password.html — già
+                // "noindex" nel loro tag <meta> — e results.html/en.results.html/
+                // 404.html, che non sono pagine di destinazione con un unico
+                // indirizzo fisso). Le prime 14 sono confermate direttamente
+                // dai file veri presenti su wePanel; le ultime 8 (versioni
+                // inglesi + donazioni/images) sono confermate a voce
+                // dall'utente, senza verifica diretta del file da parte mia.
+                const staticPages = [
+                    '/', '/blog.html', '/news.html', '/ia.html', '/piani.html',
+                    '/traduttore.html', '/travel.html', '/fai-pubblicita.html',
+                    '/come-impostare-ialgae-come-pagina-iniziale.html',
+                    '/cookie-policy.html', '/privacy.html', '/storia.html',
+                    '/chi-siamo.html', '/report-motori-di-ricerca.html', '/faq.html',
+                    '/en.html', '/images.html', '/en.images.html', '/en.news.html',
+                    '/en.travel.html', '/en.translate.html', '/en.about.html',
+                    // Pagine pubbliche del motore di ricerca (cartella /motore/):
+                    // pensate apposta per essere trovate da chi cerca "aggiungi il
+                    // tuo sito a iAlgae" o "API di ricerca iAlgae". Escluse invece
+                    // invia-sito.php, chiave-api.php e mie-pagine.php: richiedono
+                    // il login (o il codice della dashboard admin), quindi non
+                    // hanno senso come destinazione diretta da un risultato di
+                    // ricerca per chi non ha ancora fatto accesso.
+                    '/motore/webmaster.html', '/motore/api.html'
+                ];
+
+                let postEntries = [];
+                if (dbEnabled) {
+                    const result = await pool.query(
+                        "SELECT slug, updated_at, created_at FROM blog_posts WHERE published = true ORDER BY created_at DESC"
+                    );
+                    postEntries = result.rows.map(function (p) {
+                        const date = (p.updated_at || p.created_at);
+                        const lastmod = date ? new Date(date).toISOString().slice(0, 10) : null;
+                        return urlEntry(SITE + '/blog.html?post=' + encodeURIComponent(p.slug), lastmod);
+                    });
+                }
+
+                const staticEntries = staticPages.map(function (path) { return urlEntry(SITE + path, null); });
+
+                const xml =
+                    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+                    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
+                    staticEntries.join('\n') + '\n' +
+                    postEntries.join('\n') + '\n' +
+                    '</urlset>';
+
+                res.writeHead(200, { 'Content-Type': 'application/xml; charset=utf-8' });
+                return res.end(xml);
+            } catch (err) {
+                console.error('Errore generazione sitemap:', err);
+                res.writeHead(500, { 'Content-Type': 'text/plain' });
+                return res.end('Errore nella generazione della sitemap.');
+            }
+        })();
+        return;
     }
 
     // Endpoint suggerimenti di ricerca in tempo reale (proxy verso DuckDuckGo)
@@ -1586,7 +1768,16 @@ const server = http.createServer((req, res) => {
 
                 const ddgResponse = await fetch(
                     'https://duckduckgo.com/ac/?q=' + encodeURIComponent(q) + '&type=list',
-                    { headers: { 'User-Agent': 'Mozilla/5.0' } }
+                    {
+                        headers: { 'User-Agent': 'Mozilla/5.0' },
+                        // Senza un limite esplicito, Node aspetta fino a 10
+                        // secondi prima di arrendersi se DuckDuckGo non
+                        // risponde — troppo lento per una casella di ricerca
+                        // che deve sembrare istantanea. Con 2.5 secondi,
+                        // falliamo in fretta e il sito passa subito ai
+                        // suggerimenti locali di riserva.
+                        signal: AbortSignal.timeout(2500),
+                    }
                 );
 
                 if (!ddgResponse.ok) {
@@ -1776,7 +1967,7 @@ const server = http.createServer((req, res) => {
                 return sendJSON(res, 401, { error: 'not_logged_in' });
             }
             return sendJSON(res, 200, {
-                user: { email: user.email, name: user.name, picture: user.picture || null, isPro: !!user.isPro }
+                user: { email: user.email, name: user.name, picture: user.picture || null, isPro: !!user.isPro, twoFactorEnabled: !!user.totpEnabled, hasPassword: !!user.passwordHash }
             });
         })();
         return;
@@ -1832,11 +2023,12 @@ const server = http.createServer((req, res) => {
             const user = await getUserFromRequest(req);
             if (!user) return sendJSON(res, 401, { error: 'not_logged_in' });
             try {
-                const result = await pool.query('SELECT hidden_apps, custom_apps FROM users WHERE id = $1', [user.sub]);
+                const result = await pool.query('SELECT hidden_apps, custom_apps, app_order FROM users WHERE id = $1', [user.sub]);
                 const row = result.rows[0] || {};
                 return sendJSON(res, 200, {
                     hiddenApps: row.hidden_apps || [],
-                    customApps: row.custom_apps || []
+                    customApps: row.custom_apps || [],
+                    appOrder: row.app_order || []
                 });
             } catch (err) {
                 console.error('Errore /api/user/hidden-apps GET:', err);
@@ -1879,11 +2071,17 @@ const server = http.createServer((req, res) => {
                         .slice(0, 30)
                     : [];
 
+                // Ordine personalizzato: un semplice elenco di nomi app, nel
+                // nuovo ordine scelto dall'utente trascinandole.
+                const appOrder = Array.isArray(payload.appOrder)
+                    ? payload.appOrder.map(function (n) { return String(n).trim(); }).filter(Boolean).slice(0, 200)
+                    : [];
+
                 await pool.query(
-                    'UPDATE users SET hidden_apps = $1, custom_apps = $2 WHERE id = $3',
-                    [hiddenApps, JSON.stringify(customApps), user.sub]
+                    'UPDATE users SET hidden_apps = $1, custom_apps = $2, app_order = $3 WHERE id = $4',
+                    [hiddenApps, JSON.stringify(customApps), appOrder, user.sub]
                 );
-                return sendJSON(res, 200, { message: 'Preferenze salvate.', hiddenApps: hiddenApps, customApps: customApps });
+                return sendJSON(res, 200, { message: 'Preferenze salvate.', hiddenApps: hiddenApps, customApps: customApps, appOrder: appOrder });
             } catch (err) {
                 console.error('Errore /api/user/hidden-apps POST:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
@@ -2034,7 +2232,11 @@ const server = http.createServer((req, res) => {
                 if (!id || !durationMs || durationMs <= 0 || durationMs > 30 * 60 * 1000) {
                     return sendJSON(res, 200, { ok: false });
                 }
-                await pool.query('UPDATE page_views SET duration_ms = $1 WHERE id = $2', [durationMs, id]);
+                // Non scriviamo subito sul database: accumuliamo in memoria e
+                // lasciamo che sia il flush periodico (vedi più in basso nel
+                // file) a scrivere tutto insieme. Il valore più recente vince
+                // se per qualche motivo arrivasse due volte per lo stesso id.
+                pendingDurations.set(id, durationMs);
                 return sendJSON(res, 200, { ok: true });
             } catch (err) {
                 console.error('Errore tracciamento durata (non bloccante):', err.message);
@@ -2120,14 +2322,14 @@ function parseAdminDateRange(searchParams) {
                 const topCountriesResult = await pool.query(
                     'SELECT country, country_code AS "countryCode", COUNT(*)::int AS count ' +
                     'FROM page_views WHERE created_at >= $1 AND created_at <= $2 AND country IS NOT NULL ' +
-                    'GROUP BY country, country_code ORDER BY count DESC LIMIT 10',
+                    'GROUP BY country, country_code ORDER BY count DESC LIMIT 250',
                     [rangeStart, rangeEnd]
                 );
 
                 const topCitiesResult = await pool.query(
                     'SELECT city, country, country_code AS "countryCode", AVG(latitude) AS lat, AVG(longitude) AS lon, COUNT(*)::int AS count ' +
                     'FROM page_views WHERE created_at >= $1 AND created_at <= $2 AND city IS NOT NULL AND latitude IS NOT NULL ' +
-                    'GROUP BY city, country, country_code ORDER BY count DESC LIMIT 40',
+                    'GROUP BY city, country, country_code ORDER BY count DESC LIMIT 300',
                     [rangeStart, rangeEnd]
                 );
 
@@ -3877,9 +4079,23 @@ function parseAdminDateRange(searchParams) {
                 let aiResult;
                 // La cache si usa SOLO per domande singole (senza cronologia
                 // precedente): una conversazione con più messaggi è troppo
-                // specifica per essere condivisa con altri utenti.
+                // specifica per essere condivisa con altri utenti. Le risposte
+                // in inglese e in italiano vengono tenute separate in cache
+                // (altrimenti chi chiede in inglese potrebbe ricevere una
+                // risposta italiana già salvata per la stessa domanda).
+                const lang = payload.lang === 'en' ? 'en' : 'it';
+                // Avevamo provato a forzare risposte brevi (~500 caratteri)
+                // per l'assistente di ia.html/en_ia.html, ma il modello si
+                // "confondeva" con l'istruzione di brevità mentre provava a
+                // scrivere un elenco puntato, fermandosi da solo a metà frase
+                // molto prima di qualsiasi limite di token o di caratteri —
+                // quindi non era un problema risolvibile alzando i numeri.
+                // Torniamo al comportamento invariato del resto del sito:
+                // nessun vincolo di lunghezza, stesso tetto di 2000 token.
+                const systemPrompt = lang === 'en' ? 'Always answer in English, regardless of the language the question is written in.' : null;
+                const ASK_MAX_TOKENS = 2000;
                 const isCacheable = anthropicMessages.length === 1;
-                const aiCacheKey = isCacheable ? buildAiCacheKey('ask', anthropicMessages[0].content) : null;
+                const aiCacheKey = isCacheable ? buildAiCacheKey('ask-' + lang, anthropicMessages[0].content) : null;
 
                 if (isCacheable) {
                     const cached = await getCachedAiAnswer(aiCacheKey);
@@ -3889,7 +4105,7 @@ function parseAdminDateRange(searchParams) {
                 }
 
                 try {
-                    aiResult = await getAiAnswer(anthropicMessages);
+                    aiResult = await getAiAnswer(anthropicMessages, systemPrompt, ASK_MAX_TOKENS);
                 } catch (aiErr) {
                     console.error('Errore IA (ask):', aiErr.message);
                     return sendJSON(res, 502, { error: 'Errore nel contattare il servizio IA. Riprova più tardi.' });
@@ -4473,6 +4689,95 @@ function parseAdminDateRange(searchParams) {
 
     // ===== FINE BLOG =====
 
+    // ===== VOLI (Duffel) =====
+    // A differenza di Amadeus, Duffel non richiede uno scambio OAuth: il
+    // token creato nella dashboard si usa direttamente come "Bearer" in ogni
+    // chiamata, senza scadenza da gestire qui.
+
+    // Duffel manda ogni offerta con moltissimi campi tecnici (condizioni
+    // tariffarie, bagagli per segmento, servizi extra, ecc.): qui teniamo
+    // solo quello che serve a mostrare una card di volo comprensibile.
+    function simplifyDuffelOffer(offer) {
+        const slice = offer.slices[0];
+        const segments = slice.segments;
+        const firstSeg = segments[0];
+        const lastSeg = segments[segments.length - 1];
+
+        return {
+            price: offer.total_amount,
+            currency: offer.total_currency,
+            departureTime: firstSeg.departing_at,
+            arrivalTime: lastSeg.arriving_at,
+            originCode: firstSeg.origin.iata_code,
+            destinationCode: lastSeg.destination.iata_code,
+            durationIso: slice.duration, // es. "PT2H35M"
+            stops: segments.length - 1,
+            carrierCode: firstSeg.marketing_carrier.iata_code,
+            flightNumber: firstSeg.marketing_carrier.iata_code + firstSeg.marketing_carrier_flight_number
+        };
+    }
+
+    if (req.method === 'GET' && req.url.indexOf('/api/flights') === 0) {
+        (async function () {
+            try {
+                if (!DUFFEL_API_KEY) {
+                    return sendJSON(res, 503, { error: 'Ricerca voli non ancora configurata: manca DUFFEL_API_KEY su Render.' });
+                }
+
+                const fullUrl = new URL(req.url, 'http://localhost');
+                const origin = (fullUrl.searchParams.get('from') || '').trim().toUpperCase();
+                const destination = (fullUrl.searchParams.get('to') || '').trim().toUpperCase();
+                const date = (fullUrl.searchParams.get('date') || '').trim();
+                let adults = parseInt(fullUrl.searchParams.get('adults'), 10);
+                if (!adults || adults < 1) adults = 1;
+                if (adults > 9) adults = 9;
+
+                if (!origin || !destination || !date) {
+                    return sendJSON(res, 400, { error: 'Parametri mancanti: servono from, to e date (es. ?from=FCO&to=LON&date=2026-09-15).' });
+                }
+                // Duffel vuole i codici IATA dei singoli aeroporti (3 lettere),
+                // non i "codici città" a più aeroporti come LON o NYC.
+                if (!/^[A-Z]{3}$/.test(origin) || !/^[A-Z]{3}$/.test(destination)) {
+                    return sendJSON(res, 400, { error: 'from e to devono essere codici aeroporto IATA di 3 lettere (es. FCO, non LON o città per esteso).' });
+                }
+
+                const passengers = [];
+                for (let i = 0; i < adults; i++) passengers.push({ type: 'adult' });
+
+                const flightRes = await fetch(DUFFEL_BASE_URL + '/air/offer_requests?return_offers=true', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': 'Bearer ' + DUFFEL_API_KEY,
+                        'Duffel-Version': 'v2',
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        data: {
+                            slices: [{ origin: origin, destination: destination, departure_date: date }],
+                            passengers: passengers,
+                            cabin_class: 'economy'
+                        }
+                    })
+                });
+                const flightData = await flightRes.json();
+
+                if (!flightRes.ok) {
+                    const detail = (flightData.errors && flightData.errors[0] && (flightData.errors[0].message || flightData.errors[0].title)) || ('HTTP ' + flightRes.status);
+                    return sendJSON(res, flightRes.status, { error: 'Duffel: ' + detail });
+                }
+
+                const offers = ((flightData.data && flightData.data.offers) || []).slice(0, 6).map(simplifyDuffelOffer);
+                return sendJSON(res, 200, { offers: offers });
+            } catch (err) {
+                console.error('Errore /api/flights:', err);
+                return sendJSON(res, 500, { error: 'Errore nella ricerca voli. Riprova tra poco.' });
+            }
+        })();
+        return;
+    }
+    // ===== FINE VOLI =====
+
     if (req.method === 'GET' && req.url.indexOf('/api/search') === 0) {
         (async function () {
             try {
@@ -4486,6 +4791,50 @@ function parseAdminDateRange(searchParams) {
                 let type = (fullUrl.searchParams.get('type') || 'web').toLowerCase();
                 if (allowedTypes.indexOf(type) === -1) type = 'web';
 
+                // SafeSearch: distinguiamo due casi diversi apposta —
+                // 1) parametro DEL TUTTO ASSENTE dalla richiesta: vuol dire
+                //    che chi ha chiamato l'API non sa/non vuole nulla su
+                //    SafeSearch (è il caso della pagina senza-safesearch,
+                //    che non lo manda mai) → nessun filtro applicato.
+                // 2) parametro PRESENTE ma con un valore inventato/non
+                //    valido: qualcuno ha provato a specificarlo ma ha
+                //    sbagliato (o un tentativo di manomissione) → qui
+                //    restiamo prudenti e filtriamo comunque ("strict").
+                // La pagina con-safesearch manda SEMPRE un valore esplicito
+                // (anche "strict" per chi non è loggato), quindi non passa
+                // mai dal caso 1 — questa modifica non la tocca per niente.
+                const allowedSafesearch = ['off', 'moderate', 'strict'];
+                const rawSafesearch = fullUrl.searchParams.get('safesearch');
+                let safesearch;
+                if (rawSafesearch === null) {
+                    safesearch = 'off';
+                } else {
+                    safesearch = rawSafesearch.toLowerCase();
+                    if (allowedSafesearch.indexOf(safesearch) === -1) safesearch = 'strict';
+                }
+
+                // Filtro per data: stessi 4 valori che offre davvero Brave
+                // (pd=24 ore, pw=settimana, pm=mese, py=anno) — stringa vuota
+                // vuol dire "qualsiasi momento", nessun filtro.
+                const allowedFreshness = ['', 'pd', 'pw', 'pm', 'py'];
+                let freshness = (fullUrl.searchParams.get('freshness') || '').toLowerCase();
+                if (allowedFreshness.indexOf(freshness) === -1) freshness = '';
+
+                // Lingua dei risultati: il frontend la manda esplicitamente
+                // (results.html -> "it", en_results.html -> "en"). Se manca
+                // o non è tra quelle supportate, restiamo su "it" come prima
+                // per non rompere le pagine esistenti che non la mandano ancora.
+                const allowedLangs = ['it', 'en'];
+                let lang = (fullUrl.searchParams.get('lang') || 'it').toLowerCase();
+                if (allowedLangs.indexOf(lang) === -1) lang = 'it';
+                // Brave vuole codici paese/lingua separati; Serper vuole gl/hl.
+                // Per ora mappiamo 1:1 IT<->IT ed EN<->US (risultati in inglese,
+                // paese USA, la combinazione più neutra per l'inglese generico).
+                const braveCountry = (lang === 'en') ? 'gb' : 'it';
+                const braveSearchLang = lang; // 'it' o 'en', combacia già coi codici Brave
+                const serperGl = (lang === 'en') ? 'gb' : 'it';
+                const serperHl = lang;
+
                 if (!q) {
                     return sendJSON(res, 200, { results: [], totalPages: 0, page: page, type: type });
                 }
@@ -4498,7 +4847,7 @@ function parseAdminDateRange(searchParams) {
                 // Prima di chiamare Brave/Serper, controlliamo se qualcuno ha già
                 // cercato la stessa cosa di recente: se sì, rispondiamo subito da
                 // cache senza consumare quota delle API esterne.
-                const cacheKey = buildSearchCacheKey(q, type, page);
+                const cacheKey = buildSearchCacheKey(q, type, page, safesearch, freshness, lang);
                 const cached = await getCachedSearch(cacheKey);
                 if (cached) {
                     return sendJSON(res, 200, {
@@ -4532,7 +4881,8 @@ function parseAdminDateRange(searchParams) {
                 // Le Immagini di Brave non supportano la paginazione con "offset": restituiscono
                 // sempre la prima pagina di risultati, quindi la omettiamo per quel tipo.
                 const countForType = (type === 'images') ? IMAGES_COUNT : RESULTS_PER_PAGE;
-                let searchUrl = endpoints[type] + '?q=' + encodeURIComponent(q) + '&count=' + countForType + '&country=it&search_lang=it';
+                let searchUrl = endpoints[type] + '?q=' + encodeURIComponent(q) + '&count=' + countForType + '&country=' + braveCountry + '&search_lang=' + braveSearchLang + '&safesearch=' + safesearch;
+                if (freshness) searchUrl += '&freshness=' + freshness;
                 if (type !== 'images') {
                     searchUrl += '&offset=' + offset;
                 }
@@ -4616,13 +4966,26 @@ function parseAdminDateRange(searchParams) {
                 let usedFallback = false;
                 if (type === 'web' && (braveFailed || results.length === 0) && page === 1 && SERPER_API_KEY) {
                     try {
+                        // Serper mira a rispecchiare i parametri nativi di una vera
+                        // ricerca Google, che usa "safe": "active"/"off" (solo due
+                        // livelli, non tre come Brave) — quindi "strict" e "moderate"
+                        // diventano entrambi "active", solo "off" resta "off".
+                        const serperBody = { q: q, gl: serperGl, hl: serperHl };
+                        if (safesearch !== 'off') serperBody.safe = 'active';
+                        // Stesso parametro nativo di Google (tbs=qdr:X), che
+                        // Serper rispecchia direttamente — a differenza del
+                        // parametro "safe", questo è documentato con esempi
+                        // reali, non solo dedotto per analogia.
+                        const freshnessToTbs = { pd: 'qdr:d', pw: 'qdr:w', pm: 'qdr:m', py: 'qdr:y' };
+                        if (freshnessToTbs[freshness]) serperBody.tbs = freshnessToTbs[freshness];
+
                         const serperResponse = await fetch('https://google.serper.dev/search', {
                             method: 'POST',
                             headers: {
                                 'X-API-KEY': SERPER_API_KEY,
                                 'Content-Type': 'application/json'
                             },
-                            body: JSON.stringify({ q: q, gl: 'it', hl: 'it' })
+                            body: JSON.stringify(serperBody)
                         });
                         if (serperResponse.ok) {
                             const serperData = await serperResponse.json();
@@ -4772,4 +5135,32 @@ if (dbEnabled) {
                 console.error('Errore pulizia admin_notifications:', err);
             });
     }, 60 * 60 * 1000);
+
+    // Scrive sul database, tutte insieme, le durate di visita accumulate in
+    // memoria (vedi pendingDurations e /api/track/duration più sopra).
+    // Se in questi 5 minuti non è successo nulla, il buffer è vuoto e non
+    // facciamo nessuna query: è proprio questo il punto — non svegliare il
+    // database quando non c'è davvero nulla da scrivere.
+    setInterval(async function () {
+        if (pendingDurations.size === 0) return;
+
+        const ids = [];
+        const durations = [];
+        for (const [id, durationMs] of pendingDurations) {
+            ids.push(id);
+            durations.push(durationMs);
+        }
+        pendingDurations.clear();
+
+        try {
+            await pool.query(
+                'UPDATE page_views AS pv SET duration_ms = dati.durata ' +
+                'FROM (SELECT unnest($1::int[]) AS id, unnest($2::int[]) AS durata) AS dati ' +
+                'WHERE pv.id = dati.id',
+                [ids, durations]
+            );
+        } catch (err) {
+            console.error('Errore scrittura raggruppata delle durate di visita:', err.message);
+        }
+    }, 5 * 60 * 1000);
 }
