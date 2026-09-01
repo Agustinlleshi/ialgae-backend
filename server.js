@@ -1712,7 +1712,15 @@ const server = http.createServer((req, res) => {
                     '/cookie-policy.html', '/privacy.html', '/storia.html',
                     '/chi-siamo.html', '/report-motori-di-ricerca.html', '/faq.html',
                     '/en.html', '/images.html', '/en.images.html', '/en.news.html',
-                    '/en.travel.html', '/en.translate.html', '/en.about.html'
+                    '/en.travel.html', '/en.translate.html', '/en.about.html',
+                    // Pagine pubbliche del motore di ricerca (cartella /motore/):
+                    // pensate apposta per essere trovate da chi cerca "aggiungi il
+                    // tuo sito a iAlgae" o "API di ricerca iAlgae". Escluse invece
+                    // invia-sito.php, chiave-api.php e mie-pagine.php: richiedono
+                    // il login (o il codice della dashboard admin), quindi non
+                    // hanno senso come destinazione diretta da un risultato di
+                    // ricerca per chi non ha ancora fatto accesso.
+                    '/motore/webmaster.html', '/motore/api.html'
                 ];
 
                 let postEntries = [];
