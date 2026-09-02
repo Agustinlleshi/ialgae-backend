@@ -1766,28 +1766,55 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 200, { suggestions: [] });
                 }
 
-                const ddgResponse = await fetch(
-                    'https://duckduckgo.com/ac/?q=' + encodeURIComponent(q) + '&type=list',
-                    {
-                        headers: { 'User-Agent': 'Mozilla/5.0' },
-                        // Senza un limite esplicito, Node aspetta fino a 10
-                        // secondi prima di arrendersi se DuckDuckGo non
-                        // risponde — troppo lento per una casella di ricerca
-                        // che deve sembrare istantanea. Con 2.5 secondi,
-                        // falliamo in fretta e il sito passa subito ai
-                        // suggerimenti locali di riserva.
-                        signal: AbortSignal.timeout(2500),
-                    }
-                );
+                // Tre servizi diversi di suggerimenti, interrogati TUTTI E TRE
+                // NELLO STESSO ISTANTE (in parallelo) — non uno dopo l'altro.
+                // Usiamo la prima risposta valida che arriva, qualunque sia;
+                // le altre vengono semplicemente ignorate quando arrivano.
+                // Così, se una fonte è irraggiungibile (es. bloccata da
+                // Render), non rallenta le altre: nel peggiore dei casi
+                // aspettiamo solo il limite di tempo qui sotto, una volta
+                // sola, non una volta per ogni fonte.
+                // Tutti e tre restituiscono lo stesso formato di risposta
+                // (stile "OpenSearch"): ["query", ["suggerimento1", ...]]
+                const fontiSuggerimenti = [
+                    { nome: 'DuckDuckGo', url: 'https://duckduckgo.com/ac/?q=' + encodeURIComponent(q) + '&type=list' },
+                    { nome: 'Google', url: 'https://suggestqueries.google.com/complete/search?client=firefox&q=' + encodeURIComponent(q) },
+                    { nome: 'Bing', url: 'https://api.bing.com/osjson.aspx?query=' + encodeURIComponent(q) },
+                ];
 
-                if (!ddgResponse.ok) {
-                    return sendJSON(res, 200, { suggestions: [] });
+                // Limite di tempo TOTALE per l'intero gruppo, non per singola
+                // fonte: 600 millesimi di secondo è già oltre il tempo di
+                // andata/ritorno tipico di una richiesta internet reale (che
+                // di solito è tra 50 e 300 millesimi) — scendere sotto
+                // questo valore farebbe fallire anche le fonti che
+                // funzionano normalmente, vanificando il motivo per cui le
+                // abbiamo aggiunte.
+                const LIMITE_TOTALE_MS = 600;
+
+                async function interrogaFonte(fonte) {
+                    const risposta = await fetch(fonte.url, {
+                        headers: { 'User-Agent': 'Mozilla/5.0' },
+                        signal: AbortSignal.timeout(LIMITE_TOTALE_MS),
+                    });
+                    if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
+                    const dati = await risposta.json();
+                    const suggerimenti = Array.isArray(dati) && Array.isArray(dati[1]) ? dati[1] : [];
+                    if (suggerimenti.length === 0) throw new Error('nessun suggerimento');
+                    return { suggerimenti, fonte: fonte.nome };
                 }
 
-                const data = await ddgResponse.json();
-                const suggestions = Array.isArray(data) && Array.isArray(data[1]) ? data[1] : [];
-
-                return sendJSON(res, 200, { suggestions: suggestions });
+                try {
+                    // Promise.any: aspetta solo la PRIMA che va a buon fine
+                    // tra le tre, ignorando le altre. Se falliscono TUTTE,
+                    // lancia un errore e cadiamo nel catch qui sotto.
+                    const risultato = await Promise.any(fontiSuggerimenti.map(interrogaFonte));
+                    return sendJSON(res, 200, { suggestions: risultato.suggerimenti, fonte: risultato.fonte });
+                } catch (tutteFallite) {
+                    // Nessuna delle tre fonti ha risposto in tempo: il sito
+                    // userà da solo i suggerimenti locali di riserva già
+                    // previsti lato frontend.
+                    return sendJSON(res, 200, { suggestions: [] });
+                }
 
             } catch (err) {
                 console.error('Errore suggerimenti:', err);
