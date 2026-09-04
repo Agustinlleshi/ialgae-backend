@@ -2016,6 +2016,35 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // ------------------------------------------------------------
+    // TILE DELLA MAPPA (Mapbox se sotto soglia, altrimenti il nostro
+    // stile OpenFreeMap gratuito di sempre)
+    // ------------------------------------------------------------
+    // NOTA: usando MapLibre (gratis) invece della libreria ufficiale di
+    // Mapbox, il LORO contatore "Caricamenti mappa" (quello delle notifiche
+    // email che hai impostato) potrebbe non essere del tutto preciso — quel
+    // numero lo registra il loro SDK ufficiale, che qui non usiamo. Non
+    // cambia nulla per la sicurezza vera: il blocco reale lo decidiamo noi,
+    // qui sotto, in autonomia.
+    const SOGLIA_MAPBOX_TILES = 25000; // metà dei 50.000 caricamenti gratuiti/mese
+
+    if (req.method === 'GET' && req.url.indexOf('/api/maps/tile-style') === 0) {
+        (async function () {
+            try {
+                const usaMapbox = await permessoUsoMapbox('tiles', SOGLIA_MAPBOX_TILES);
+                if (usaMapbox) {
+                    const styleUrl = 'https://api.mapbox.com/styles/v1/mapbox/streets-v12?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN);
+                    return sendJSON(res, 200, { usaMapbox: true, styleUrl: styleUrl });
+                }
+                return sendJSON(res, 200, { usaMapbox: false });
+            } catch (err) {
+                console.error('Errore scelta stile mappa:', err);
+                return sendJSON(res, 200, { usaMapbox: false });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/suggest') === 0) {
         (async function () {
             try {
