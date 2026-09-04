@@ -111,6 +111,12 @@ const DUFFEL_BASE_URL = 'https://api.duffel.com';
 // resto del sito): serve solo per la pagina test-serper.html, per
 // verificare come sarebbero i risultati usando Serper invece di Brave.
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
+
+// Token pubblico Mapbox (pk.xxx), usato per geocodifica/indicazioni/mappa/
+// ricerca POI quando siamo sotto la soglia mensile gratuita — vedi la
+// sezione "CONTATORE USO MAPBOX" più sotto per il perché e il come.
+const MAPBOX_ACCESS_TOKEN = process.env.MAPBOX_ACCESS_TOKEN || '';
+
 // Chiave segreta per proteggere le statistiche interne (es. iscrizioni
 // giornaliere). Impostala su Render come stringa lunga e casuale, inventata
 // da te: chi non la conosce non può vedere i dati statistici del sito.
@@ -523,6 +529,52 @@ async function initDb() {
     );
     await pool.query('CREATE INDEX IF NOT EXISTS idx_ai_response_cache_created ON ai_response_cache (created_at)');
 
+    // ---- ANNUNCI PUBBLICITARI SELF-SERVICE (ads.html) ----
+    // L'utente compila i dati del suo annuncio e sceglie liberamente quanto
+    // pagare; noi creiamo subito una riga con status 'pending_payment'. Solo
+    // quando Stripe conferma il pagamento (via webhook, mai fidandosi del
+    // browser) passiamo a 'paid' — a quel punto compare nella dashboard admin
+    // ("Annunci" -> "In attesa"), da dove l'admin lo inserisce a mano nei
+    // risultati di ricerca e lo segna come 'inserted'.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS ads (' +
+        '  id SERIAL PRIMARY KEY,' +
+        '  full_name TEXT NOT NULL,' +
+        '  company TEXT,' +
+        '  email TEXT NOT NULL,' +
+        '  ad_title TEXT NOT NULL,' +
+        '  ad_description TEXT,' +
+        '  ad_url TEXT NOT NULL,' +
+        '  amount_cents INTEGER NOT NULL,' +
+        '  currency TEXT NOT NULL DEFAULT \'eur\',' +
+        '  status TEXT NOT NULL DEFAULT \'pending_payment\',' + // pending_payment | paid | inserted | cancelled
+        '  stripe_session_id TEXT,' +
+        '  stripe_payment_intent TEXT,' +
+        '  admin_note TEXT,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),' +
+        '  paid_at TIMESTAMPTZ,' +
+        '  inserted_at TIMESTAMPTZ' +
+        ')'
+    );
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_ads_status ON ads (status)');
+
+    // ---- CONTATORE USO MAPBOX ----
+    // Mapbox NON offre un tetto di spesa configurabile (l'abbiamo verificato:
+    // superata la soglia gratuita, fattura normalmente e basta). Per non
+    // rischiare mai un addebito, contiamo QUI, noi, quante richieste facciamo
+    // ogni mese per ciascun servizio (geocodifica, indicazioni, mappa, POI) e
+    // ci fermiamo DA SOLI un po' prima della soglia gratuita reale, passando
+    // silenziosamente al servizio gratuito equivalente (Nominatim/OSRM/
+    // OpenFreeMap/Overpass) per il resto del mese — vedi ottieniEIncrementaContatoreMapbox().
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS uso_mapbox (' +
+        '  servizio TEXT NOT NULL,' +
+        '  anno_mese TEXT NOT NULL,' + // es. "2026-09"
+        '  conteggio INTEGER NOT NULL DEFAULT 0,' +
+        '  PRIMARY KEY (servizio, anno_mese)' +
+        ')'
+    );
+
     // Blog: articoli scritti in markdown, con stato bozza/pubblicato.
     // "slug" è la versione URL-friendly del titolo (es. "la-mia-storia"),
     // usata nell'indirizzo della pagina dell'articolo.
@@ -577,6 +629,51 @@ async function initDb() {
     );
 
     console.log('Database pronto (tabella users verificata/creata).');
+}
+
+// ------------------------------------------------------------
+// CONTATORE USO MAPBOX — decide se questa richiesta può usare Mapbox
+// (sotto la soglia che ci siamo dati noi) oppure deve ripiegare sul
+// servizio gratuito equivalente. La query è scritta apposta per essere
+// ATOMICA: anche con tante richieste arrivate insieme, non si supera mai
+// la soglia per colpa di controlli "letti" in un momento e "scritti" un
+// attimo dopo (race condition classica dei contatori).
+//
+// Se il database non è configurato (DATABASE_URL assente), non possiamo
+// contare in modo affidabile e condiviso: per prudenza, in quel caso NON
+// usiamo mai Mapbox — meglio restare sul gratuito che rischiare un uso
+// scoordinato e potenzialmente costoso.
+// ------------------------------------------------------------
+async function permessoUsoMapbox(servizio, sogliaMassima) {
+    if (!MAPBOX_ACCESS_TOKEN || !dbEnabled) return false;
+
+    const oggi = new Date();
+    const annoMese = oggi.getFullYear() + '-' + String(oggi.getMonth() + 1).padStart(2, '0');
+
+    try {
+        const result = await pool.query(
+            'INSERT INTO uso_mapbox (servizio, anno_mese, conteggio) VALUES ($1, $2, 1) ' +
+            'ON CONFLICT (servizio, anno_mese) DO UPDATE SET conteggio = uso_mapbox.conteggio + 1 ' +
+            'WHERE uso_mapbox.conteggio < $3 ' +
+            'RETURNING conteggio',
+            [servizio, annoMese, sogliaMassima]
+        );
+        if (result.rows.length > 0) return true; // richiesta autorizzata e già conteggiata
+
+        // Soglia raggiunta: avvisiamo in dashboard (non via email — quella la
+        // manda Mapbox stessa se hai configurato le notifiche di utilizzo).
+        // Throttled a 24 ore: una volta al giorno basta e avanza, non serve
+        // un avviso per OGNI singola richiesta bloccata da qui in poi.
+        await createNotificationThrottled(
+            'mapbox_limite',
+            '⚠️ Mapbox "' + servizio + '": raggiunta la soglia di sicurezza (' + sogliaMassima + '/mese). Passato automaticamente al servizio gratuito per il resto del mese.',
+            24
+        );
+        return false;
+    } catch (err) {
+        console.error('Errore contatore uso Mapbox:', err);
+        return false; // in caso di dubbio, meglio il gratuito
+    }
 }
 
 // Usato SOLO se DATABASE_URL non è configurata (vedi sopra).
@@ -1707,7 +1804,7 @@ const server = http.createServer((req, res) => {
                 // dall'utente, senza verifica diretta del file da parte mia.
                 const staticPages = [
                     '/', '/blog.html', '/news.html', '/ia.html', '/piani.html',
-                    '/traduttore.html', '/travel.html', '/fai-pubblicita.html',
+                    '/traduttore.html', '/travel.html', '/ads.html',
                     '/come-impostare-ialgae-come-pagina-iniziale.html',
                     '/cookie-policy.html', '/privacy.html', '/storia.html',
                     '/chi-siamo.html', '/report-motori-di-ricerca.html', '/faq.html',
@@ -1756,6 +1853,76 @@ const server = http.createServer((req, res) => {
     }
 
     // Endpoint suggerimenti di ricerca in tempo reale (proxy verso DuckDuckGo)
+    // ------------------------------------------------------------
+    // GEOCODIFICA (Mapbox se sotto soglia, altrimenti Nominatim in automatico)
+    // ------------------------------------------------------------
+    // Soglia auto-imposta VOLUTAMENTE prudente: ci fermiamo a 50.000, cioè a
+    // METÀ della soglia gratuita reale di Mapbox (100.000/mese), non al
+    // massimo consentito. Il motivo: se Mapbox in futuro abbassasse la
+    // soglia gratuita senza che ce ne accorgiamo, un margine così ampio ci
+    // protegge comunque da un addebito a sorpresa — molto meglio usare un
+    // po' meno Mapbox (e un po' più il ripiego gratuito) che rischiare.
+    const SOGLIA_MAPBOX_GEOCODING = 50000;
+
+    if (req.method === 'GET' && req.url.indexOf('/api/maps/geocode') === 0) {
+        (async function () {
+            try {
+                const fullUrl = new URL(req.url, 'http://localhost');
+                const q = (fullUrl.searchParams.get('q') || '').trim();
+                if (!q) return sendJSON(res, 200, { risultati: [], fonte: null });
+
+                const usaMapbox = await permessoUsoMapbox('geocoding', SOGLIA_MAPBOX_GEOCODING);
+
+                if (usaMapbox) {
+                    try {
+                        const url = 'https://api.mapbox.com/geocoding/v5/mapbox.places/' + encodeURIComponent(q) + '.json' +
+                            '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) + '&limit=5&language=it';
+                        const risposta = await fetch(url, { signal: AbortSignal.timeout(8000) });
+                        if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
+                        const dati = await risposta.json();
+                        const risultati = (dati.features || []).map(function (f) {
+                            return {
+                                lat: f.center[1],
+                                lon: f.center[0],
+                                display_name: f.place_name,
+                                boundingbox: f.bbox ? [f.bbox[1], f.bbox[3], f.bbox[0], f.bbox[2]] : null,
+                                importance: typeof f.relevance === 'number' ? f.relevance : 0.5
+                            };
+                        });
+                        return sendJSON(res, 200, { risultati: risultati, fonte: 'mapbox' });
+                    } catch (erroreMapbox) {
+                        console.error('Geocodifica Mapbox fallita, ripiego su Nominatim:', erroreMapbox.message);
+                        // continua sotto: nessun return, cade nel ramo Nominatim
+                    }
+                }
+
+                // Ripiego gratuito: stessa identica logica usata prima
+                // direttamente dal browser, solo spostata sul server.
+                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&q=' + encodeURIComponent(q);
+                const rispostaNominatim = await fetch(urlNominatim, {
+                    headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
+                    signal: AbortSignal.timeout(10000)
+                });
+                const datiNominatim = await rispostaNominatim.json();
+                const risultatiNominatim = (Array.isArray(datiNominatim) ? datiNominatim : []).map(function (r) {
+                    return {
+                        lat: parseFloat(r.lat),
+                        lon: parseFloat(r.lon),
+                        display_name: r.display_name,
+                        boundingbox: r.boundingbox ? r.boundingbox.map(Number) : null,
+                        importance: typeof r.importance === 'number' ? r.importance : 0.5
+                    };
+                });
+                return sendJSON(res, 200, { risultati: risultatiNominatim, fonte: 'nominatim' });
+
+            } catch (err) {
+                console.error('Errore geocodifica:', err);
+                return sendJSON(res, 500, { risultati: [], fonte: null, error: 'Servizio di geocodifica non raggiungibile.' });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/suggest') === 0) {
         (async function () {
             try {
@@ -2876,6 +3043,135 @@ function parseAdminDateRange(searchParams) {
         return;
     }
 
+    // ---- ANNUNCI PUBBLICITARI: gestione admin ----
+    // Elenco annunci per la dashboard (scheda "Annunci"). Filtro facoltativo
+    // per stato (?status=paid per vedere solo quelli in attesa di inserimento).
+    // Mostra i consumi Mapbox del mese corrente per ogni servizio, così puoi
+    // controllare a colpo d'occhio senza guardare il database a mano.
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/mapbox-usage') === 0) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                const parsedUrl = new URL(req.url, 'http://localhost');
+                if ((parsedUrl.searchParams.get('secret') || '') !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+                if (!dbEnabled) return sendJSON(res, 200, { righe: [], nota: 'Database non configurato: il contatore non è attivo, Mapbox non viene mai usato.' });
+
+                const oggi = new Date();
+                const annoMese = oggi.getFullYear() + '-' + String(oggi.getMonth() + 1).padStart(2, '0');
+                const result = await pool.query('SELECT servizio, conteggio FROM uso_mapbox WHERE anno_mese = $1 ORDER BY servizio', [annoMese]);
+                return sendJSON(res, 200, { mese: annoMese, righe: result.rows });
+            } catch (err) {
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    if (req.method === 'GET' && req.url.indexOf('/api/admin/ads') === 0 && req.url.indexOf('/mark-inserted') === -1 && req.url.indexOf('/cancel') === -1) {
+        (async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                const parsedUrl = new URL(req.url, 'http://localhost');
+                const secret = parsedUrl.searchParams.get('secret') || '';
+                if (secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+                const statusFilter = parsedUrl.searchParams.get('status'); // paid | inserted | pending_payment | cancelled | (assente = tutti tranne pending_payment)
+
+                let query = 'SELECT * FROM ads';
+                const params = [];
+                if (statusFilter) {
+                    params.push(statusFilter);
+                    query += ' WHERE status = $1';
+                } else {
+                    // Di default nascondiamo i "pending_payment" (utenti che hanno
+                    // iniziato a compilare il form ma non hanno mai pagato): non
+                    // sono azionabili e affollerebbero solo la dashboard.
+                    query += " WHERE status != 'pending_payment'";
+                }
+                query += ' ORDER BY created_at DESC LIMIT 200';
+
+                const result = await pool.query(query, params);
+                return sendJSON(res, 200, { ads: result.rows });
+            } catch (err) {
+                console.error('Errore lettura annunci:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Segna un annuncio come "inserito" (l'admin lo ha messo a mano nei
+    // risultati di ricerca tramite il motore PHP).
+    if (req.method === 'POST' && req.url === '/api/admin/ads/mark-inserted') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+                if (payload.secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+                const id = parseInt(payload.id, 10);
+                if (!id) return sendJSON(res, 400, { error: 'ID annuncio mancante.' });
+
+                await pool.query("UPDATE ads SET status = 'inserted', inserted_at = now() WHERE id = $1", [id]);
+                return sendJSON(res, 200, { ok: true });
+            } catch (err) {
+                console.error('Errore aggiornamento annuncio:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
+    // Annulla un annuncio pagato (es. contenuto non adatto): resta comunque
+    // nello storico con stato "cancelled", non lo cancelliamo dal database.
+    if (req.method === 'POST' && req.url === '/api/admin/ads/cancel') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!ADMIN_SECRET) {
+                    return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
+                }
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+                if (payload.secret !== ADMIN_SECRET) {
+                    return sendJSON(res, 401, { error: 'Password errata.' });
+                }
+                const id = parseInt(payload.id, 10);
+                if (!id) return sendJSON(res, 400, { error: 'ID annuncio mancante.' });
+
+                await pool.query(
+                    "UPDATE ads SET status = 'cancelled', admin_note = $2 WHERE id = $1",
+                    [id, (payload.note || '').trim() || null]
+                );
+                return sendJSON(res, 200, { ok: true });
+            } catch (err) {
+                console.error('Errore annullamento annuncio:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/admin/notifications') === 0 && req.url.indexOf('/mark-read') === -1) {
         (async function () {
             try {
@@ -3895,6 +4191,92 @@ function parseAdminDateRange(searchParams) {
         return;
     }
 
+    // Crea una sessione di pagamento Stripe per un ANNUNCIO PUBBLICITARIO
+    // self-service (ads.html). A differenza degli abbonamenti Pro,
+    // qui: 1) non serve un account/login, 2) l'importo lo decide liberamente
+    // l'utente (con un minimo), 3) salviamo subito i dati dell'annuncio nel
+    // database con status 'pending_payment' — diventerà 'paid' solo quando
+    // Stripe conferma davvero il pagamento (vedi il webhook più sotto).
+    const AD_MIN_AMOUNT_EUR = 5;
+    if (req.method === 'POST' && req.url === '/api/ads/create-checkout-session') {
+        let body = '';
+        req.on('data', function (chunk) { body += chunk; });
+        req.on('end', async function () {
+            try {
+                if (!stripe) {
+                    return sendJSON(res, 500, { error: 'Pagamenti non configurati sul server (STRIPE_SECRET_KEY mancante).' });
+                }
+                if (!dbEnabled) {
+                    return sendJSON(res, 500, { error: 'Database non configurato sul server (DATABASE_URL mancante).' });
+                }
+
+                let payload;
+                try {
+                    payload = JSON.parse(body || '{}');
+                } catch (parseErr) {
+                    return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                }
+
+                const fullName = (payload.fullName || '').trim();
+                const company = (payload.company || '').trim();
+                const email = (payload.email || '').trim();
+                const adTitle = (payload.adTitle || '').trim();
+                const adDescription = (payload.adDescription || '').trim();
+                let adUrl = (payload.adUrl || '').trim();
+                const amountEur = Number(payload.amountEur);
+
+                if (!fullName || !email || !adTitle || !adUrl) {
+                    return sendJSON(res, 400, { error: 'Compila nome, email, titolo annuncio e link di destinazione.' });
+                }
+                if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                    return sendJSON(res, 400, { error: 'Email non valida.' });
+                }
+                if (!/^https?:\/\//i.test(adUrl)) adUrl = 'https://' + adUrl;
+                if (!Number.isFinite(amountEur) || amountEur < AD_MIN_AMOUNT_EUR) {
+                    return sendJSON(res, 400, { error: 'Importo minimo: ' + AD_MIN_AMOUNT_EUR + '€.' });
+                }
+                const amountCents = Math.round(amountEur * 100);
+
+                const insertResult = await pool.query(
+                    'INSERT INTO ads (full_name, company, email, ad_title, ad_description, ad_url, amount_cents, currency) ' +
+                    'VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id',
+                    [fullName, company || null, email, adTitle, adDescription || null, adUrl, amountCents, 'eur']
+                );
+                const adId = insertResult.rows[0].id;
+
+                const session = await stripe.checkout.sessions.create({
+                    mode: 'payment',
+                    payment_method_types: ['card'],
+                    line_items: [{
+                        price_data: {
+                            currency: 'eur',
+                            unit_amount: amountCents,
+                            product_data: {
+                                name: 'Annuncio su iAlgae — ' + adTitle,
+                                description: 'Annuncio nei risultati di ricerca di iAlgae'
+                            }
+                        },
+                        quantity: 1
+                    }],
+                    customer_email: email,
+                    client_reference_id: 'ad_' + adId,
+                    metadata: { adId: String(adId) },
+                    success_url: SITE_BASE_URL + '/ads.html?pagamento=ok',
+                    cancel_url: SITE_BASE_URL + '/ads.html?pagamento=annullato'
+                });
+
+                await pool.query('UPDATE ads SET stripe_session_id = $1 WHERE id = $2', [session.id, adId]);
+
+                return sendJSON(res, 200, { url: session.url });
+
+            } catch (err) {
+                console.error('Errore creazione sessione Stripe (annuncio):', err);
+                return sendJSON(res, 500, { error: 'Impossibile avviare il pagamento in questo momento.' });
+            }
+        });
+        return;
+    }
+
     // Apre il Customer Portal di Stripe: da lì l'utente può vedere fatture,
     // aggiornare il metodo di pagamento, o annullare/declassare da solo il
     // proprio abbonamento, senza bisogno di contattarci.
@@ -3970,6 +4352,28 @@ function parseAdminDateRange(searchParams) {
 
             if (event.type === 'checkout.session.completed') {
                 const session = event.data.object;
+
+                // Ramo ANNUNCI: riconoscibile dal metadata.adId che mettiamo
+                // noi in fase di creazione della sessione (vedi endpoint
+                // /api/ads/create-checkout-session sopra). Separato dal ramo
+                // abbonamenti Pro sotto, che invece riguarda gli utenti loggati.
+                if (session.metadata && session.metadata.adId) {
+                    const adId = parseInt(session.metadata.adId, 10);
+                    try {
+                        await pool.query(
+                            "UPDATE ads SET status = 'paid', paid_at = now(), stripe_payment_intent = $1 " +
+                            "WHERE id = $2 AND status = 'pending_payment'",
+                            [session.payment_intent || null, adId]
+                        );
+                        await createNotification('ad_payment', '💳 Nuovo annuncio pagato, in attesa di essere inserito (#' + adId + ').');
+                        console.log('Annuncio pagato:', adId);
+                    } catch (adErr) {
+                        console.error('Errore aggiornamento annuncio pagato:', adErr);
+                    }
+                    res.writeHead(200);
+                    return res.end();
+                }
+
                 let user = null;
                 if (session.client_reference_id) {
                     user = await getUserById(session.client_reference_id);
