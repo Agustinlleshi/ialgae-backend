@@ -1923,6 +1923,99 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // ------------------------------------------------------------
+    // INDICAZIONI STRADALI (Mapbox se sotto soglia, altrimenti OSRM in automatico)
+    // ------------------------------------------------------------
+    // Stessa identica filosofia prudente della geocodifica: soglia a metà
+    // di quella reale di Mapbox (100.000/mese), non al massimo.
+    const SOGLIA_MAPBOX_DIRECTIONS = 50000;
+
+    // Riporta la risposta di Mapbox e quella di OSRM alla STESSA identica
+    // forma, indipendentemente da chi ha risposto: così il resto del sito
+    // (e il browser dell'utente) non deve sapere qual è stato usato.
+    // Un dettaglio importante: Mapbox fornisce già una frase pronta per ogni
+    // manovra ("istruzione_pronta"); OSRM no — in quel caso il browser userà
+    // la sua funzione che traduce tipo+modificatore in una frase (già
+    // costruita e testata), usando gli stessi identici campi "maneuver" che
+    // forniamo qui per entrambe le fonti.
+    function normalizzaPercorso(route, fonte) {
+        return {
+            fonte: fonte,
+            distanza: route.distance,
+            durata: route.duration,
+            coordinate: route.geometry.coordinates.map(function (c) { return [c[1], c[0]]; }),
+            passi: (route.legs && route.legs[0] && route.legs[0].steps ? route.legs[0].steps : []).map(function (s) {
+                return {
+                    distanza: s.distance,
+                    nome_via: s.name || '',
+                    maneuver: {
+                        type: s.maneuver.type,
+                        modifier: s.maneuver.modifier || null,
+                        exit: s.maneuver.exit || null,
+                        location: s.maneuver.location // [lon, lat]
+                    },
+                    istruzione_pronta: (fonte === 'mapbox' && s.maneuver.instruction) ? s.maneuver.instruction : null
+                };
+            })
+        };
+    }
+
+    if (req.method === 'GET' && req.url.indexOf('/api/maps/directions') === 0) {
+        (async function () {
+            try {
+                const fullUrl = new URL(req.url, 'http://localhost');
+                const fromLat = parseFloat(fullUrl.searchParams.get('fromLat'));
+                const fromLon = parseFloat(fullUrl.searchParams.get('fromLon'));
+                const toLat = parseFloat(fullUrl.searchParams.get('toLat'));
+                const toLon = parseFloat(fullUrl.searchParams.get('toLon'));
+                const travelMode = fullUrl.searchParams.get('profile') || 'driving';
+
+                if (![fromLat, fromLon, toLat, toLon].every(Number.isFinite)) {
+                    return sendJSON(res, 400, { error: 'Coordinate di partenza/arrivo mancanti o non valide.', fonte: null });
+                }
+
+                const usaMapbox = await permessoUsoMapbox('directions', SOGLIA_MAPBOX_DIRECTIONS);
+
+                if (usaMapbox) {
+                    try {
+                        const mapboxProfile = travelMode === 'walking' ? 'walking' : (travelMode === 'cycling' ? 'cycling' : 'driving');
+                        const url = 'https://api.mapbox.com/directions/v5/mapbox/' + mapboxProfile + '/' +
+                            fromLon + ',' + fromLat + ';' + toLon + ',' + toLat +
+                            '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) +
+                            '&geometries=geojson&steps=true&overview=full&language=it';
+                        const risposta = await fetch(url, { signal: AbortSignal.timeout(10000) });
+                        if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
+                        const dati = await risposta.json();
+                        if (!dati.routes || dati.routes.length === 0) throw new Error('Mapbox: nessun percorso trovato');
+                        return sendJSON(res, 200, normalizzaPercorso(dati.routes[0], 'mapbox'));
+                    } catch (erroreMapbox) {
+                        console.error('Indicazioni Mapbox fallite, ripiego su OSRM:', erroreMapbox.message);
+                        // continua sotto: nessun return, cade nel ramo OSRM
+                    }
+                }
+
+                // Ripiego gratuito: stessa identica logica usata prima
+                // direttamente dal browser, solo spostata sul server.
+                const routedPrefix = travelMode === 'walking' ? 'routed-foot' : (travelMode === 'cycling' ? 'routed-bike' : 'routed-car');
+                const osrmProfile = travelMode === 'walking' ? 'foot' : (travelMode === 'cycling' ? 'bike' : 'driving');
+                const osrmUrl = 'https://routing.openstreetmap.de/' + routedPrefix + '/route/v1/' + osrmProfile + '/' +
+                    fromLon + ',' + fromLat + ';' + toLon + ',' + toLat +
+                    '?overview=full&geometries=geojson&steps=true';
+                const rispostaOsrm = await fetch(osrmUrl, { signal: AbortSignal.timeout(12000) });
+                const datiOsrm = await rispostaOsrm.json();
+                if (!datiOsrm.routes || datiOsrm.routes.length === 0) {
+                    return sendJSON(res, 200, { error: 'Nessun percorso trovato tra questi due punti.', fonte: null });
+                }
+                return sendJSON(res, 200, normalizzaPercorso(datiOsrm.routes[0], 'osrm'));
+
+            } catch (err) {
+                console.error('Errore indicazioni stradali:', err);
+                return sendJSON(res, 500, { error: 'Servizio di indicazioni stradali non raggiungibile.', fonte: null });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/suggest') === 0) {
         (async function () {
             try {
