@@ -2084,6 +2084,77 @@ const server = http.createServer((req, res) => {
         return style;
     }
 
+    // ------------------------------------------------------------
+    // GEOCODIFICA INVERSA ("cosa c'è in questo punto della mappa?"):
+    // usata quando l'utente clicca un punto sulla mappa Standard e vogliamo
+    // mostrargli nome + indirizzo, senza dover indovinare i nomi interni dei
+    // livelli grafici di chi fornisce la mappa (cambiano da stile a stile e
+    // non finiscono mai di sorprendere). Stessa soglia/contatore della
+    // geocodifica normale, perché è la stessa famiglia di servizio Mapbox.
+    if (req.method === 'GET' && req.url.indexOf('/api/maps/reverse-geocode') === 0) {
+        (async function () {
+            try {
+                const fullUrl = new URL(req.url, 'http://localhost');
+                const lat = parseFloat(fullUrl.searchParams.get('lat'));
+                const lon = parseFloat(fullUrl.searchParams.get('lon'));
+                if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+                    return sendJSON(res, 400, { error: 'Coordinate mancanti o non valide.', fonte: null });
+                }
+
+                const usaMapbox = await permessoUsoMapbox('geocoding', SOGLIA_MAPBOX_GEOCODING);
+
+                if (usaMapbox) {
+                    try {
+                        const url = 'https://api.mapbox.com/geocoding/v5/mapbox.places/' + lon + ',' + lat + '.json' +
+                            '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) + '&types=poi,address&language=it';
+                        const risposta = await fetch(url, { signal: AbortSignal.timeout(8000) });
+                        if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
+                        const dati = await risposta.json();
+                        const primo = (dati.features || [])[0];
+                        if (primo) {
+                            return sendJSON(res, 200, {
+                                fonte: 'mapbox',
+                                nome: primo.text || primo.place_name,
+                                indirizzo: primo.place_name,
+                                categoria: (primo.properties && primo.properties.category) || null,
+                                lat: primo.center ? primo.center[1] : lat,
+                                lon: primo.center ? primo.center[0] : lon
+                            });
+                        }
+                    } catch (erroreMapbox) {
+                        console.error('Geocodifica inversa Mapbox fallita, ripiego su Nominatim:', erroreMapbox.message);
+                    }
+                }
+
+                const urlNominatim = 'https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lon + '&zoom=18&addressdetails=1';
+                const rispostaNominatim = await fetch(urlNominatim, {
+                    headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
+                    signal: AbortSignal.timeout(10000)
+                });
+                const datiNominatim = await rispostaNominatim.json();
+                if (!datiNominatim || datiNominatim.error) {
+                    return sendJSON(res, 200, { fonte: null, nome: null, indirizzo: null });
+                }
+                const nomeBreve = (datiNominatim.name) ||
+                    (datiNominatim.address && (datiNominatim.address.amenity || datiNominatim.address.shop || datiNominatim.address.tourism)) ||
+                    null;
+                return sendJSON(res, 200, {
+                    fonte: 'nominatim',
+                    nome: nomeBreve,
+                    indirizzo: datiNominatim.display_name,
+                    categoria: null,
+                    lat: parseFloat(datiNominatim.lat) || lat,
+                    lon: parseFloat(datiNominatim.lon) || lon
+                });
+
+            } catch (err) {
+                console.error('Errore geocodifica inversa:', err);
+                return sendJSON(res, 500, { error: 'Servizio non raggiungibile.', fonte: null });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/maps/tile-style') === 0) {
         (async function () {
             try {
