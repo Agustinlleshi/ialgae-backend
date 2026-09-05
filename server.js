@@ -2103,22 +2103,10 @@ const server = http.createServer((req, res) => {
                         // qui rifiuta con un errore ("unknown property") perché il
                         // suo validatore è più rigido. Passiamo avanti SOLO i campi
                         // che servono davvero a disegnare la mappa.
-                        //
-                        // Togliamo anche i livelli delle icone dei punti di interesse
-                        // (ristoranti, negozi, fermate...): sulla nostra mappa non sono
-                        // cliccabili (la usiamo in modalità "non interattiva": i
-                        // segnaposto li disegniamo noi con Leaflet, con i loro popup
-                        // funzionanti) e affollano la vista senza dare nessuna funzione
-                        // reale — meglio una mappa più pulita.
-                        const layersSenzaIconePoi = (styleConUrlRisolti.layers || []).filter(function (layer) {
-                            const id = (layer.id || '').toLowerCase();
-                            return id.indexOf('poi') === -1;
-                        });
-
                         const styleRipulito = {
                             version: styleConUrlRisolti.version,
                             sources: styleConUrlRisolti.sources,
-                            layers: layersSenzaIconePoi,
+                            layers: styleConUrlRisolti.layers,
                             sprite: styleConUrlRisolti.sprite,
                             glyphs: styleConUrlRisolti.glyphs
                         };
