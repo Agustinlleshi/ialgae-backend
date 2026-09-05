@@ -1705,7 +1705,14 @@ const ALLOWED_ORIGINS = [
 
 function corsOriginFor(req) {
     const origin = req.headers.origin;
-    return (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) ? origin : ALLOWED_ORIGINS[0];
+    if (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) return origin;
+    // La nostra estensione Chrome gira da un indirizzo "chrome-extension://..."
+    // diverso per ogni installazione — non è un dominio fisso da poter
+    // scrivere in ALLOWED_ORIGINS. Un sito normale non può "fingersi" questo
+    // tipo di indirizzo (lo assegna solo Chrome stesso a un'estensione
+    // davvero installata), quindi accettarli tutti qui è sicuro.
+    if (origin && origin.indexOf('chrome-extension://') === 0) return origin;
+    return ALLOWED_ORIGINS[0];
 }
 
 const server = http.createServer((req, res) => {
