@@ -2207,20 +2207,25 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 200, { suggestions: [] });
                 }
 
-                // Tre servizi diversi di suggerimenti, interrogati TUTTI E TRE
-                // NELLO STESSO ISTANTE (in parallelo) — non uno dopo l'altro.
-                // Usiamo la prima risposta valida che arriva, qualunque sia;
-                // le altre vengono semplicemente ignorate quando arrivano.
-                // Così, se una fonte è irraggiungibile (es. bloccata da
-                // Render), non rallenta le altre: nel peggiore dei casi
-                // aspettiamo solo il limite di tempo qui sotto, una volta
-                // sola, non una volta per ogni fonte.
-                // Tutti e tre restituiscono lo stesso formato di risposta
-                // (stile "OpenSearch"): ["query", ["suggerimento1", ...]]
+                // Quattro servizi diversi di suggerimenti, interrogati TUTTI E
+                // QUATTRO NELLO STESSO ISTANTE (in parallelo) — non uno dopo
+                // l'altro. Usiamo la prima risposta valida che arriva,
+                // qualunque sia; le altre vengono semplicemente ignorate
+                // quando arrivano. Così, se una fonte è irraggiungibile (es.
+                // bloccata da Render), non rallenta le altre: nel peggiore
+                // dei casi aspettiamo solo il limite di tempo qui sotto, una
+                // volta sola, non una volta per ogni fonte.
+                // Tutte e quattro restituiscono lo stesso formato di risposta
+                // (stile "OpenSearch"): ["query", ["suggerimento1", ...]] —
+                // Wikipedia usa letteralmente lo stesso formato standard
+                // delle altre tre, quindi si aggiunge alla gara senza dover
+                // scrivere nessun codice a parte per lei. È anche una delle
+                // fonti più stabili e affidabili in assoluto: raramente è giù.
                 const fontiSuggerimenti = [
                     { nome: 'DuckDuckGo', url: 'https://duckduckgo.com/ac/?q=' + encodeURIComponent(q) + '&type=list' },
                     { nome: 'Google', url: 'https://suggestqueries.google.com/complete/search?client=firefox&q=' + encodeURIComponent(q) },
                     { nome: 'Bing', url: 'https://api.bing.com/osjson.aspx?query=' + encodeURIComponent(q) },
+                    { nome: 'Wikipedia', url: 'https://it.wikipedia.org/w/api.php?action=opensearch&search=' + encodeURIComponent(q) + '&limit=8&namespace=0&format=json' },
                 ];
 
                 // Limite di tempo TOTALE per l'intero gruppo, non per singola
