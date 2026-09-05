@@ -2033,8 +2033,32 @@ const server = http.createServer((req, res) => {
             try {
                 const usaMapbox = await permessoUsoMapbox('tiles', SOGLIA_MAPBOX_TILES);
                 if (usaMapbox) {
-                    const styleUrl = 'https://api.mapbox.com/styles/v1/mapbox/streets-v12?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN);
-                    return sendJSON(res, 200, { usaMapbox: true, styleUrl: styleUrl });
+                    try {
+                        const styleUrl = 'https://api.mapbox.com/styles/v1/mapbox/streets-v12?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN);
+                        const rispostaStile = await fetch(styleUrl, { signal: AbortSignal.timeout(8000) });
+                        if (!rispostaStile.ok) throw new Error('HTTP ' + rispostaStile.status);
+                        const styleGrezzo = await rispostaStile.json();
+
+                        // IMPORTANTE: lo stile che Mapbox restituisce include campi
+                        // extra (name, metadata, created, modified, owner,
+                        // visibility, protected...) che sono validi per la LORO
+                        // libreria ufficiale, ma che la versione di MapLibre usata
+                        // qui rifiuta con un errore ("unknown property") perché il
+                        // suo validatore è più rigido. Passiamo avanti SOLO i campi
+                        // che servono davvero a disegnare la mappa.
+                        const styleRipulito = {
+                            version: styleGrezzo.version,
+                            sources: styleGrezzo.sources,
+                            layers: styleGrezzo.layers,
+                            sprite: styleGrezzo.sprite,
+                            glyphs: styleGrezzo.glyphs
+                        };
+
+                        return sendJSON(res, 200, { usaMapbox: true, style: styleRipulito });
+                    } catch (erroreMapbox) {
+                        console.error('Stile Mapbox non ottenibile/valido, ripiego sul gratuito:', erroreMapbox.message);
+                        return sendJSON(res, 200, { usaMapbox: false });
+                    }
                 }
                 return sendJSON(res, 200, { usaMapbox: false });
             } catch (err) {
