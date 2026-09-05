@@ -2028,6 +2028,62 @@ const server = http.createServer((req, res) => {
     // qui sotto, in autonomia.
     const SOGLIA_MAPBOX_TILES = 25000; // metà dei 50.000 caricamenti gratuiti/mese
 
+    // MapLibre (a differenza della libreria ufficiale di Mapbox) non sa
+    // interpretare gli indirizzi abbreviati "mapbox://..." che Mapbox usa
+    // nei suoi stili per indicare font, sprite e sorgenti delle tile — va
+    // fatta noi la "traduzione" in indirizzi https normali che qualunque
+    // libreria può capire, PRIMA di mandare lo stile al browser.
+    async function risolviStileMapbox(styleGrezzo, token) {
+        const style = JSON.parse(JSON.stringify(styleGrezzo)); // clona, non tocchiamo l'originale
+
+        // Font: una singola stringa con segnaposto, es.
+        // "mapbox://fonts/mapbox/{fontstack}/{range}.pbf"
+        if (style.glyphs && style.glyphs.indexOf('mapbox://fonts/') === 0) {
+            style.glyphs = 'https://api.mapbox.com/fonts/v1/' + style.glyphs.slice('mapbox://fonts/'.length) +
+                '?access_token=' + encodeURIComponent(token);
+        }
+
+        // Sprite: una singola stringa base, es. "mapbox://sprites/mapbox/streets-v12"
+        // (MapLibre aggiunge da solo .json/.png/@2x quando serve)
+        if (style.sprite && style.sprite.indexOf('mapbox://sprites/') === 0) {
+            style.sprite = 'https://api.mapbox.com/styles/v1/' + style.sprite.slice('mapbox://sprites/'.length) +
+                '/sprite?access_token=' + encodeURIComponent(token);
+        }
+
+        // Sorgenti delle tile: ognuna può avere un "url" tipo
+        // "mapbox://mapbox.mapbox-streets-v8,mapbox.mapbox-terrain-v2" — qui
+        // serve un'altra chiamata a Mapbox (TileJSON) per sapere i VERI
+        // indirizzi delle tile, che poi incorporiamo direttamente nello stile
+        // (campo "tiles") al posto dell'indirizzo abbreviato.
+        if (style.sources) {
+            for (const nomeSorgente of Object.keys(style.sources)) {
+                const sorgente = style.sources[nomeSorgente];
+                if (sorgente && typeof sorgente.url === 'string' && sorgente.url.indexOf('mapbox://') === 0) {
+                    try {
+                        const idTileset = sorgente.url.slice('mapbox://'.length);
+                        const tileJsonUrl = 'https://api.mapbox.com/v4/' + idTileset + '.json?secure&access_token=' + encodeURIComponent(token);
+                        const rispostaTileJson = await fetch(tileJsonUrl, { signal: AbortSignal.timeout(8000) });
+                        if (rispostaTileJson.ok) {
+                            const tileJson = await rispostaTileJson.json();
+                            if (Array.isArray(tileJson.tiles) && tileJson.tiles.length > 0) {
+                                delete sorgente.url;
+                                sorgente.tiles = tileJson.tiles;
+                                if (tileJson.minzoom !== undefined) sorgente.minzoom = tileJson.minzoom;
+                                if (tileJson.maxzoom !== undefined) sorgente.maxzoom = tileJson.maxzoom;
+                            }
+                        }
+                    } catch (erroreSorgente) {
+                        // Se UNA sorgente fallisce, la lasciamo com'è (quel livello
+                        // specifico non si vedrà) invece di far fallire l'intera mappa.
+                        console.error('Impossibile risolvere una sorgente Mapbox:', erroreSorgente.message);
+                    }
+                }
+            }
+        }
+
+        return style;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/maps/tile-style') === 0) {
         (async function () {
             try {
@@ -2038,6 +2094,7 @@ const server = http.createServer((req, res) => {
                         const rispostaStile = await fetch(styleUrl, { signal: AbortSignal.timeout(8000) });
                         if (!rispostaStile.ok) throw new Error('HTTP ' + rispostaStile.status);
                         const styleGrezzo = await rispostaStile.json();
+                        const styleConUrlRisolti = await risolviStileMapbox(styleGrezzo, MAPBOX_ACCESS_TOKEN);
 
                         // IMPORTANTE: lo stile che Mapbox restituisce include campi
                         // extra (name, metadata, created, modified, owner,
@@ -2047,11 +2104,11 @@ const server = http.createServer((req, res) => {
                         // suo validatore è più rigido. Passiamo avanti SOLO i campi
                         // che servono davvero a disegnare la mappa.
                         const styleRipulito = {
-                            version: styleGrezzo.version,
-                            sources: styleGrezzo.sources,
-                            layers: styleGrezzo.layers,
-                            sprite: styleGrezzo.sprite,
-                            glyphs: styleGrezzo.glyphs
+                            version: styleConUrlRisolti.version,
+                            sources: styleConUrlRisolti.sources,
+                            layers: styleConUrlRisolti.layers,
+                            sprite: styleConUrlRisolti.sprite,
+                            glyphs: styleConUrlRisolti.glyphs
                         };
 
                         return sendJSON(res, 200, { usaMapbox: true, style: styleRipulito });
