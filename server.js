@@ -2261,7 +2261,7 @@ const server = http.createServer((req, res) => {
                     // tra le tre, ignorando le altre. Se falliscono TUTTE,
                     // lancia un errore e cadiamo nel catch qui sotto.
                     const risultato = await Promise.any(fontiSuggerimenti.map(interrogaFonte));
-                    return sendJSON(res, 200, { suggestions: risultato.suggerimenti, fonte: risultato.fonte });
+                    return sendJSON(res, 200, { suggestions: risultato.suggerimenti.slice(0, 10), fonte: risultato.fonte });
                 } catch (tutteFallite) {
                     // Nessuna delle tre fonti ha risposto in tempo: il sito
                     // userà da solo i suggerimenti locali di riserva già
