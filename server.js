@@ -2040,7 +2040,7 @@ const server = http.createServer((req, res) => {
     // nei suoi stili per indicare font, sprite e sorgenti delle tile — va
     // fatta noi la "traduzione" in indirizzi https normali che qualunque
     // libreria può capire, PRIMA di mandare lo stile al browser.
-    async function risolviStileMapbox(styleGrezzo, token) {
+    async function risolviStileMapbox(styleGrezzo, token, lingua) {
         const style = JSON.parse(JSON.stringify(styleGrezzo)); // clona, non tocchiamo l'originale
 
         // Font: una singola stringa con segnaposto, es.
@@ -2086,6 +2086,26 @@ const server = http.createServer((req, res) => {
                     }
                 }
             }
+        }
+
+        // Etichette di testo (nomi di città, vie, ecc.): lo stile
+        // "streets-v12" classico che usiamo NON si localizza da solo con un
+        // parametro nell'URL (quello funziona solo con il nuovo stile
+        // "Standard" v3 di Mapbox, che non è questo) — dobbiamo riscrivere
+        // noi a mano l'espressione di ogni livello di testo, sostituendo il
+        // riferimento al campo "name_en"/"name_it"/ecc. con quello della
+        // lingua che vogliamo, con ripiego sul nome locale ("name") se quella
+        // lingua non è disponibile per un dato luogo.
+        if (Array.isArray(style.layers)) {
+            style.layers.forEach(function (layer) {
+                if (layer.layout && layer.layout['text-field'] !== undefined) {
+                    let stringaEspressione = JSON.stringify(layer.layout['text-field']);
+                    if (stringaEspressione.indexOf('"name_') !== -1) {
+                        stringaEspressione = stringaEspressione.replace(/"name_[a-zA-Z]{2,3}(-[a-zA-Z]+)?"/g, '"name_' + lingua + '"');
+                        layer.layout['text-field'] = JSON.parse(stringaEspressione);
+                    }
+                }
+            });
         }
 
         return style;
@@ -2266,7 +2286,7 @@ const server = http.createServer((req, res) => {
                         const rispostaStile = await fetch(styleUrl, { signal: AbortSignal.timeout(8000) });
                         if (!rispostaStile.ok) throw new Error('HTTP ' + rispostaStile.status);
                         const styleGrezzo = await rispostaStile.json();
-                        const styleConUrlRisolti = await risolviStileMapbox(styleGrezzo, MAPBOX_ACCESS_TOKEN);
+                        const styleConUrlRisolti = await risolviStileMapbox(styleGrezzo, MAPBOX_ACCESS_TOKEN, linguaMappa);
 
                         // IMPORTANTE: lo stile che Mapbox restituisce include campi
                         // extra (name, metadata, created, modified, owner,
