@@ -2098,6 +2098,69 @@ const server = http.createServer((req, res) => {
     // livelli grafici di chi fornisce la mappa (cambiano da stile a stile e
     // non finiscono mai di sorprendere). Stessa soglia/contatore della
     // geocodifica normale, perché è la stessa famiglia di servizio Mapbox.
+    // ------------------------------------------------------------
+    // SUGGERIMENTI DI INDIRIZZI ("via san..." → "Via San Martino, Milano"):
+    // stessa soglia/contatore della geocodifica normale (stessa famiglia di
+    // servizio Mapbox), ma con più risultati e pensato per query parziali
+    // digitate mentre si scrive, non per una ricerca già completa.
+    // ------------------------------------------------------------
+    if (req.method === 'GET' && req.url.indexOf('/api/maps/address-suggest') === 0) {
+        (async function () {
+            try {
+                const fullUrl = new URL(req.url, 'http://localhost');
+                const q = (fullUrl.searchParams.get('q') || '').trim();
+                if (q.length < 3) return sendJSON(res, 200, { suggerimenti: [], fonte: null });
+
+                const usaMapbox = await permessoUsoMapbox('geocoding', SOGLIA_MAPBOX_GEOCODING);
+
+                if (usaMapbox) {
+                    try {
+                        const url = 'https://api.mapbox.com/geocoding/v5/mapbox.places/' + encodeURIComponent(q) + '.json' +
+                            '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) +
+                            '&autocomplete=true&limit=5&language=it&types=address,place,poi';
+                        const risposta = await fetch(url, { signal: AbortSignal.timeout(6000) });
+                        if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
+                        const dati = await risposta.json();
+                        const suggerimenti = (dati.features || []).map(function (f) {
+                            const parti = (f.place_name || '').split(',');
+                            return {
+                                testo: f.text || parti[0] || f.place_name,
+                                sottotitolo: parti.slice(1).join(',').trim(),
+                                lat: f.center ? f.center[1] : null,
+                                lon: f.center ? f.center[0] : null
+                            };
+                        });
+                        return sendJSON(res, 200, { suggerimenti: suggerimenti, fonte: 'mapbox' });
+                    } catch (erroreMapbox) {
+                        console.error('Suggerimenti indirizzi Mapbox falliti, ripiego su Nominatim:', erroreMapbox.message);
+                    }
+                }
+
+                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&q=' + encodeURIComponent(q);
+                const rispostaNominatim = await fetch(urlNominatim, {
+                    headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
+                    signal: AbortSignal.timeout(8000)
+                });
+                const datiNominatim = await rispostaNominatim.json();
+                const suggerimentiNominatim = (Array.isArray(datiNominatim) ? datiNominatim : []).map(function (r) {
+                    const parti = (r.display_name || '').split(',');
+                    return {
+                        testo: parti[0] || r.display_name,
+                        sottotitolo: parti.slice(1).join(',').trim(),
+                        lat: parseFloat(r.lat),
+                        lon: parseFloat(r.lon)
+                    };
+                });
+                return sendJSON(res, 200, { suggerimenti: suggerimentiNominatim, fonte: 'nominatim' });
+
+            } catch (err) {
+                console.error('Errore suggerimenti indirizzi:', err);
+                return sendJSON(res, 200, { suggerimenti: [], fonte: null });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/maps/reverse-geocode') === 0) {
         (async function () {
             try {
