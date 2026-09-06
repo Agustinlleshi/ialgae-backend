@@ -2117,7 +2117,7 @@ const server = http.createServer((req, res) => {
                     try {
                         const url = 'https://api.mapbox.com/geocoding/v5/mapbox.places/' + encodeURIComponent(q) + '.json' +
                             '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) +
-                            '&autocomplete=true&limit=5&language=it&types=address,place,poi';
+                            '&autocomplete=true&limit=5&language=it&types=address,place,poi&country=it';
                         const risposta = await fetch(url, { signal: AbortSignal.timeout(6000) });
                         if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
                         const dati = await risposta.json();
@@ -2136,7 +2136,7 @@ const server = http.createServer((req, res) => {
                     }
                 }
 
-                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&q=' + encodeURIComponent(q);
+                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&countrycodes=it&q=' + encodeURIComponent(q);
                 const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(8000)
