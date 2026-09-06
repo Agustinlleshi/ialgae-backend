@@ -2250,10 +2250,19 @@ const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url.indexOf('/api/maps/tile-style') === 0) {
         (async function () {
             try {
+                const fullUrlStile = new URL(req.url, 'http://localhost');
+                // "it" di base perché il sito nasce italiano; il sito inglese
+                // (en_results.html) passa esplicitamente "?lang=en" per avere
+                // le etichette delle città nella sua lingua invece che in
+                // italiano (senza specificarla, Mapbox altrimenti mostra un
+                // misto poco coerente, es. "Milan" invece di "Milano" per le
+                // grandi città ma nomi locali per i paesi più piccoli).
+                const linguaMappa = fullUrlStile.searchParams.get('lang') === 'en' ? 'en' : 'it';
+
                 const usaMapbox = await permessoUsoMapbox('tiles', SOGLIA_MAPBOX_TILES);
                 if (usaMapbox) {
                     try {
-                        const styleUrl = 'https://api.mapbox.com/styles/v1/mapbox/streets-v12?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN);
+                        const styleUrl = 'https://api.mapbox.com/styles/v1/mapbox/streets-v12?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) + '&language=' + linguaMappa;
                         const rispostaStile = await fetch(styleUrl, { signal: AbortSignal.timeout(8000) });
                         if (!rispostaStile.ok) throw new Error('HTTP ' + rispostaStile.status);
                         const styleGrezzo = await rispostaStile.json();
