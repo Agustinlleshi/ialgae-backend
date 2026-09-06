@@ -2112,6 +2112,7 @@ const server = http.createServer((req, res) => {
                 if (q.length < 3) return sendJSON(res, 200, { suggerimenti: [], fonte: null });
 
                 const usaMapbox = await permessoUsoMapbox('geocoding', SOGLIA_MAPBOX_GEOCODING);
+                let debugMapbox = 'permessoUsoMapbox ha risposto: ' + usaMapbox;
 
                 if (usaMapbox) {
                     try {
@@ -2119,7 +2120,7 @@ const server = http.createServer((req, res) => {
                             '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) +
                             '&autocomplete=true&limit=5&language=it&types=address,place,poi&country=it';
                         const risposta = await fetch(url, { signal: AbortSignal.timeout(6000) });
-                        if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
+                        if (!risposta.ok) throw new Error('HTTP ' + risposta.status + ' - ' + await risposta.text());
                         const dati = await risposta.json();
                         const suggerimenti = (dati.features || [])
                             .slice()
@@ -2139,6 +2140,7 @@ const server = http.createServer((req, res) => {
                             });
                         return sendJSON(res, 200, { suggerimenti: suggerimenti, fonte: 'mapbox' });
                     } catch (erroreMapbox) {
+                        debugMapbox += ' | Errore Mapbox: ' + erroreMapbox.message;
                         console.error('Suggerimenti indirizzi Mapbox falliti, ripiego su Nominatim:', erroreMapbox.message);
                     }
                 }
@@ -2171,7 +2173,7 @@ const server = http.createServer((req, res) => {
                         lon: parseFloat(r.lon)
                     };
                 });
-                return sendJSON(res, 200, { suggerimenti: suggerimentiNominatim, fonte: 'nominatim' });
+                return sendJSON(res, 200, { suggerimenti: suggerimentiNominatim, fonte: 'nominatim', debug: debugMapbox });
 
             } catch (err) {
                 console.error('Errore suggerimenti indirizzi:', err);
