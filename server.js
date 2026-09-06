@@ -2121,28 +2121,48 @@ const server = http.createServer((req, res) => {
                         const risposta = await fetch(url, { signal: AbortSignal.timeout(6000) });
                         if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
                         const dati = await risposta.json();
-                        const suggerimenti = (dati.features || []).map(function (f) {
-                            const parti = (f.place_name || '').split(',');
-                            return {
-                                testo: f.text || parti[0] || f.place_name,
-                                sottotitolo: parti.slice(1).join(',').trim(),
-                                lat: f.center ? f.center[1] : null,
-                                lon: f.center ? f.center[0] : null
-                            };
-                        });
+                        const suggerimenti = (dati.features || [])
+                            .slice()
+                            .sort(function (a, b) {
+                                const relA = typeof a.relevance === 'number' ? a.relevance : 0;
+                                const relB = typeof b.relevance === 'number' ? b.relevance : 0;
+                                return relB - relA;
+                            })
+                            .map(function (f) {
+                                const parti = (f.place_name || '').split(',');
+                                return {
+                                    testo: f.text || parti[0] || f.place_name,
+                                    sottotitolo: parti.slice(1).join(',').trim(),
+                                    lat: f.center ? f.center[1] : null,
+                                    lon: f.center ? f.center[0] : null
+                                };
+                            });
                         return sendJSON(res, 200, { suggerimenti: suggerimenti, fonte: 'mapbox' });
                     } catch (erroreMapbox) {
                         console.error('Suggerimenti indirizzi Mapbox falliti, ripiego su Nominatim:', erroreMapbox.message);
                     }
                 }
 
-                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&countrycodes=it&q=' + encodeURIComponent(q);
+                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&countrycodes=it&q=' + encodeURIComponent(q);
                 const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(8000)
                 });
                 const datiNominatim = await rispostaNominatim.json();
-                const suggerimentiNominatim = (Array.isArray(datiNominatim) ? datiNominatim : []).map(function (r) {
+                // IMPORTANTE: Nominatim NON restituisce i risultati ordinati per
+                // quanto un posto sia conosciuto — per una query ambigua (es. un
+                // refuso, o un nome comune a più paesini) può capitare che la
+                // piazza famosa di una grande città finisca in fondo alla lista
+                // (o fuori dai primi risultati) mentre vincono paesini sconosciuti
+                // con lo stesso nome. Ordiniamo noi per "importance" (lo stesso
+                // criterio già usato per la geocodifica principale), così i posti
+                // più conosciuti vengono proposti per primi.
+                const candidatiOrdinati = (Array.isArray(datiNominatim) ? datiNominatim : []).sort(function (a, b) {
+                    const impA = typeof a.importance === 'number' ? a.importance : 0;
+                    const impB = typeof b.importance === 'number' ? b.importance : 0;
+                    return impB - impA;
+                });
+                const suggerimentiNominatim = candidatiOrdinati.slice(0, 5).map(function (r) {
                     const parti = (r.display_name || '').split(',');
                     return {
                         testo: parti[0] || r.display_name,
