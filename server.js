@@ -1440,6 +1440,69 @@ function buildTotpOtpauthUrl(email, secretBase32) {
 const geoIpCache = new Map(); // ip -> { data, timestamp }
 const GEO_IP_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 ore
 
+// ------------------------------------------------------------
+// PREZZO MEDIO NAZIONALE DEI CARBURANTI (fonte: open data del MIMIT,
+// Ministero delle Imprese e del Made in Italy — dato ufficiale, gratuito,
+// aggiornato ogni giorno verso le 8:30). Usato per stimare il costo del
+// carburante di un percorso, NON per pedaggi (quelli restano fuori: nessuna
+// fonte gratuita ne conosce il prezzo esatto).
+// Il file è un CSV con la media per regione; la media nazionale che
+// mostriamo è semplicemente la media aritmetica di tutte le regioni — lo
+// stesso identico dato che il sito del MIMIT mostra nella sua pagina
+// dedicata, calcolato però da noi partendo dal CSV (più robusto da leggere
+// via codice di una pagina HTML, che potrebbe cambiare struttura).
+const FUEL_PRICE_CSV_URL = 'https://www.mimit.gov.it/images/stories/carburanti/MediaRegionaleStradale.csv';
+const FUEL_PRICE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 ore: il dato MIMIT cambia una volta al giorno, non serve riscaricarlo più spesso
+let fuelPriceCache = null; // { data: {...}, timestamp }
+
+async function getPrezzoCarburanteNazionale() {
+    if (fuelPriceCache && (Date.now() - fuelPriceCache.timestamp) < FUEL_PRICE_CACHE_TTL_MS) {
+        return fuelPriceCache.data;
+    }
+
+    try {
+        const risposta = await fetch(FUEL_PRICE_CSV_URL, { signal: AbortSignal.timeout(10000) });
+        if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
+        const testoCsv = await risposta.text();
+        const righe = testoCsv.split('\n').map(function (r) { return r.trim(); }).filter(Boolean);
+
+        // Prima riga: "Aggiornamento GG-MM-AAAA". Seconda riga: intestazioni
+        // delle colonne. Dalla terza in poi: "REGIONE;TIPOLOGIA;EROGAZIONE;PREZZO MEDIO"
+        const aggiornamento = (righe[0] || '').replace('Aggiornamento', '').trim();
+        const somme = {};   // tipologia -> somma prezzi
+        const conteggi = {}; // tipologia -> quante regioni l'hanno
+
+        for (let i = 2; i < righe.length; i++) {
+            const campi = righe[i].split(';');
+            if (campi.length < 4) continue;
+            const tipologia = campi[1].trim().toLowerCase(); // gasolio / benzina / gpl / metano
+            const prezzo = parseFloat(campi[3].replace(',', '.'));
+            if (!Number.isFinite(prezzo)) continue;
+            somme[tipologia] = (somme[tipologia] || 0) + prezzo;
+            conteggi[tipologia] = (conteggi[tipologia] || 0) + 1;
+        }
+
+        const dati = { aggiornamento: aggiornamento || null, fonte: 'mimit' };
+        Object.keys(somme).forEach(function (tipologia) {
+            dati[tipologia] = Math.round((somme[tipologia] / conteggi[tipologia]) * 1000) / 1000;
+        });
+
+        // Serve almeno benzina e gasolio, altrimenti il dato non è utilizzabile
+        if (typeof dati.benzina !== 'number' || typeof dati.gasolio !== 'number') {
+            throw new Error('CSV MIMIT senza benzina/gasolio validi');
+        }
+
+        fuelPriceCache = { data: dati, timestamp: Date.now() };
+        return dati;
+    } catch (err) {
+        console.error('Prezzo carburanti MIMIT non raggiungibile:', err.message);
+        // Se avevamo un valore precedente (anche scaduto) è comunque meglio
+        // di niente: molto meglio un prezzo di ieri che nessuna stima.
+        if (fuelPriceCache) return fuelPriceCache.data;
+        return null;
+    }
+}
+
 function isPrivateOrLocalIp(ip) {
     if (!ip) return true;
     return ip === '::1' || ip === '127.0.0.1' ||
@@ -1967,6 +2030,15 @@ const server = http.createServer((req, res) => {
         };
     }
 
+    // Stessa funzione di sopra, ma per la risposta INTERA di Mapbox/OSRM,
+    // quando abbiamo chiesto alternative: restituisce un array di percorsi
+    // già normalizzati, dal più veloce in giù, con un tetto massimo (le API
+    // a volte ne restituiscono più di quanti ne servano davvero all'utente).
+    const MASSIMO_PERCORSI_ALTERNATIVI = 3;
+    function normalizzaPercorsi(routes, fonte) {
+        return routes.slice(0, MASSIMO_PERCORSI_ALTERNATIVI).map(function (r) { return normalizzaPercorso(r, fonte); });
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/maps/directions') === 0) {
         (async function () {
             try {
@@ -1983,18 +2055,29 @@ const server = http.createServer((req, res) => {
 
                 const usaMapbox = await permessoUsoMapbox('directions', SOGLIA_MAPBOX_DIRECTIONS);
 
+                // Piccolo helper: dato un array di percorsi già normalizzati,
+                // costruisce la risposta finale. Il PRIMO percorso resta anche
+                // ai vecchi campi di primo livello (distanza/durata/coordinate/
+                // passi), esattamente come prima di avere le alternative: così
+                // qualunque pagina non ancora aggiornata per mostrare la scelta
+                // del percorso continua a funzionare senza modifiche, mentre
+                // "percorsi" (con tutte le alternative) è lì per chi lo usa.
+                function rispostaConAlternative(percorsi) {
+                    return Object.assign({}, percorsi[0], { percorsi: percorsi });
+                }
+
                 if (usaMapbox) {
                     try {
                         const mapboxProfile = travelMode === 'walking' ? 'walking' : (travelMode === 'cycling' ? 'cycling' : 'driving');
                         const url = 'https://api.mapbox.com/directions/v5/mapbox/' + mapboxProfile + '/' +
                             fromLon + ',' + fromLat + ';' + toLon + ',' + toLat +
                             '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) +
-                            '&geometries=geojson&steps=true&overview=full&language=it';
+                            '&geometries=geojson&steps=true&overview=full&language=it&alternatives=true';
                         const risposta = await fetch(url, { signal: AbortSignal.timeout(10000) });
                         if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
                         const dati = await risposta.json();
                         if (!dati.routes || dati.routes.length === 0) throw new Error('Mapbox: nessun percorso trovato');
-                        return sendJSON(res, 200, normalizzaPercorso(dati.routes[0], 'mapbox'));
+                        return sendJSON(res, 200, rispostaConAlternative(normalizzaPercorsi(dati.routes, 'mapbox')));
                     } catch (erroreMapbox) {
                         console.error('Indicazioni Mapbox fallite, ripiego su OSRM:', erroreMapbox.message);
                         // continua sotto: nessun return, cade nel ramo OSRM
@@ -2007,18 +2090,34 @@ const server = http.createServer((req, res) => {
                 const osrmProfile = travelMode === 'walking' ? 'foot' : (travelMode === 'cycling' ? 'bike' : 'driving');
                 const osrmUrl = 'https://routing.openstreetmap.de/' + routedPrefix + '/route/v1/' + osrmProfile + '/' +
                     fromLon + ',' + fromLat + ';' + toLon + ',' + toLat +
-                    '?overview=full&geometries=geojson&steps=true';
+                    '?overview=full&geometries=geojson&steps=true&alternatives=true';
                 const rispostaOsrm = await fetch(osrmUrl, { signal: AbortSignal.timeout(12000) });
                 const datiOsrm = await rispostaOsrm.json();
                 if (!datiOsrm.routes || datiOsrm.routes.length === 0) {
                     return sendJSON(res, 200, { error: 'Nessun percorso trovato tra questi due punti.', fonte: null });
                 }
-                return sendJSON(res, 200, normalizzaPercorso(datiOsrm.routes[0], 'osrm'));
+                return sendJSON(res, 200, rispostaConAlternative(normalizzaPercorsi(datiOsrm.routes, 'osrm')));
 
             } catch (err) {
                 console.error('Errore indicazioni stradali:', err);
                 return sendJSON(res, 500, { error: 'Servizio di indicazioni stradali non raggiungibile.', fonte: null });
             }
+        })();
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // PREZZO CARBURANTE (media nazionale, fonte MIMIT) — usato dal
+    // frontend per stimare il costo di un percorso. Nessun costo pedaggi:
+    // nessuna fonte gratuita fornisce quel dato in Italia.
+    // ------------------------------------------------------------
+    if (req.method === 'GET' && req.url.indexOf('/api/maps/fuel-price') === 0) {
+        (async function () {
+            const prezzi = await getPrezzoCarburanteNazionale();
+            if (!prezzi) {
+                return sendJSON(res, 503, { error: 'Prezzo carburante non disponibile al momento.' });
+            }
+            return sendJSON(res, 200, prezzi);
         })();
         return;
     }
