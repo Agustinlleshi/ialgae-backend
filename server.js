@@ -1968,7 +1968,11 @@ const server = http.createServer((req, res) => {
 
                 // Ripiego gratuito: stessa identica logica usata prima
                 // direttamente dal browser, solo spostata sul server.
-                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&q=' + encodeURIComponent(q);
+                // "extratags=1" in più: ci serve per il campo "wikipedia" dei
+                // luoghi noti, usato dal frontend per mostrare le foto di
+                // Wikimedia Commons anche sul segnaposto di una ricerca
+                // semplice (non solo sui punti di interesse di Overpass).
+                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&extratags=1&q=' + encodeURIComponent(q);
                 const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(10000)
@@ -1980,7 +1984,8 @@ const server = http.createServer((req, res) => {
                         lon: parseFloat(r.lon),
                         display_name: r.display_name,
                         boundingbox: r.boundingbox ? r.boundingbox.map(Number) : null,
-                        importance: typeof r.importance === 'number' ? r.importance : 0.5
+                        importance: typeof r.importance === 'number' ? r.importance : 0.5,
+                        wikipedia: (r.extratags && r.extratags.wikipedia) || null
                     };
                 });
                 return sendJSON(res, 200, { risultati: risultatiNominatim, fonte: 'nominatim' });
