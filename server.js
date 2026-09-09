@@ -2257,7 +2257,22 @@ const server = http.createServer((req, res) => {
                                     lon: f.center ? f.center[0] : null
                                 };
                             });
-                        return sendJSON(res, 200, { suggerimenti: suggerimenti, fonte: 'mapbox' });
+                        // IMPORTANTE: se Mapbox risponde correttamente ma senza
+                        // risultati utili (es. nomi di luoghi noti come aeroporti,
+                        // che a volte Mapbox copre peggio di OpenStreetMap in
+                        // Italia), NON ci fermiamo qui — passiamo comunque a
+                        // Nominatim qui sotto. Prima ci fermavamo sempre in caso
+                        // di risposta HTTP corretta, anche a zero risultati: così
+                        // la stessa ricerca poteva trovare un posto quando si
+                        // calcolava il percorso (che usa un altro percorso di
+                        // codice) ma non comparire affatto nei suggerimenti
+                        // mentre si scriveva — stessa domanda, due risposte
+                        // diverse. Ora i suggerimenti provano entrambe le fonti
+                        // proprio come fa il calcolo del percorso.
+                        if (suggerimenti.length > 0) {
+                            return sendJSON(res, 200, { suggerimenti: suggerimenti, fonte: 'mapbox' });
+                        }
+                        debugMapbox += ' | Mapbox ha risposto ma senza risultati utili, ripiego su Nominatim';
                     } catch (erroreMapbox) {
                         debugMapbox += ' | Errore Mapbox: ' + erroreMapbox.message;
                         console.error('Suggerimenti indirizzi Mapbox falliti, ripiego su Nominatim:', erroreMapbox.message);
@@ -2328,6 +2343,7 @@ const server = http.createServer((req, res) => {
                                 nome: primo.text || primo.place_name,
                                 indirizzo: primo.place_name,
                                 categoria: (primo.properties && primo.properties.category) || null,
+                                wikipedia: null, // Mapbox non espone questo dato in questa API
                                 lat: primo.center ? primo.center[1] : lat,
                                 lon: primo.center ? primo.center[0] : lon
                             });
@@ -2337,7 +2353,11 @@ const server = http.createServer((req, res) => {
                     }
                 }
 
-                const urlNominatim = 'https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lon + '&zoom=18&addressdetails=1';
+                // "extratags=1" fa sì che Nominatim includa anche il campo
+                // "wikipedia" quando il punto è collegato a una voce (musei,
+                // monumenti, parchi noti...) — ci serve per mostrare le foto
+                // di Wikimedia Commons nel popup sul frontend.
+                const urlNominatim = 'https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lon + '&zoom=18&addressdetails=1&extratags=1';
                 const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(10000)
@@ -2354,6 +2374,7 @@ const server = http.createServer((req, res) => {
                     nome: nomeBreve,
                     indirizzo: datiNominatim.display_name,
                     categoria: null,
+                    wikipedia: (datiNominatim.extratags && datiNominatim.extratags.wikipedia) || null,
                     lat: parseFloat(datiNominatim.lat) || lat,
                     lon: parseFloat(datiNominatim.lon) || lon
                 });
