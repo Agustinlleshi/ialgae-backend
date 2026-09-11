@@ -116,6 +116,13 @@ const SERPER_API_KEY = process.env.SERPER_API_KEY;
 // ricerca POI quando siamo sotto la soglia mensile gratuita — vedi la
 // sezione "CONTATORE USO MAPBOX" più sotto per il perché e il come.
 const MAPBOX_ACCESS_TOKEN = process.env.MAPBOX_ACCESS_TOKEN || '';
+// ATTENZIONE: questa chiave era prima scritta in chiaro dentro pwa.html,
+// visibile a chiunque avesse guardato il codice sorgente della pagina.
+// L'ho spostata qui (lato server, mai visibile al browser) ma consiglio
+// di generarne una NUOVA da https://developer.tomtom.com/ e impostarla
+// come variabile d'ambiente TOMTOM_API_KEY su Render — quella vecchia,
+// essendo già stata pubblica, va considerata compromessa.
+const TOMTOM_API_KEY = process.env.TOMTOM_API_KEY || 'DF4uM9LiSVMQOMMYR4z9DWTXiNW9Qz7r';
 
 // Chiave segreta per proteggere le statistiche interne (es. iscrizioni
 // giornaliere). Impostala su Render come stringa lunga e casuale, inventata
@@ -1956,7 +1963,13 @@ const server = http.createServer((req, res) => {
                                 lon: f.center[0],
                                 display_name: f.place_name,
                                 boundingbox: f.bbox ? [f.bbox[1], f.bbox[3], f.bbox[0], f.bbox[2]] : null,
-                                importance: typeof f.relevance === 'number' ? f.relevance : 0.5
+                                importance: typeof f.relevance === 'number' ? f.relevance : 0.5,
+                                // Mapbox usa "place_type" (es. ["poi"], ["address"]):
+                                // lo passiamo così com'è, il frontend lo confronta
+                                // in modo un po' diverso da "classe/tipo" di
+                                // Nominatim ma con lo stesso obiettivo.
+                                classe: (f.place_type && f.place_type[0]) || null,
+                                tipo: null
                             };
                         });
                         return sendJSON(res, 200, { risultati: risultati, fonte: 'mapbox' });
@@ -1972,7 +1985,7 @@ const server = http.createServer((req, res) => {
                 // luoghi noti, usato dal frontend per mostrare le foto di
                 // Wikimedia Commons anche sul segnaposto di una ricerca
                 // semplice (non solo sui punti di interesse di Overpass).
-                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&extratags=1&q=' + encodeURIComponent(q);
+                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&extratags=1&countrycodes=it&q=' + encodeURIComponent(q);
                 const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(10000)
@@ -1985,7 +1998,14 @@ const server = http.createServer((req, res) => {
                         display_name: r.display_name,
                         boundingbox: r.boundingbox ? r.boundingbox.map(Number) : null,
                         importance: typeof r.importance === 'number' ? r.importance : 0.5,
-                        wikipedia: (r.extratags && r.extratags.wikipedia) || null
+                        wikipedia: (r.extratags && r.extratags.wikipedia) || null,
+                        // "class"/"type" (es. class:"aeroway", type:"aerodrome"):
+                        // servono al frontend per preferire un luogo NOTEVOLE
+                        // (aeroporto, stazione, monumento...) a un semplice
+                        // indirizzo quando l'importanza di Nominatim è simile —
+                        // vedi geocodaLuogoMigliore.
+                        classe: r.class || null,
+                        tipo: r.type || null
                     };
                 });
                 return sendJSON(res, 200, { risultati: risultatiNominatim, fonte: 'nominatim' });
@@ -2387,6 +2407,113 @@ const server = http.createServer((req, res) => {
             } catch (err) {
                 console.error('Errore geocodifica inversa:', err);
                 return sendJSON(res, 500, { error: 'Servizio non raggiungibile.', fonte: null });
+            }
+        })();
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // TILE RASTER DI MAPBOX (per pagine che usano Leaflet con tile PNG
+    // semplici invece delle tile vettoriali MapLibre, come la nuova app
+    // PWA di navigazione): la chiave resta sempre solo qui sul server,
+    // mai nel browser. Stessa soglia/contatore delle tile vettoriali:
+    // sono comunque "caricamenti mappa" agli occhi di Mapbox.
+    // ------------------------------------------------------------
+    // TRAFFICO (TomTom): tile del flusso e incidenti, con la chiave
+    // sempre solo qui sul server — vedi nota sopra vicino a TOMTOM_API_KEY.
+    // ------------------------------------------------------------
+    if (req.method === 'GET' && req.url.indexOf('/api/maps/traffic-tile') === 0) {
+        (async function () {
+            try {
+                const fullUrlTraffico = new URL(req.url, 'http://localhost');
+                const z = fullUrlTraffico.searchParams.get('z');
+                const x = fullUrlTraffico.searchParams.get('x');
+                const y = fullUrlTraffico.searchParams.get('y');
+                if (![z, x, y].every(function (v) { return v !== null && /^-?\d+$/.test(v); })) {
+                    res.writeHead(400, { 'Content-Type': 'text/plain' });
+                    return res.end('Coordinate tile mancanti o non valide.');
+                }
+                const urlTomTom = 'https://api.tomtom.com/traffic/map/4/tile/flow/relative/' + z + '/' + x + '/' + y +
+                    '.png?key=' + encodeURIComponent(TOMTOM_API_KEY);
+                const rispostaTile = await fetch(urlTomTom, { signal: AbortSignal.timeout(10000) });
+                if (!rispostaTile.ok) {
+                    res.writeHead(rispostaTile.status);
+                    return res.end();
+                }
+                const buffer = Buffer.from(await rispostaTile.arrayBuffer());
+                res.writeHead(200, {
+                    'Content-Type': rispostaTile.headers.get('content-type') || 'image/png',
+                    'Cache-Control': 'public, max-age=120' // il traffico cambia in fretta: cache breve
+                });
+                return res.end(buffer);
+            } catch (err) {
+                console.error('Errore tile traffico TomTom:', err);
+                res.writeHead(204);
+                return res.end();
+            }
+        })();
+        return;
+    }
+
+    if (req.method === 'GET' && req.url.indexOf('/api/maps/traffic-incidents') === 0) {
+        (async function () {
+            try {
+                const fullUrlIncidenti = new URL(req.url, 'http://localhost');
+                const bbox = fullUrlIncidenti.searchParams.get('bbox');
+                if (!bbox) return sendJSON(res, 400, { error: 'bbox mancante.', incidents: [] });
+                const fields = '{incidents{type,geometry{type,coordinates},properties{id,iconCategory,magnitudeOfDelay,events{description,code},from,to}}}';
+                const urlTomTom = 'https://api.tomtom.com/traffic/services/5/incidentDetails?key=' + encodeURIComponent(TOMTOM_API_KEY) +
+                    '&bbox=' + encodeURIComponent(bbox) +
+                    '&fields=' + encodeURIComponent(fields) +
+                    '&language=it-IT&timeValidityFilter=present';
+                const rispostaIncidenti = await fetch(urlTomTom, { signal: AbortSignal.timeout(10000) });
+                if (!rispostaIncidenti.ok) return sendJSON(res, 200, { incidents: [] });
+                const dati = await rispostaIncidenti.json();
+                return sendJSON(res, 200, { incidents: dati.incidents || [] });
+            } catch (err) {
+                console.error('Errore incidenti traffico TomTom:', err);
+                return sendJSON(res, 200, { incidents: [] });
+            }
+        })();
+        return;
+    }
+
+    if (req.method === 'GET' && req.url.indexOf('/api/maps/mapbox-raster-tile') === 0) {
+        (async function () {
+            try {
+                const fullUrlTile = new URL(req.url, 'http://localhost');
+                const z = fullUrlTile.searchParams.get('z');
+                const x = fullUrlTile.searchParams.get('x');
+                const y = fullUrlTile.searchParams.get('y');
+                if (![z, x, y].every(function (v) { return v !== null && /^-?\d+$/.test(v); })) {
+                    res.writeHead(400, { 'Content-Type': 'text/plain' });
+                    return res.end('Coordinate tile mancanti o non valide.');
+                }
+                const puoUsareMapbox = MAPBOX_ACCESS_TOKEN && await permessoUsoMapbox('tiles', SOGLIA_MAPBOX_TILES);
+                if (!puoUsareMapbox) {
+                    // Sopra soglia o chiave non configurata: nessuna tile,
+                    // il browser mostrerà il livello OSM gratuito già
+                    // presente come base — non è un errore bloccante.
+                    res.writeHead(204);
+                    return res.end();
+                }
+                const urlMapbox = 'https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/256/' + z + '/' + x + '/' + y +
+                    '@2x?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN);
+                const rispostaTile = await fetch(urlMapbox, { signal: AbortSignal.timeout(10000) });
+                if (!rispostaTile.ok) {
+                    res.writeHead(rispostaTile.status);
+                    return res.end();
+                }
+                const buffer = Buffer.from(await rispostaTile.arrayBuffer());
+                res.writeHead(200, {
+                    'Content-Type': rispostaTile.headers.get('content-type') || 'image/png',
+                    'Cache-Control': 'public, max-age=86400'
+                });
+                return res.end(buffer);
+            } catch (err) {
+                console.error('Errore tile raster Mapbox:', err);
+                res.writeHead(204);
+                return res.end();
             }
         })();
         return;
