@@ -1948,12 +1948,25 @@ const server = http.createServer((req, res) => {
                 const q = (fullUrl.searchParams.get('q') || '').trim();
                 if (!q) return sendJSON(res, 200, { risultati: [], fonte: null });
 
+                // Posizione approssimativa di chi cerca (centro della mappa che
+                // sta guardando in quel momento): senza questo, cercare un
+                // posto poco noto (es. un piccolo centro commerciale locale)
+                // può restituire risultati con lo stesso nome sparsi per
+                // tutta Italia invece di quello vicino che magari si vede
+                // già sulla mappa. Parametro facoltativo: se manca, la
+                // ricerca funziona comunque come prima, solo senza preferenza
+                // di zona.
+                const nearLat = parseFloat(fullUrl.searchParams.get('nearLat'));
+                const nearLon = parseFloat(fullUrl.searchParams.get('nearLon'));
+                const haPosizione = Number.isFinite(nearLat) && Number.isFinite(nearLon);
+
                 const usaMapbox = await permessoUsoMapbox('geocoding', SOGLIA_MAPBOX_GEOCODING);
 
                 if (usaMapbox) {
                     try {
+                        const prossimita = haPosizione ? ('&proximity=' + nearLon + ',' + nearLat) : '';
                         const url = 'https://api.mapbox.com/geocoding/v5/mapbox.places/' + encodeURIComponent(q) + '.json' +
-                            '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) + '&limit=5&language=it';
+                            '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) + '&limit=5&language=it' + prossimita;
                         const risposta = await fetch(url, { signal: AbortSignal.timeout(8000) });
                         if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
                         const dati = await risposta.json();
@@ -1985,7 +1998,18 @@ const server = http.createServer((req, res) => {
                 // luoghi noti, usato dal frontend per mostrare le foto di
                 // Wikimedia Commons anche sul segnaposto di una ricerca
                 // semplice (non solo sui punti di interesse di Overpass).
-                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&extratags=1&countrycodes=it&q=' + encodeURIComponent(q);
+                // "viewbox"+"bounded=0" (solo se abbiamo una posizione): un
+                // suggerimento di zona morbido, non un confine rigido — se il
+                // posto cercato è altrove Nominatim lo trova comunque, ma a
+                // parità di altri fattori preferisce quello vicino.
+                let vicinanzaParam = '';
+                if (haPosizione) {
+                    const margine = 1.2; // gradi, circa 130 km
+                    vicinanzaParam = '&viewbox=' + (nearLon - margine) + ',' + (nearLat + margine) + ',' +
+                        (nearLon + margine) + ',' + (nearLat - margine) + '&bounded=0';
+                }
+                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&extratags=1&countrycodes=it' +
+                    vicinanzaParam + '&q=' + encodeURIComponent(q);
                 const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(10000)
