@@ -238,6 +238,26 @@ const RESET_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 ora
 const resetRateLimitByEmail = new Map(); // email -> { count, windowStart }
 const resetRateLimitByIp = new Map();    // ip -> { count, windowStart }
 
+// Rate limiting per login, registrazione e /api/auth/me. Senza questo,
+// qualcuno potrebbe provare migliaia di password di fila su un account
+// (o su tanti account), o un'app con un bug potrebbe chiamare /me in loop
+// senza sosta — ogni tentativo tocca il database, e su un piano gratuito
+// con ore di calcolo limitate (Neon) questo consuma budget reale senza che
+// nessun utente vero ne stia traendo beneficio.
+const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000; // 15 minuti
+const MAX_LOGIN_ATTEMPTS_PER_IP = 10;   // un IP può provare ad accedere a più account (es. rete condivisa)
+const MAX_LOGIN_ATTEMPTS_PER_EMAIL = 5; // ma non indovinare all'infinito la password di UN account specifico
+const loginRateLimitByIp = new Map();
+const loginRateLimitByEmail = new Map();
+
+const REGISTER_RATE_WINDOW_MS = 60 * 60 * 1000; // 1 ora
+const MAX_REGISTRATIONS_PER_IP = 4;
+const registerRateLimitByIp = new Map();
+
+const ME_RATE_WINDOW_MS = 5 * 60 * 1000; // 5 minuti
+const MAX_ME_REQUESTS = 30; // abbondante per un uso normale (la pagina profilo lo chiama una volta al caricamento), pensato per bloccare un loop impazzito, non un utente vero
+const meRateLimitByUser = new Map();
+
 // Rate limiting per i tentativi di codice 2FA al login (endpoint
 // /api/auth/2fa/login-verify). Senza questo limite, un codice a 6 cifre
 // (un milione di combinazioni) sarebbe indovinabile a forza bruta in un
@@ -2832,6 +2852,27 @@ const server = http.createServer((req, res) => {
     // rifare il login ogni volta (es. dopo essere passati da login.html a ia.html).
     if (req.method === 'GET' && req.url === '/api/auth/me') {
         (async function () {
+            // Limite per utente PRIMA di interrogare il database per intero:
+            // decodifichiamo il token (operazione locale, nessuna query) solo
+            // per ottenere un identificativo su cui contare le richieste — se
+            // qualcosa (un bug del sito, o un uso scorretto) chiama questo
+            // endpoint in loop, lo blocchiamo prima che arrivi al database,
+            // non dopo.
+            const authHeader = req.headers['authorization'] || '';
+            const rawToken = authHeader.replace('Bearer ', '').trim();
+            let meKey = null;
+            if (rawToken) {
+                try {
+                    const decodedForLimit = jwt.verify(rawToken, SESSION_SECRET);
+                    meKey = decodedForLimit.sub;
+                } catch (e) { /* token non valido: getUserFromRequest darà il suo stesso errore più sotto, come prima */ }
+            }
+            if (meKey) {
+                const meCheck = await checkAndConsumeRateLimitPersistent('auth-me', meKey, MAX_ME_REQUESTS, ME_RATE_WINDOW_MS, meRateLimitByUser);
+                if (!meCheck.allowed) {
+                    return sendJSON(res, 429, { error: 'too_many_requests', message: 'Troppe richieste, riprova tra qualche minuto.' });
+                }
+            }
             const user = await getUserFromRequest(req);
             if (!user) {
                 return sendJSON(res, 401, { error: 'not_logged_in' });
@@ -4315,6 +4356,15 @@ function parseAdminDateRange(searchParams) {
                     return sendJSON(res, 400, { error: 'La password deve avere almeno 8 caratteri.' });
                 }
 
+                const registerIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+                const registerIpCheck = await checkAndConsumeRateLimitPersistent('register-ip', registerIp, MAX_REGISTRATIONS_PER_IP, REGISTER_RATE_WINDOW_MS, registerRateLimitByIp);
+                if (!registerIpCheck.allowed) {
+                    return sendJSON(res, 429, {
+                        error: 'too_many_attempts',
+                        message: 'Troppe registrazioni da questa rete. Riprova più tardi.'
+                    });
+                }
+
                 const id = localAccountId(email);
                 const existing = (await getUserById(id)) || (await getUserByEmail(email));
                 if (existing) {
@@ -4478,6 +4528,16 @@ function parseAdminDateRange(searchParams) {
 
                 const email = (payload.email || '').trim().toLowerCase();
                 const password = payload.password || '';
+
+                const loginIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+                const ipCheck = await checkAndConsumeRateLimitPersistent('login-ip', loginIp, MAX_LOGIN_ATTEMPTS_PER_IP, LOGIN_RATE_WINDOW_MS, loginRateLimitByIp);
+                const emailCheck = await checkAndConsumeRateLimitPersistent('login-email', email, MAX_LOGIN_ATTEMPTS_PER_EMAIL, LOGIN_RATE_WINDOW_MS, loginRateLimitByEmail);
+                if (!ipCheck.allowed || !emailCheck.allowed) {
+                    return sendJSON(res, 429, {
+                        error: 'too_many_attempts',
+                        message: 'Troppi tentativi di accesso. Riprova tra qualche minuto.'
+                    });
+                }
 
                 const user = await getUserById(localAccountId(email));
                 if (!user || !user.passwordHash || !verifyPassword(password, user.passwordHash)) {
