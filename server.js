@@ -1990,7 +1990,7 @@ const server = http.createServer((req, res) => {
                 };
 
                 const interrogaNominatim = async function (urlExtra, testoCercato) {
-                    const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
+                    const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=30&extratags=1&countrycodes=it' +
                         urlExtra + '&q=' + encodeURIComponent(testoCercato);
                     const risposta = await fetch(url, {
                         headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
@@ -2045,13 +2045,50 @@ const server = http.createServer((req, res) => {
                 // città che un nome libero a due parole). Proviamo quindi
                 // anche solo l'ultima parola, in parallelo, senza costare
                 // tempo aggiuntivo a chi cerca.
+                // Ricerca STRUTTURATA (parametro "amenity" di Nominatim,
+                // pensato apposta per cercare un luogo/punto di interesse
+                // per NOME — non un indirizzo). La ricerca normale (q=) a
+                // volte non basta per nomi noti come "Malpensa": Nominatim
+                // può classificarlo con un'importanza interna bassa e
+                // scartarlo prima ancora di arrivare a noi. La ricerca per
+                // "amenity" guarda proprio nel nome del luogo, con più
+                // probabilità di trovarlo.
+                const interrogaNominatimPerNome = async function (nome) {
+                    try {
+                        const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
+                            '&amenity=' + encodeURIComponent(nome);
+                        const risposta = await fetch(url, {
+                            headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
+                            signal: AbortSignal.timeout(10000)
+                        });
+                        const dati = await risposta.json();
+                        return (Array.isArray(dati) ? dati : []).map(function (r) {
+                            return {
+                                lat: parseFloat(r.lat),
+                                lon: parseFloat(r.lon),
+                                display_name: r.display_name,
+                                boundingbox: r.boundingbox ? r.boundingbox.map(Number) : null,
+                                importance: typeof r.importance === 'number' ? r.importance : 0.5,
+                                wikipedia: (r.extratags && r.extratags.wikipedia) || null,
+                                classe: r.class || null,
+                                tipo: r.type || null,
+                                _fonte: 'nominatim'
+                            };
+                        });
+                    } catch (erroreStrutturata) {
+                        console.error('Ricerca strutturata Nominatim fallita:', erroreStrutturata.message);
+                        return [];
+                    }
+                };
+
                 const paroleQuery = q.trim().split(/\s+/);
                 const ultimaParola = paroleQuery.length > 1 ? paroleQuery[paroleQuery.length - 1] : null;
 
-                const [risultatiMapbox, risultatiNominatim, risultatiUltimaParola] = await Promise.all([
+                const [risultatiMapbox, risultatiNominatim, risultatiUltimaParola, risultatiPerNome] = await Promise.all([
                     interrogaMapbox(),
                     interrogaNominatimCompleto(q),
-                    ultimaParola ? interrogaNominatimCompleto(ultimaParola) : Promise.resolve([])
+                    ultimaParola ? interrogaNominatimCompleto(ultimaParola) : Promise.resolve([]),
+                    interrogaNominatimPerNome(q)
                 ]);
 
                 // Unione: stessa posizione (arrotondata) e stesso nome =
@@ -2061,7 +2098,7 @@ const server = http.createServer((req, res) => {
                     return r.lat.toFixed(3) + '|' + r.lon.toFixed(3);
                 };
                 const perChiave = {};
-                risultatiNominatim.concat(risultatiUltimaParola, risultatiMapbox).forEach(function (r) {
+                risultatiNominatim.concat(risultatiUltimaParola, risultatiPerNome, risultatiMapbox).forEach(function (r) {
                     const k = chiaveDedup(r);
                     if (!perChiave[k]) perChiave[k] = r;
                 });
