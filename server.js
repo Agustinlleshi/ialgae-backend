@@ -2019,46 +2019,26 @@ const server = http.createServer((req, res) => {
                 // Wikimedia Commons anche sul segnaposto di una ricerca
                 // semplice (non solo sui punti di interesse di Overpass).
                 //
-                // Ricerca in DUE TENTATIVI quando conosciamo la posizione:
-                // 1) prima "bounded=1" — SOLO risultati entro l'area vicina,
-                //    un vero filtro, non solo una preferenza. Serve per casi
-                //    come "piazzale piola milano": il nome ufficiale su
-                //    OpenStreetMap è "Piazzale Gabrio Piola", meno "importante"
-                //    secondo Nominatim di un "Piazzale Pola" che esiste
-                //    davvero altrove in Italia (Brescia/Torino) — senza un
-                //    filtro vero, quello sbagliato ma "più importante" vince
-                //    sempre, anche standomi vicino a quello giusto.
-                // 2) se il tentativo 1 non trova nulla, si allarga a tutta
-                //    Italia (ricerca originale, senza confine) — così non si
-                //    perde comunque la possibilità di trovare un posto
-                //    genuinamente lontano da dove ci si trova ora.
-                async function interrogaNominatim(vicinanzaParam){
-                    const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=5&extratags=1&countrycodes=it' +
-                        vicinanzaParam + '&q=' + encodeURIComponent(q);
-                    const risp = await fetch(url, {
-                        headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
-                        signal: AbortSignal.timeout(10000)
-                    });
-                    const dati = await risp.json();
-                    return Array.isArray(dati) ? dati : [];
-                }
-
-                let datiNominatim = [];
-                if (haPosizione) {
-                    const margine = 1.2; // gradi, circa 130 km
-                    const viewboxCoords = (nearLon - margine) + ',' + (nearLat + margine) + ',' +
-                        (nearLon + margine) + ',' + (nearLat - margine);
-                    datiNominatim = await interrogaNominatim('&viewbox=' + viewboxCoords + '&bounded=1');
-                }
-                if (!datiNominatim.length) {
-                    // Nessuna posizione nota, o il tentativo "vicino a te" non ha
-                    // trovato nulla: si allarga a tutta Italia.
-                    const vicinanzaParamMorbida = haPosizione
-                        ? ('&viewbox=' + (nearLon - 1.2) + ',' + (nearLat + 1.2) + ',' + (nearLon + 1.2) + ',' + (nearLat - 1.2) + '&bounded=0')
-                        : '';
-                    datiNominatim = await interrogaNominatim(vicinanzaParamMorbida);
-                }
-                const risultatiNominatim = datiNominatim.map(function (r) {
+                // NON usiamo un filtro geografico rigido (escluderebbe anche
+                // il risultato giusto quando il nome cercato non combacia
+                // perfettamente — es. "piazza piola" non trova nulla se il
+                // nome vero su OpenStreetMap è "Piazzale Gabrio Piola" e il
+                // filtro è troppo stretto). Prendiamo invece PIÙ risultati
+                // possibili (fino a 10, non solo 5) e poi li RIORDINIAMO noi:
+                // chi è più vicino a dove ti trovi ora va in cima alla lista,
+                // invece di fidarci solo di quanto Nominatim lo ritiene
+                // "importante" a livello nazionale (motivo per cui un
+                // "Piazzale Pola" a Brescia/Torino batteva sempre il
+                // "Piazzale Gabrio Piola" di Milano, anche standoci proprio
+                // vicino).
+                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
+                    '&q=' + encodeURIComponent(q);
+                const rispostaNominatim = await fetch(urlNominatim, {
+                    headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
+                    signal: AbortSignal.timeout(10000)
+                });
+                const datiNominatim = await rispostaNominatim.json();
+                let risultatiNominatim = (Array.isArray(datiNominatim) ? datiNominatim : []).map(function (r) {
                     return {
                         lat: parseFloat(r.lat),
                         lon: parseFloat(r.lon),
@@ -2075,6 +2055,28 @@ const server = http.createServer((req, res) => {
                         tipo: r.type || null
                     };
                 });
+
+                // Riordino per vicinanza: chi è più vicino a te guadagna
+                // punti, così un posto meno "importante" a livello nazionale
+                // ma proprio nella tua zona può battere un omonimo o quasi-
+                // omonimo più "importante" ma lontano centinaia di km.
+                // Una differenza di importanza enorme (un vero monumento
+                // nazionale) può comunque vincere anche da lontano — qui
+                // si bilanciano solo i casi dubbi/simili.
+                if (haPosizione && risultatiNominatim.length > 1) {
+                    const distanzaKm = function (lat1, lon1, lat2, lon2) {
+                        const R = 6371, toRad = Math.PI / 180;
+                        const dLat = (lat2 - lat1) * toRad, dLon = (lon2 - lon1) * toRad;
+                        const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.sin(dLon / 2) ** 2;
+                        return 2 * R * Math.asin(Math.sqrt(a));
+                    };
+                    risultatiNominatim.forEach(function (r) {
+                        r._punteggio = r.importance - distanzaKm(nearLat, nearLon, r.lat, r.lon) * 0.003;
+                    });
+                    risultatiNominatim.sort(function (a, b) { return b._punteggio - a._punteggio; });
+                    risultatiNominatim.forEach(function (r) { delete r._punteggio; });
+                }
+
                 return sendJSON(res, 200, { risultati: risultatiNominatim, fonte: 'nominatim' });
 
             } catch (err) {
