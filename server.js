@@ -2012,62 +2012,76 @@ const server = http.createServer((req, res) => {
                     }
                 }
 
-                // Ripiego gratuito: stessa identica logica usata prima
-                // direttamente dal browser, solo spostata sul server.
+                // Funzione che interroga Nominatim e adatta i risultati al
+                // nostro formato: usata sia per la ricerca ristretta qui
+                // sotto sia per quella nazionale di ripiego.
+                const interrogaNominatim = async function (urlExtra) {
+                    const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
+                        urlExtra + '&q=' + encodeURIComponent(q);
+                    const risposta = await fetch(url, {
+                        headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
+                        signal: AbortSignal.timeout(10000)
+                    });
+                    const dati = await risposta.json();
+                    return (Array.isArray(dati) ? dati : []).map(function (r) {
+                        return {
+                            lat: parseFloat(r.lat),
+                            lon: parseFloat(r.lon),
+                            display_name: r.display_name,
+                            boundingbox: r.boundingbox ? r.boundingbox.map(Number) : null,
+                            importance: typeof r.importance === 'number' ? r.importance : 0.5,
+                            wikipedia: (r.extratags && r.extratags.wikipedia) || null,
+                            classe: r.class || null,
+                            tipo: r.type || null
+                        };
+                    });
+                };
+
+                let risultatiNominatim = [];
+
+                // Primo tentativo, SOLO se conosciamo la posizione di chi
+                // cerca: una ricerca DAVVERO ristretta (bounded=1, non solo
+                // "preferita") a circa 25km intorno a te. Dentro un'area
+                // così piccola non possono esistere omonimi lontani a
+                // rubare il posto per "importanza nazionale" — è il modo
+                // giusto per risolvere casi come "piazza piola" che non
+                // trova "Piazzale Gabrio Piola" di Milano perché un
+                // "Piazzale Pola" a Brescia/Torino è considerato più
+                // importante a livello di tutta Italia. Se qui non troviamo
+                // nulla (magari perché il posto cercato è altrove, non
+                // vicino a te), ripieghiamo sotto sulla ricerca nazionale
+                // come prima.
+                if (haPosizione) {
+                    const raggio = 0.22; // gradi, circa 25km
+                    const viewboxRistretto = '&viewbox=' + (nearLon - raggio) + ',' + (nearLat + raggio) + ',' + (nearLon + raggio) + ',' + (nearLat - raggio) + '&bounded=1';
+                    try {
+                        risultatiNominatim = await interrogaNominatim(viewboxRistretto);
+                    } catch (erroreRistretto) {
+                        console.error('Ricerca ristretta Nominatim fallita:', erroreRistretto.message);
+                    }
+                }
+
+                // Ripiego gratuito nazionale: stessa identica logica usata
+                // prima direttamente dal browser, solo spostata sul server.
                 // "extratags=1" in più: ci serve per il campo "wikipedia" dei
                 // luoghi noti, usato dal frontend per mostrare le foto di
                 // Wikimedia Commons anche sul segnaposto di una ricerca
                 // semplice (non solo sui punti di interesse di Overpass).
                 //
-                // NON usiamo un filtro geografico rigido (escluderebbe anche
-                // il risultato giusto quando il nome cercato non combacia
-                // perfettamente — es. "piazza piola" non trova nulla se il
-                // nome vero su OpenStreetMap è "Piazzale Gabrio Piola" e il
-                // filtro è troppo stretto). Prendiamo invece PIÙ risultati
-                // possibili (fino a 10, non solo 5) e poi li RIORDINIAMO noi:
-                // chi è più vicino a dove ti trovi ora va in cima alla lista,
-                // invece di fidarci solo di quanto Nominatim lo ritiene
-                // "importante" a livello nazionale (motivo per cui un
-                // "Piazzale Pola" a Brescia/Torino batteva sempre il
-                // "Piazzale Gabrio Piola" di Milano, anche standoci proprio
-                // vicino).
-                // Se conosciamo la posizione di chi cerca, diamo a Nominatim
-                // stesso un "viewbox" (un riquadro largo ~1 grado, circa
-                // 100km) intorno a quella posizione, con bounded=0: questo
-                // significa "preferisci risultati qui dentro, ma non
-                // escludere quelli fuori" — così un posto vicino ha più
-                // probabilità di rientrare già nei primi 10 risultati
-                // restituiti da Nominatim, invece di essere scartato prima
-                // ancora che il nostro riordino per vicinanza possa
-                // intervenire (il riordino può solo riordinare i risultati
-                // che arrivano, non recuperare quelli tagliati fuori).
-                const viewbox = haPosizione
-                    ? ('&viewbox=' + (nearLon - 0.5) + ',' + (nearLat + 0.5) + ',' + (nearLon + 0.5) + ',' + (nearLat - 0.5) + '&bounded=0')
-                    : '';
-                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
-                    viewbox + '&q=' + encodeURIComponent(q);
-                const rispostaNominatim = await fetch(urlNominatim, {
-                    headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
-                    signal: AbortSignal.timeout(10000)
-                });
-                const datiNominatim = await rispostaNominatim.json();
-                let risultatiNominatim = (Array.isArray(datiNominatim) ? datiNominatim : []).map(function (r) {
-                    return {
-                        lat: parseFloat(r.lat),
-                        lon: parseFloat(r.lon),
-                        display_name: r.display_name,
-                        boundingbox: r.boundingbox ? r.boundingbox.map(Number) : null,
-                        importance: typeof r.importance === 'number' ? r.importance : 0.5,
-                        wikipedia: (r.extratags && r.extratags.wikipedia) || null,
-                        // "class"/"type" (es. class:"aeroway", type:"aerodrome"):
-                        // servono al frontend per preferire un luogo NOTEVOLE
-                        // (aeroporto, stazione, monumento...) a un semplice
-                        // indirizzo quando l'importanza di Nominatim è simile —
-                        // vedi geocodaLuogoMigliore.
-                        classe: r.class || null,
-                        tipo: r.type || null
-                    };
-                });
+                // NON usiamo un filtro geografico rigido qui (escluderebbe
+                // anche il risultato giusto quando cercato è altrove).
+                // Prendiamo PIÙ risultati possibili (fino a 10, non solo 5)
+                // e poi li RIORDINIAMO noi: chi è più vicino a dove ti trovi
+                // ora va in cima alla lista, invece di fidarci solo di
+                // quanto Nominatim lo ritiene "importante" a livello
+                // nazionale. Con "viewbox"+bounded=0 diamo comunque una
+                // preferenza leggera alla tua zona già in questa fase.
+                if (!risultatiNominatim.length) {
+                    const viewbox = haPosizione
+                        ? ('&viewbox=' + (nearLon - 0.5) + ',' + (nearLat + 0.5) + ',' + (nearLon + 0.5) + ',' + (nearLat - 0.5) + '&bounded=0')
+                        : '';
+                    risultatiNominatim = await interrogaNominatim(viewbox);
+                }
 
                 // Riordino per vicinanza: chi è più vicino a te guadagna
                 // punti, così un posto meno "importante" a livello nazionale
