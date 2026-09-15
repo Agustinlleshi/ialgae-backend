@@ -113,16 +113,11 @@ const DUFFEL_BASE_URL = 'https://api.duffel.com';
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 
 // Token pubblico Mapbox (pk.xxx), usato per geocodifica/indicazioni/mappa/
-// ricerca POI quando siamo sotto la soglia mensile gratuita — vedi la
-// sezione "CONTATORE USO MAPBOX" più sotto per il perché e il come.
+// ricerca POI quando siamo sotto la soglia mensile gratuita.
 const MAPBOX_ACCESS_TOKEN = process.env.MAPBOX_ACCESS_TOKEN || '';
-// ATTENZIONE: questa chiave era prima scritta in chiaro dentro pwa.html,
-// visibile a chiunque avesse guardato il codice sorgente della pagina.
-// L'ho spostata qui (lato server, mai visibile al browser) ma consiglio
-// di generarne una NUOVA da https://developer.tomtom.com/ e impostarla
-// come variabile d'ambiente TOMTOM_API_KEY su Render — quella vecchia,
-// essendo già stata pubblica, va considerata compromessa.
-const TOMTOM_API_KEY = process.env.TOMTOM_API_KEY || 'DF4uM9LiSVMQOMMYR4z9DWTXiNW9Qz7r';
+// Genera una chiave TomTom da https://developer.tomtom.com/ e impostala
+// come variabile d'ambiente TOMTOM_API_KEY su Render.
+const TOMTOM_API_KEY = process.env.TOMTOM_API_KEY || '';
 
 // Chiave segreta per proteggere le statistiche interne (es. iscrizioni
 // giornaliere). Impostala su Render come stringa lunga e casuale, inventata
@@ -272,18 +267,11 @@ const memory2faAttempts = new Map(); // userId -> { count, windowStart }
 // sul piano gratuito, si traduce in ore di calcolo consumate inutilmente).
 const pendingDurations = new Map(); // page_view id -> durationMs
 
-// Segnalazioni stradali (vedi tabella map_reports / endpoint
-// /api/maps/reports): se il database non è configurato, le teniamo qui in
-// memoria — si perdono a un riavvio del server, ma restano comunque
-// condivise tra tutti i visitatori finché il server resta attivo, il che
-// è già molto meglio di "solo nel browser di chi le ha messe".
+// Segnalazioni stradali (tabella map_reports / endpoint /api/maps/reports):
+// se il database non è configurato, ripiego in memoria.
 const memoryReports = [];
 let memoryReportsNextId = 1;
-
-// Anti-abuso: senza un limite, chiunque potrebbe riempire la mappa di
-// segnalazioni false in pochi secondi. 12 ogni 10 minuti per IP basta e
-// avanza per l'uso reale (chi guida non mette 12 segnalazioni in 10 minuti)
-// mentre blocca comunque uno script che ne mandasse a raffica.
+// Anti-abuso: 12 segnalazioni ogni 10 minuti per IP.
 const reportsRateLimitByIp = new Map();
 
 
@@ -670,10 +658,7 @@ async function initDb() {
     );
 
     // Segnalazioni stradali stile Waze (pulsante "Segnala" in pwa.html):
-    // condivise tra tutti gli utenti (prima restavano solo nel browser di chi
-    // le metteva) e con una scadenza — "expires_at" invece di calcolarla ogni
-    // volta lato codice, così anche ordinare/filtrare per "ancora valide" resta
-    // una semplice condizione SQL (vedi endpoint /api/maps/reports più sotto).
+    // condivise tra tutti, con scadenza automatica dopo 30 minuti.
     await pool.query(
         'CREATE TABLE IF NOT EXISTS map_reports (' +
         '  id SERIAL PRIMARY KEY,' +
@@ -692,22 +677,14 @@ async function initDb() {
 // ------------------------------------------------------------
 // CONTATORE USO MAPBOX — decide se questa richiesta può usare Mapbox
 // (sotto la soglia che ci siamo dati noi) oppure deve ripiegare sul
-// servizio gratuito equivalente. La query è scritta apposta per essere
-// ATOMICA: anche con tante richieste arrivate insieme, non si supera mai
-// la soglia per colpa di controlli "letti" in un momento e "scritti" un
-// attimo dopo (race condition classica dei contatori).
-//
-// Se il database non è configurato (DATABASE_URL assente), non possiamo
-// contare in modo affidabile e condiviso: per prudenza, in quel caso NON
-// usiamo mai Mapbox — meglio restare sul gratuito che rischiare un uso
+// servizio gratuito equivalente. Se il database non è configurato, per
+// prudenza NON usiamo mai Mapbox — meglio il gratuito che un uso
 // scoordinato e potenzialmente costoso.
 // ------------------------------------------------------------
 async function permessoUsoMapbox(servizio, sogliaMassima) {
     if (!MAPBOX_ACCESS_TOKEN || !dbEnabled) return false;
-
     const oggi = new Date();
     const annoMese = oggi.getFullYear() + '-' + String(oggi.getMonth() + 1).padStart(2, '0');
-
     try {
         const result = await pool.query(
             'INSERT INTO uso_mapbox (servizio, anno_mese, conteggio) VALUES ($1, $2, 1) ' +
@@ -716,12 +693,7 @@ async function permessoUsoMapbox(servizio, sogliaMassima) {
             'RETURNING conteggio',
             [servizio, annoMese, sogliaMassima]
         );
-        if (result.rows.length > 0) return true; // richiesta autorizzata e già conteggiata
-
-        // Soglia raggiunta: avvisiamo in dashboard (non via email — quella la
-        // manda Mapbox stessa se hai configurato le notifiche di utilizzo).
-        // Throttled a 24 ore: una volta al giorno basta e avanza, non serve
-        // un avviso per OGNI singola richiesta bloccata da qui in poi.
+        if (result.rows.length > 0) return true;
         await createNotificationThrottled(
             'mapbox_limite',
             '⚠️ Mapbox "' + servizio + '": raggiunta la soglia di sicurezza (' + sogliaMassima + '/mese). Passato automaticamente al servizio gratuito per il resto del mese.',
@@ -729,8 +701,8 @@ async function permessoUsoMapbox(servizio, sogliaMassima) {
         );
         return false;
     } catch (err) {
-        console.error('Errore contatore uso Mapbox:', err);
-        return false; // in caso di dubbio, meglio il gratuito
+        console.error('Errore contatore Mapbox:', err);
+        return false;
     }
 }
 
@@ -1499,63 +1471,44 @@ const geoIpCache = new Map(); // ip -> { data, timestamp }
 const GEO_IP_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 ore
 
 // ------------------------------------------------------------
-// PREZZO MEDIO NAZIONALE DEI CARBURANTI (fonte: open data del MIMIT,
-// Ministero delle Imprese e del Made in Italy — dato ufficiale, gratuito,
-// aggiornato ogni giorno verso le 8:30). Usato per stimare il costo del
-// carburante di un percorso, NON per pedaggi (quelli restano fuori: nessuna
-// fonte gratuita ne conosce il prezzo esatto).
-// Il file è un CSV con la media per regione; la media nazionale che
-// mostriamo è semplicemente la media aritmetica di tutte le regioni — lo
-// stesso identico dato che il sito del MIMIT mostra nella sua pagina
-// dedicata, calcolato però da noi partendo dal CSV (più robusto da leggere
-// via codice di una pagina HTML, che potrebbe cambiare struttura).
+// PREZZO MEDIO NAZIONALE DEI CARBURANTI (fonte: open data del MIMIT).
+// ------------------------------------------------------------
 const FUEL_PRICE_CSV_URL = 'https://www.mimit.gov.it/images/stories/carburanti/MediaRegionaleStradale.csv';
-const FUEL_PRICE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 ore: il dato MIMIT cambia una volta al giorno, non serve riscaricarlo più spesso
-let fuelPriceCache = null; // { data: {...}, timestamp }
+const FUEL_PRICE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+let fuelPriceCache = null;
 
 async function getPrezzoCarburanteNazionale() {
     if (fuelPriceCache && (Date.now() - fuelPriceCache.timestamp) < FUEL_PRICE_CACHE_TTL_MS) {
         return fuelPriceCache.data;
     }
-
     try {
         const risposta = await fetch(FUEL_PRICE_CSV_URL, { signal: AbortSignal.timeout(10000) });
         if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
         const testoCsv = await risposta.text();
         const righe = testoCsv.split('\n').map(function (r) { return r.trim(); }).filter(Boolean);
-
-        // Prima riga: "Aggiornamento GG-MM-AAAA". Seconda riga: intestazioni
-        // delle colonne. Dalla terza in poi: "REGIONE;TIPOLOGIA;EROGAZIONE;PREZZO MEDIO"
         const aggiornamento = (righe[0] || '').replace('Aggiornamento', '').trim();
-        const somme = {};   // tipologia -> somma prezzi
-        const conteggi = {}; // tipologia -> quante regioni l'hanno
-
+        const somme = {};
+        const conteggi = {};
         for (let i = 2; i < righe.length; i++) {
             const campi = righe[i].split(';');
             if (campi.length < 4) continue;
-            const tipologia = campi[1].trim().toLowerCase(); // gasolio / benzina / gpl / metano
+            const tipologia = campi[1].trim().toLowerCase();
             const prezzo = parseFloat(campi[3].replace(',', '.'));
             if (!Number.isFinite(prezzo)) continue;
             somme[tipologia] = (somme[tipologia] || 0) + prezzo;
             conteggi[tipologia] = (conteggi[tipologia] || 0) + 1;
         }
-
         const dati = { aggiornamento: aggiornamento || null, fonte: 'mimit' };
         Object.keys(somme).forEach(function (tipologia) {
             dati[tipologia] = Math.round((somme[tipologia] / conteggi[tipologia]) * 1000) / 1000;
         });
-
-        // Serve almeno benzina e gasolio, altrimenti il dato non è utilizzabile
         if (typeof dati.benzina !== 'number' || typeof dati.gasolio !== 'number') {
             throw new Error('CSV MIMIT senza benzina/gasolio validi');
         }
-
         fuelPriceCache = { data: dati, timestamp: Date.now() };
         return dati;
     } catch (err) {
         console.error('Prezzo carburanti MIMIT non raggiungibile:', err.message);
-        // Se avevamo un valore precedente (anche scaduto) è comunque meglio
-        // di niente: molto meglio un prezzo di ieri che nessuna stima.
         if (fuelPriceCache) return fuelPriceCache.data;
         return null;
     }
@@ -1981,15 +1934,13 @@ const server = http.createServer((req, res) => {
     }
 
     // Endpoint suggerimenti di ricerca in tempo reale (proxy verso DuckDuckGo)
+
     // ------------------------------------------------------------
-    // GEOCODIFICA (Mapbox se sotto soglia, altrimenti Nominatim in automatico)
+    // ENDPOINT MAPPE (/api/maps/*) — geocodifica, indicazioni, tile,
+    // traffico, segnalazioni. Tenuti di nuovo qui insieme al resto per
+    // ora (in attesa di decidere come tenere sveglio un secondo
+    // servizio Render separato prima di dividerli davvero).
     // ------------------------------------------------------------
-    // Soglia auto-imposta VOLUTAMENTE prudente: ci fermiamo a 50.000, cioè a
-    // METÀ della soglia gratuita reale di Mapbox (100.000/mese), non al
-    // massimo consentito. Il motivo: se Mapbox in futuro abbassasse la
-    // soglia gratuita senza che ce ne accorgiamo, un margine così ampio ci
-    // protegge comunque da un addebito a sorpresa — molto meglio usare un
-    // po' meno Mapbox (e un po' più il ripiego gratuito) che rischiare.
     const SOGLIA_MAPBOX_GEOCODING = 50000;
 
     if (req.method === 'GET' && req.url.indexOf('/api/maps/geocode') === 0) {
@@ -1999,21 +1950,20 @@ const server = http.createServer((req, res) => {
                 const q = (fullUrl.searchParams.get('q') || '').trim();
                 if (!q) return sendJSON(res, 200, { risultati: [], fonte: null });
 
-                // Posizione approssimativa di chi cerca (centro della mappa che
-                // sta guardando in quel momento): senza questo, cercare un
-                // posto poco noto (es. un piccolo centro commerciale locale)
-                // può restituire risultati con lo stesso nome sparsi per
-                // tutta Italia invece di quello vicino che magari si vede
-                // già sulla mappa. Parametro facoltativo: se manca, la
-                // ricerca funziona comunque come prima, solo senza preferenza
-                // di zona.
                 const nearLat = parseFloat(fullUrl.searchParams.get('nearLat'));
                 const nearLon = parseFloat(fullUrl.searchParams.get('nearLon'));
                 const haPosizione = Number.isFinite(nearLat) && Number.isFinite(nearLon);
 
                 const usaMapbox = await permessoUsoMapbox('geocoding', SOGLIA_MAPBOX_GEOCODING);
 
-                if (usaMapbox) {
+                // Interroga Mapbox (se sotto soglia). NON ci fermiamo più al
+                // primo che risponde: un caso reale ("milano malpensa") ha
+                // mostrato che Mapbox può rispondere con successo ma con
+                // risultati mediocri (solo vie omonime, senza l'aeroporto
+                // vero) — se ci fermassimo lì, perderemmo per sempre la
+                // possibilità che Nominatim faccia meglio.
+                const interrogaMapbox = async function () {
+                    if (!usaMapbox) return [];
                     try {
                         const prossimita = haPosizione ? ('&proximity=' + nearLon + ',' + nearLat) : '';
                         const url = 'https://api.mapbox.com/geocoding/v5/mapbox.places/' + encodeURIComponent(q) + '.json' +
@@ -2021,34 +1971,27 @@ const server = http.createServer((req, res) => {
                         const risposta = await fetch(url, { signal: AbortSignal.timeout(8000) });
                         if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
                         const dati = await risposta.json();
-                        const risultati = (dati.features || []).map(function (f) {
+                        return (dati.features || []).map(function (f) {
                             return {
                                 lat: f.center[1],
                                 lon: f.center[0],
                                 display_name: f.place_name,
                                 boundingbox: f.bbox ? [f.bbox[1], f.bbox[3], f.bbox[0], f.bbox[2]] : null,
                                 importance: typeof f.relevance === 'number' ? f.relevance : 0.5,
-                                // Mapbox usa "place_type" (es. ["poi"], ["address"]):
-                                // lo passiamo così com'è, il frontend lo confronta
-                                // in modo un po' diverso da "classe/tipo" di
-                                // Nominatim ma con lo stesso obiettivo.
                                 classe: (f.place_type && f.place_type[0]) || null,
-                                tipo: null
+                                tipo: null,
+                                _fonte: 'mapbox'
                             };
                         });
-                        return sendJSON(res, 200, { risultati: risultati, fonte: 'mapbox' });
                     } catch (erroreMapbox) {
-                        console.error('Geocodifica Mapbox fallita, ripiego su Nominatim:', erroreMapbox.message);
-                        // continua sotto: nessun return, cade nel ramo Nominatim
+                        console.error('Geocodifica Mapbox fallita:', erroreMapbox.message);
+                        return [];
                     }
-                }
+                };
 
-                // Funzione che interroga Nominatim e adatta i risultati al
-                // nostro formato: usata sia per la ricerca ristretta qui
-                // sotto sia per quella nazionale di ripiego.
-                const interrogaNominatim = async function (urlExtra) {
-                    const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
-                        urlExtra + '&q=' + encodeURIComponent(q);
+                const interrogaNominatim = async function (urlExtra, testoCercato) {
+                    const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=30&extratags=1&countrycodes=it' +
+                        urlExtra + '&q=' + encodeURIComponent(testoCercato);
                     const risposta = await fetch(url, {
                         headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                         signal: AbortSignal.timeout(10000)
@@ -2063,79 +2006,206 @@ const server = http.createServer((req, res) => {
                             importance: typeof r.importance === 'number' ? r.importance : 0.5,
                             wikipedia: (r.extratags && r.extratags.wikipedia) || null,
                             classe: r.class || null,
-                            tipo: r.type || null
+                            tipo: r.type || null,
+                            _fonte: 'nominatim'
                         };
                     });
                 };
 
-                let risultatiNominatim = [];
-
-                // Primo tentativo, SOLO se conosciamo la posizione di chi
-                // cerca: una ricerca DAVVERO ristretta (bounded=1, non solo
-                // "preferita") a circa 25km intorno a te. Dentro un'area
-                // così piccola non possono esistere omonimi lontani a
-                // rubare il posto per "importanza nazionale" — è il modo
-                // giusto per risolvere casi come "piazza piola" che non
-                // trova "Piazzale Gabrio Piola" di Milano perché un
-                // "Piazzale Pola" a Brescia/Torino è considerato più
-                // importante a livello di tutta Italia. Se qui non troviamo
-                // nulla (magari perché il posto cercato è altrove, non
-                // vicino a te), ripieghiamo sotto sulla ricerca nazionale
-                // come prima.
-                if (haPosizione) {
-                    const raggio = 0.22; // gradi, circa 25km
-                    const viewboxRistretto = '&viewbox=' + (nearLon - raggio) + ',' + (nearLat + raggio) + ',' + (nearLon + raggio) + ',' + (nearLat - raggio) + '&bounded=1';
-                    try {
-                        risultatiNominatim = await interrogaNominatim(viewboxRistretto);
-                    } catch (erroreRistretto) {
-                        console.error('Ricerca ristretta Nominatim fallita:', erroreRistretto.message);
+                const interrogaNominatimCompleto = async function (testoCercato) {
+                    let risultati = [];
+                    if (haPosizione) {
+                        const raggio = 0.22; // gradi, circa 25km
+                        const viewboxRistretto = '&viewbox=' + (nearLon - raggio) + ',' + (nearLat + raggio) + ',' + (nearLon + raggio) + ',' + (nearLat - raggio) + '&bounded=1';
+                        try {
+                            risultati = await interrogaNominatim(viewboxRistretto, testoCercato);
+                        } catch (erroreRistretto) {
+                            console.error('Ricerca ristretta Nominatim fallita:', erroreRistretto.message);
+                        }
                     }
-                }
+                    if (!risultati.length) {
+                        const viewbox = haPosizione
+                            ? ('&viewbox=' + (nearLon - 0.5) + ',' + (nearLat + 0.5) + ',' + (nearLon + 0.5) + ',' + (nearLat - 0.5) + '&bounded=0')
+                            : '';
+                        try {
+                            risultati = await interrogaNominatim(viewbox, testoCercato);
+                        } catch (erroreNazionale) {
+                            console.error('Ricerca nazionale Nominatim fallita:', erroreNazionale.message);
+                        }
+                    }
+                    return risultati;
+                };
 
-                // Ripiego gratuito nazionale: stessa identica logica usata
-                // prima direttamente dal browser, solo spostata sul server.
-                // "extratags=1" in più: ci serve per il campo "wikipedia" dei
-                // luoghi noti, usato dal frontend per mostrare le foto di
-                // Wikimedia Commons anche sul segnaposto di una ricerca
-                // semplice (non solo sui punti di interesse di Overpass).
-                //
-                // NON usiamo un filtro geografico rigido qui (escluderebbe
-                // anche il risultato giusto quando cercato è altrove).
-                // Prendiamo PIÙ risultati possibili (fino a 10, non solo 5)
-                // e poi li RIORDINIAMO noi: chi è più vicino a dove ti trovi
-                // ora va in cima alla lista, invece di fidarci solo di
-                // quanto Nominatim lo ritiene "importante" a livello
-                // nazionale. Con "viewbox"+bounded=0 diamo comunque una
-                // preferenza leggera alla tua zona già in questa fase.
-                if (!risultatiNominatim.length) {
-                    const viewbox = haPosizione
-                        ? ('&viewbox=' + (nearLon - 0.5) + ',' + (nearLat + 0.5) + ',' + (nearLon + 0.5) + ',' + (nearLat - 0.5) + '&bounded=0')
-                        : '';
-                    risultatiNominatim = await interrogaNominatim(viewbox);
-                }
+                // Ricerca aggiuntiva con SOLO L'ULTIMA PAROLA della domanda:
+                // quando scrivi "città + luogo" (es. "milano malpensa",
+                // "roma colosseo"), spesso il nome VERO del posto su
+                // OpenStreetMap è solo l'ultima parola da sola — la
+                // combinazione delle due può mandare fuori strada sia
+                // Mapbox che Nominatim (si aspettano più una via "in" una
+                // città che un nome libero a due parole). Proviamo quindi
+                // anche solo l'ultima parola, in parallelo, senza costare
+                // tempo aggiuntivo a chi cerca.
+                // Ricerca STRUTTURATA (parametro "amenity" di Nominatim,
+                // pensato apposta per cercare un luogo/punto di interesse
+                // per NOME — non un indirizzo). La ricerca normale (q=) a
+                // volte non basta per nomi noti come "Malpensa": Nominatim
+                // può classificarlo con un'importanza interna bassa e
+                // scartarlo prima ancora di arrivare a noi. La ricerca per
+                // "amenity" guarda proprio nel nome del luogo, con più
+                // probabilità di trovarlo.
+                const interrogaNominatimPerNome = async function (nome) {
+                    try {
+                        const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
+                            '&amenity=' + encodeURIComponent(nome);
+                        const risposta = await fetch(url, {
+                            headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
+                            signal: AbortSignal.timeout(10000)
+                        });
+                        const dati = await risposta.json();
+                        return (Array.isArray(dati) ? dati : []).map(function (r) {
+                            return {
+                                lat: parseFloat(r.lat),
+                                lon: parseFloat(r.lon),
+                                display_name: r.display_name,
+                                boundingbox: r.boundingbox ? r.boundingbox.map(Number) : null,
+                                importance: typeof r.importance === 'number' ? r.importance : 0.5,
+                                wikipedia: (r.extratags && r.extratags.wikipedia) || null,
+                                classe: r.class || null,
+                                tipo: r.type || null,
+                                _fonte: 'nominatim'
+                            };
+                        });
+                    } catch (erroreStrutturata) {
+                        console.error('Ricerca strutturata Nominatim fallita:', erroreStrutturata.message);
+                        return [];
+                    }
+                };
 
-                // Riordino per vicinanza: chi è più vicino a te guadagna
-                // punti, così un posto meno "importante" a livello nazionale
-                // ma proprio nella tua zona può battere un omonimo o quasi-
-                // omonimo più "importante" ma lontano centinaia di km.
-                // Una differenza di importanza enorme (un vero monumento
-                // nazionale) può comunque vincere anche da lontano — qui
-                // si bilanciano solo i casi dubbi/simili.
-                if (haPosizione && risultatiNominatim.length > 1) {
+                // Ricerca OVERPASS: cerca per NOME ESATTO tra tutti i dati
+                // OpenStreetMap, senza nessuna classifica di "quanto è
+                // famoso" un posto (a differenza di Nominatim/Mapbox, che
+                // possono scartare un aeroporto vero se lo ritengono poco
+                // "importante"). Stessi tre server di riserva già usati in
+                // pwa.html per gli autovelox: gratuiti, senza chiave API.
+                // Interrogata solo quando l'ultima parola della ricerca è
+                // abbastanza lunga (almeno 4 lettere) da non rischiare
+                // risultati a raffica su parole troppo generiche.
+                const OVERPASS_SERVERS = [
+                    'https://overpass-api.de/api/interpreter',
+                    'https://overpass.kumi.systems/api/interpreter',
+                    'https://overpass.osm.ch/api/interpreter'
+                ];
+                const interrogaOverpassPerNome = async function (nome) {
+                    if (!nome || nome.length < 4) return [];
+                    const query = '[out:json][timeout:10];' +
+                        'area["ISO3166-1"="IT"][admin_level=2]->.it;' +
+                        '(' +
+                        'node["name"~"' + nome.replace(/["\\]/g, '') + '",i](area.it);' +
+                        'way["name"~"' + nome.replace(/["\\]/g, '') + '",i](area.it);' +
+                        ');' +
+                        'out center 15;';
+                    for (const server of OVERPASS_SERVERS) {
+                        try {
+                            const risposta = await fetch(server, {
+                                method: 'POST',
+                                body: 'data=' + encodeURIComponent(query),
+                                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                signal: AbortSignal.timeout(8000)
+                            });
+                            if (!risposta.ok) continue;
+                            const dati = await risposta.json();
+                            const elementi = (dati && dati.elements) || [];
+                            return elementi.map(function (el) {
+                                const lat = el.lat != null ? el.lat : (el.center && el.center.lat);
+                                const lon = el.lon != null ? el.lon : (el.center && el.center.lon);
+                                if (lat == null || lon == null) return null;
+                                const tags = el.tags || {};
+                                const parti = [tags.name, tags['addr:city'] || tags['addr:suburb'], 'Italia'].filter(Boolean);
+                                return {
+                                    lat: lat,
+                                    lon: lon,
+                                    display_name: parti.join(', '),
+                                    boundingbox: null,
+                                    // Un nome esatto trovato su OSM merita fiducia alta:
+                                    // qui non abbiamo un punteggio di "importanza" reale
+                                    // come Nominatim, quindi ne assegnamo uno fisso ma
+                                    // comunque competitivo.
+                                    importance: 0.7,
+                                    wikipedia: tags.wikipedia || null,
+                                    classe: tags.aeroway ? 'aeroway' : (tags.amenity ? 'amenity' : (tags.railway ? 'railway' : null)),
+                                    tipo: tags.aeroway || tags.amenity || tags.railway || null,
+                                    _fonte: 'overpass'
+                                };
+                            }).filter(Boolean);
+                        } catch (erroreOverpass) {
+                            console.error('Overpass (' + server + ') non raggiungibile, provo il successivo:', erroreOverpass.message);
+                        }
+                    }
+                    return [];
+                };
+
+                // Overpass può essere lento in certi momenti (specie se il
+                // primo server di riserva non risponde e serve provare il
+                // successivo): mettiamo un tetto massimo di attesa così una
+                // sua lentezza non rallenta la ricerca per TUTTI, anche per
+                // chi cerca qualcosa che Overpass non c'entra affatto.
+                const conTetto = function (promessa, msMassimi, ripiego) {
+                    return Promise.race([
+                        promessa,
+                        new Promise(function (resolve) { setTimeout(function () { resolve(ripiego); }, msMassimi); })
+                    ]);
+                };
+
+                const paroleQuery = q.trim().split(/\s+/);
+                const ultimaParola = paroleQuery.length > 1 ? paroleQuery[paroleQuery.length - 1] : null;
+
+                const [risultatiMapbox, risultatiNominatim, risultatiUltimaParola, risultatiPerNome, risultatiOverpass] = await Promise.all([
+                    interrogaMapbox(),
+                    interrogaNominatimCompleto(q),
+                    ultimaParola ? interrogaNominatimCompleto(ultimaParola) : Promise.resolve([]),
+                    interrogaNominatimPerNome(q),
+                    conTetto(interrogaOverpassPerNome(ultimaParola || q), 5000, [])
+                ]);
+
+                // Unione: stessa posizione (arrotondata) e stesso nome =
+                // stesso posto, teniamolo una volta sola (preferendo la
+                // versione con più dettagli, cioè Nominatim quando c'è).
+                const chiaveDedup = function (r) {
+                    return r.lat.toFixed(3) + '|' + r.lon.toFixed(3);
+                };
+                const perChiave = {};
+                risultatiNominatim.concat(risultatiUltimaParola, risultatiPerNome, risultatiOverpass, risultatiMapbox).forEach(function (r) {
+                    const k = chiaveDedup(r);
+                    if (!perChiave[k]) perChiave[k] = r;
+                });
+                let risultati = Object.values(perChiave);
+
+                // Riordino per vicinanza + importanza: chi è più vicino a te
+                // guadagna punti, così un posto meno "importante" a livello
+                // nazionale ma proprio nella tua zona (o un aeroporto vero
+                // che una fonte aveva scartato) può battere un omonimo o
+                // quasi-omonimo mediocre trovato dall'altra fonte.
+                if (haPosizione && risultati.length > 1) {
                     const distanzaKm = function (lat1, lon1, lat2, lon2) {
                         const R = 6371, toRad = Math.PI / 180;
                         const dLat = (lat2 - lat1) * toRad, dLon = (lon2 - lon1) * toRad;
                         const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.sin(dLon / 2) ** 2;
                         return 2 * R * Math.asin(Math.sqrt(a));
                     };
-                    risultatiNominatim.forEach(function (r) {
+                    risultati.forEach(function (r) {
                         r._punteggio = r.importance - distanzaKm(nearLat, nearLon, r.lat, r.lon) * 0.003;
                     });
-                    risultatiNominatim.sort(function (a, b) { return b._punteggio - a._punteggio; });
-                    risultatiNominatim.forEach(function (r) { delete r._punteggio; });
+                    risultati.sort(function (a, b) { return b._punteggio - a._punteggio; });
+                    risultati.forEach(function (r) { delete r._punteggio; });
+                } else {
+                    risultati.sort(function (a, b) { return (b.importance || 0) - (a.importance || 0); });
                 }
 
-                return sendJSON(res, 200, { risultati: risultatiNominatim, fonte: 'nominatim' });
+                risultati = risultati.slice(0, 10);
+                const fonteUsata = risultati.length ? (risultati[0]._fonte || 'nominatim') : null;
+                risultati.forEach(function (r) { delete r._fonte; });
+
+                return sendJSON(res, 200, { risultati: risultati, fonte: fonteUsata });
 
             } catch (err) {
                 console.error('Errore geocodifica:', err);
@@ -2146,50 +2216,9 @@ const server = http.createServer((req, res) => {
     }
 
     // ------------------------------------------------------------
-    // INDICAZIONI STRADALI (Mapbox se sotto soglia, altrimenti OSRM in automatico)
+    // INDICAZIONI STRADALI (Mapbox se sotto soglia, altrimenti OSRM)
     // ------------------------------------------------------------
-    // Stessa identica filosofia prudente della geocodifica: soglia a metà
-    // di quella reale di Mapbox (100.000/mese), non al massimo.
     const SOGLIA_MAPBOX_DIRECTIONS = 50000;
-
-    // Riporta la risposta di Mapbox e quella di OSRM alla STESSA identica
-    // forma, indipendentemente da chi ha risposto: così il resto del sito
-    // (e il browser dell'utente) non deve sapere qual è stato usato.
-    // Un dettaglio importante: Mapbox fornisce già una frase pronta per ogni
-    // manovra ("istruzione_pronta"); OSRM no — in quel caso il browser userà
-    // la sua funzione che traduce tipo+modificatore in una frase (già
-    // costruita e testata), usando gli stessi identici campi "maneuver" che
-    // forniamo qui per entrambe le fonti.
-    function normalizzaPercorso(route, fonte) {
-        return {
-            fonte: fonte,
-            distanza: route.distance,
-            durata: route.duration,
-            coordinate: route.geometry.coordinates.map(function (c) { return [c[1], c[0]]; }),
-            passi: (route.legs && route.legs[0] && route.legs[0].steps ? route.legs[0].steps : []).map(function (s) {
-                return {
-                    distanza: s.distance,
-                    nome_via: s.name || '',
-                    maneuver: {
-                        type: s.maneuver.type,
-                        modifier: s.maneuver.modifier || null,
-                        exit: s.maneuver.exit || null,
-                        location: s.maneuver.location // [lon, lat]
-                    },
-                    istruzione_pronta: (fonte === 'mapbox' && s.maneuver.instruction) ? s.maneuver.instruction : null
-                };
-            })
-        };
-    }
-
-    // Stessa funzione di sopra, ma per la risposta INTERA di Mapbox/OSRM,
-    // quando abbiamo chiesto alternative: restituisce un array di percorsi
-    // già normalizzati, dal più veloce in giù, con un tetto massimo (le API
-    // a volte ne restituiscono più di quanti ne servano davvero all'utente).
-    const MASSIMO_PERCORSI_ALTERNATIVI = 3;
-    function normalizzaPercorsi(routes, fonte) {
-        return routes.slice(0, MASSIMO_PERCORSI_ALTERNATIVI).map(function (r) { return normalizzaPercorso(r, fonte); });
-    }
 
     if (req.method === 'GET' && req.url.indexOf('/api/maps/directions') === 0) {
         (async function () {
@@ -2207,13 +2236,26 @@ const server = http.createServer((req, res) => {
 
                 const usaMapbox = await permessoUsoMapbox('directions', SOGLIA_MAPBOX_DIRECTIONS);
 
-                // Piccolo helper: dato un array di percorsi già normalizzati,
-                // costruisce la risposta finale. Il PRIMO percorso resta anche
-                // ai vecchi campi di primo livello (distanza/durata/coordinate/
-                // passi), esattamente come prima di avere le alternative: così
-                // qualunque pagina non ancora aggiornata per mostrare la scelta
-                // del percorso continua a funzionare senza modifiche, mentre
-                // "percorsi" (con tutte le alternative) è lì per chi lo usa.
+                function normalizzaPercorsi(routes, fonte) {
+                    return routes.map(function (r) {
+                        return {
+                            fonte: fonte,
+                            distanza: r.distance,
+                            durata: r.duration,
+                            coords: (r.geometry && r.geometry.coordinates) ? r.geometry.coordinates.map(function (c) { return [c[1], c[0]]; }) : [],
+                            passi: ((r.legs && r.legs[0] && r.legs[0].steps) || []).map(function (s) {
+                                return {
+                                    istruzione: s.maneuver,
+                                    nome_via: s.name,
+                                    distanza: s.distance,
+                                    durata: s.duration,
+                                    coords: (s.geometry && s.geometry.coordinates) ? s.geometry.coordinates.map(function (c) { return [c[1], c[0]]; }) : []
+                                };
+                            })
+                        };
+                    });
+                }
+
                 function rispostaConAlternative(percorsi) {
                     return Object.assign({}, percorsi[0], { percorsi: percorsi });
                 }
@@ -2232,12 +2274,9 @@ const server = http.createServer((req, res) => {
                         return sendJSON(res, 200, rispostaConAlternative(normalizzaPercorsi(dati.routes, 'mapbox')));
                     } catch (erroreMapbox) {
                         console.error('Indicazioni Mapbox fallite, ripiego su OSRM:', erroreMapbox.message);
-                        // continua sotto: nessun return, cade nel ramo OSRM
                     }
                 }
 
-                // Ripiego gratuito: stessa identica logica usata prima
-                // direttamente dal browser, solo spostata sul server.
                 const routedPrefix = travelMode === 'walking' ? 'routed-foot' : (travelMode === 'cycling' ? 'routed-bike' : 'routed-car');
                 const osrmProfile = travelMode === 'walking' ? 'foot' : (travelMode === 'cycling' ? 'bike' : 'driving');
                 const osrmUrl = 'https://routing.openstreetmap.de/' + routedPrefix + '/route/v1/' + osrmProfile + '/' +
@@ -2258,11 +2297,6 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // ------------------------------------------------------------
-    // PREZZO CARBURANTE (media nazionale, fonte MIMIT) — usato dal
-    // frontend per stimare il costo di un percorso. Nessun costo pedaggi:
-    // nessuna fonte gratuita fornisce quel dato in Italia.
-    // ------------------------------------------------------------
     if (req.method === 'GET' && req.url.indexOf('/api/maps/fuel-price') === 0) {
         (async function () {
             const prezzi = await getPrezzoCarburanteNazionale();
@@ -2274,107 +2308,6 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // ------------------------------------------------------------
-    // TILE DELLA MAPPA (Mapbox se sotto soglia, altrimenti il nostro
-    // stile OpenFreeMap gratuito di sempre)
-    // ------------------------------------------------------------
-    // NOTA: usando MapLibre (gratis) invece della libreria ufficiale di
-    // Mapbox, il LORO contatore "Caricamenti mappa" (quello delle notifiche
-    // email che hai impostato) potrebbe non essere del tutto preciso — quel
-    // numero lo registra il loro SDK ufficiale, che qui non usiamo. Non
-    // cambia nulla per la sicurezza vera: il blocco reale lo decidiamo noi,
-    // qui sotto, in autonomia.
-    const SOGLIA_MAPBOX_TILES = 25000; // metà dei 50.000 caricamenti gratuiti/mese
-
-    // MapLibre (a differenza della libreria ufficiale di Mapbox) non sa
-    // interpretare gli indirizzi abbreviati "mapbox://..." che Mapbox usa
-    // nei suoi stili per indicare font, sprite e sorgenti delle tile — va
-    // fatta noi la "traduzione" in indirizzi https normali che qualunque
-    // libreria può capire, PRIMA di mandare lo stile al browser.
-    async function risolviStileMapbox(styleGrezzo, token, lingua) {
-        const style = JSON.parse(JSON.stringify(styleGrezzo)); // clona, non tocchiamo l'originale
-
-        // Font: una singola stringa con segnaposto, es.
-        // "mapbox://fonts/mapbox/{fontstack}/{range}.pbf"
-        if (style.glyphs && style.glyphs.indexOf('mapbox://fonts/') === 0) {
-            style.glyphs = 'https://api.mapbox.com/fonts/v1/' + style.glyphs.slice('mapbox://fonts/'.length) +
-                '?access_token=' + encodeURIComponent(token);
-        }
-
-        // Sprite: una singola stringa base, es. "mapbox://sprites/mapbox/streets-v12"
-        // (MapLibre aggiunge da solo .json/.png/@2x quando serve)
-        if (style.sprite && style.sprite.indexOf('mapbox://sprites/') === 0) {
-            style.sprite = 'https://api.mapbox.com/styles/v1/' + style.sprite.slice('mapbox://sprites/'.length) +
-                '/sprite?access_token=' + encodeURIComponent(token);
-        }
-
-        // Sorgenti delle tile: ognuna può avere un "url" tipo
-        // "mapbox://mapbox.mapbox-streets-v8,mapbox.mapbox-terrain-v2" — qui
-        // serve un'altra chiamata a Mapbox (TileJSON) per sapere i VERI
-        // indirizzi delle tile, che poi incorporiamo direttamente nello stile
-        // (campo "tiles") al posto dell'indirizzo abbreviato.
-        if (style.sources) {
-            for (const nomeSorgente of Object.keys(style.sources)) {
-                const sorgente = style.sources[nomeSorgente];
-                if (sorgente && typeof sorgente.url === 'string' && sorgente.url.indexOf('mapbox://') === 0) {
-                    try {
-                        const idTileset = sorgente.url.slice('mapbox://'.length);
-                        const tileJsonUrl = 'https://api.mapbox.com/v4/' + idTileset + '.json?secure&access_token=' + encodeURIComponent(token);
-                        const rispostaTileJson = await fetch(tileJsonUrl, { signal: AbortSignal.timeout(8000) });
-                        if (rispostaTileJson.ok) {
-                            const tileJson = await rispostaTileJson.json();
-                            if (Array.isArray(tileJson.tiles) && tileJson.tiles.length > 0) {
-                                delete sorgente.url;
-                                sorgente.tiles = tileJson.tiles;
-                                if (tileJson.minzoom !== undefined) sorgente.minzoom = tileJson.minzoom;
-                                if (tileJson.maxzoom !== undefined) sorgente.maxzoom = tileJson.maxzoom;
-                            }
-                        }
-                    } catch (erroreSorgente) {
-                        // Se UNA sorgente fallisce, la lasciamo com'è (quel livello
-                        // specifico non si vedrà) invece di far fallire l'intera mappa.
-                        console.error('Impossibile risolvere una sorgente Mapbox:', erroreSorgente.message);
-                    }
-                }
-            }
-        }
-
-        // Etichette di testo (nomi di città, vie, ecc.): lo stile
-        // "streets-v12" classico che usiamo NON si localizza da solo con un
-        // parametro nell'URL (quello funziona solo con il nuovo stile
-        // "Standard" v3 di Mapbox, che non è questo) — dobbiamo riscrivere
-        // noi a mano l'espressione di ogni livello di testo, sostituendo il
-        // riferimento al campo "name_en"/"name_it"/ecc. con quello della
-        // lingua che vogliamo, con ripiego sul nome locale ("name") se quella
-        // lingua non è disponibile per un dato luogo.
-        if (Array.isArray(style.layers)) {
-            style.layers.forEach(function (layer) {
-                if (layer.layout && layer.layout['text-field'] !== undefined) {
-                    let stringaEspressione = JSON.stringify(layer.layout['text-field']);
-                    if (stringaEspressione.indexOf('"name_') !== -1) {
-                        stringaEspressione = stringaEspressione.replace(/"name_[a-zA-Z]{2,3}(-[a-zA-Z]+)?"/g, '"name_' + lingua + '"');
-                        layer.layout['text-field'] = JSON.parse(stringaEspressione);
-                    }
-                }
-            });
-        }
-
-        return style;
-    }
-
-    // ------------------------------------------------------------
-    // GEOCODIFICA INVERSA ("cosa c'è in questo punto della mappa?"):
-    // usata quando l'utente clicca un punto sulla mappa Standard e vogliamo
-    // mostrargli nome + indirizzo, senza dover indovinare i nomi interni dei
-    // livelli grafici di chi fornisce la mappa (cambiano da stile a stile e
-    // non finiscono mai di sorprendere). Stessa soglia/contatore della
-    // geocodifica normale, perché è la stessa famiglia di servizio Mapbox.
-    // ------------------------------------------------------------
-    // SUGGERIMENTI DI INDIRIZZI ("via san..." → "Via San Martino, Milano"):
-    // stessa soglia/contatore della geocodifica normale (stessa famiglia di
-    // servizio Mapbox), ma con più risultati e pensato per query parziali
-    // digitate mentre si scrive, non per una ricerca già completa.
-    // ------------------------------------------------------------
     if (req.method === 'GET' && req.url.indexOf('/api/maps/address-suggest') === 0) {
         (async function () {
             try {
@@ -2383,7 +2316,6 @@ const server = http.createServer((req, res) => {
                 if (q.length < 3) return sendJSON(res, 200, { suggerimenti: [], fonte: null });
 
                 const usaMapbox = await permessoUsoMapbox('geocoding', SOGLIA_MAPBOX_GEOCODING);
-                let debugMapbox = 'permessoUsoMapbox ha risposto: ' + usaMapbox;
 
                 if (usaMapbox) {
                     try {
@@ -2391,7 +2323,7 @@ const server = http.createServer((req, res) => {
                             '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) +
                             '&autocomplete=true&limit=5&language=it&types=address,place,poi&country=it';
                         const risposta = await fetch(url, { signal: AbortSignal.timeout(6000) });
-                        if (!risposta.ok) throw new Error('HTTP ' + risposta.status + ' - ' + await risposta.text());
+                        if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
                         const dati = await risposta.json();
                         const suggerimenti = (dati.features || [])
                             .slice()
@@ -2409,24 +2341,10 @@ const server = http.createServer((req, res) => {
                                     lon: f.center ? f.center[0] : null
                                 };
                             });
-                        // IMPORTANTE: se Mapbox risponde correttamente ma senza
-                        // risultati utili (es. nomi di luoghi noti come aeroporti,
-                        // che a volte Mapbox copre peggio di OpenStreetMap in
-                        // Italia), NON ci fermiamo qui — passiamo comunque a
-                        // Nominatim qui sotto. Prima ci fermavamo sempre in caso
-                        // di risposta HTTP corretta, anche a zero risultati: così
-                        // la stessa ricerca poteva trovare un posto quando si
-                        // calcolava il percorso (che usa un altro percorso di
-                        // codice) ma non comparire affatto nei suggerimenti
-                        // mentre si scriveva — stessa domanda, due risposte
-                        // diverse. Ora i suggerimenti provano entrambe le fonti
-                        // proprio come fa il calcolo del percorso.
                         if (suggerimenti.length > 0) {
                             return sendJSON(res, 200, { suggerimenti: suggerimenti, fonte: 'mapbox' });
                         }
-                        debugMapbox += ' | Mapbox ha risposto ma senza risultati utili, ripiego su Nominatim';
                     } catch (erroreMapbox) {
-                        debugMapbox += ' | Errore Mapbox: ' + erroreMapbox.message;
                         console.error('Suggerimenti indirizzi Mapbox falliti, ripiego su Nominatim:', erroreMapbox.message);
                     }
                 }
@@ -2437,14 +2355,6 @@ const server = http.createServer((req, res) => {
                     signal: AbortSignal.timeout(8000)
                 });
                 const datiNominatim = await rispostaNominatim.json();
-                // IMPORTANTE: Nominatim NON restituisce i risultati ordinati per
-                // quanto un posto sia conosciuto — per una query ambigua (es. un
-                // refuso, o un nome comune a più paesini) può capitare che la
-                // piazza famosa di una grande città finisca in fondo alla lista
-                // (o fuori dai primi risultati) mentre vincono paesini sconosciuti
-                // con lo stesso nome. Ordiniamo noi per "importance" (lo stesso
-                // criterio già usato per la geocodifica principale), così i posti
-                // più conosciuti vengono proposti per primi.
                 const candidatiOrdinati = (Array.isArray(datiNominatim) ? datiNominatim : []).sort(function (a, b) {
                     const impA = typeof a.importance === 'number' ? a.importance : 0;
                     const impB = typeof b.importance === 'number' ? b.importance : 0;
@@ -2459,7 +2369,7 @@ const server = http.createServer((req, res) => {
                         lon: parseFloat(r.lon)
                     };
                 });
-                return sendJSON(res, 200, { suggerimenti: suggerimentiNominatim, fonte: 'nominatim', debug: debugMapbox });
+                return sendJSON(res, 200, { suggerimenti: suggerimentiNominatim, fonte: 'nominatim' });
 
             } catch (err) {
                 console.error('Errore suggerimenti indirizzi:', err);
@@ -2495,7 +2405,7 @@ const server = http.createServer((req, res) => {
                                 nome: primo.text || primo.place_name,
                                 indirizzo: primo.place_name,
                                 categoria: (primo.properties && primo.properties.category) || null,
-                                wikipedia: null, // Mapbox non espone questo dato in questa API
+                                wikipedia: null,
                                 lat: primo.center ? primo.center[1] : lat,
                                 lon: primo.center ? primo.center[0] : lon
                             });
@@ -2505,10 +2415,6 @@ const server = http.createServer((req, res) => {
                     }
                 }
 
-                // "extratags=1" fa sì che Nominatim includa anche il campo
-                // "wikipedia" quando il punto è collegato a una voce (musei,
-                // monumenti, parchi noti...) — ci serve per mostrare le foto
-                // di Wikimedia Commons nel popup sul frontend.
                 const urlNominatim = 'https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lon + '&zoom=18&addressdetails=1&extratags=1';
                 const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
@@ -2540,13 +2446,7 @@ const server = http.createServer((req, res) => {
     }
 
     // ------------------------------------------------------------
-    // SEGNALAZIONI STRADALI (pulsante "Segnala" in pwa.html, stile Waze):
-    // condivise tra tutti — prima restavano visibili solo a chi le metteva.
-    // Ogni segnalazione scade da sola dopo 30 minuti (utile per code,
-    // rallentamenti, controlli di polizia: cose che cambiano nel tempo,
-    // a differenza di un vero incidente stradale che potrebbe restare più
-    // a lungo — 30 minuti è un compromesso semplice e ragionevole per
-    // iniziare, si può sempre affinare per categoria più avanti).
+    // SEGNALAZIONI STRADALI condivise, scadenza 30 minuti
     // ------------------------------------------------------------
     const TIPI_SEGNALAZIONE_VALIDI = ['chiusura', 'incidente', 'rallentamento', 'polizia', 'autovelox_mobile', 'lavori', 'corsia_chiusa', 'oggetto'];
     const DURATA_SEGNALAZIONE_MS = 30 * 60 * 1000;
@@ -2568,10 +2468,6 @@ const server = http.createServer((req, res) => {
                 const tipo = TIPI_SEGNALAZIONE_VALIDI.indexOf(payload.tipo) !== -1 ? payload.tipo : null;
                 const lat = parseFloat(payload.lat);
                 const lon = parseFloat(payload.lon);
-                // Un controllo ampio, non un confine rigido sull'Italia: basta a
-                // scartare coordinate palesemente sbagliate (es. 0,0 per un bug
-                // del GPS) senza rischiare di rifiutare segnalazioni vere vicino
-                // a un confine.
                 if (!tipo || !Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) {
                     return sendJSON(res, 400, { error: 'Dati della segnalazione non validi.' });
                 }
@@ -2599,10 +2495,6 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // Restituisce le segnalazioni ANCORA VALIDE (non scadute) dentro un
-    // riquadro geografico — stesso formato bbox "minLon,minLat,maxLon,maxLat"
-    // già usato da /api/maps/traffic-incidents, per coerenza con il resto
-    // del frontend.
     if (req.method === 'GET' && req.url.indexOf('/api/maps/reports') === 0) {
         (async function () {
             try {
@@ -2649,15 +2541,57 @@ const server = http.createServer((req, res) => {
     }
 
     // ------------------------------------------------------------
-    // TILE RASTER DI MAPBOX (per pagine che usano Leaflet con tile PNG
-    // semplici invece delle tile vettoriali MapLibre, come la nuova app
-    // PWA di navigazione): la chiave resta sempre solo qui sul server,
-    // mai nel browser. Stessa soglia/contatore delle tile vettoriali:
-    // sono comunque "caricamenti mappa" agli occhi di Mapbox.
+    // TILE RASTER MAPBOX / TRAFFICO TOMTOM / STILE MAPPA
     // ------------------------------------------------------------
-    // TRAFFICO (TomTom): tile del flusso e incidenti, con la chiave
-    // sempre solo qui sul server — vedi nota sopra vicino a TOMTOM_API_KEY.
-    // ------------------------------------------------------------
+    const SOGLIA_MAPBOX_TILES = 25000;
+
+    async function risolviStileMapbox(styleGrezzo, token, lingua) {
+        const style = JSON.parse(JSON.stringify(styleGrezzo));
+        if (style.glyphs && style.glyphs.indexOf('mapbox://fonts/') === 0) {
+            style.glyphs = 'https://api.mapbox.com/fonts/v1/' + style.glyphs.slice('mapbox://fonts/'.length) +
+                '?access_token=' + encodeURIComponent(token);
+        }
+        if (style.sprite && style.sprite.indexOf('mapbox://sprites/') === 0) {
+            style.sprite = 'https://api.mapbox.com/styles/v1/' + style.sprite.slice('mapbox://sprites/'.length) +
+                '/sprite?access_token=' + encodeURIComponent(token);
+        }
+        if (style.sources) {
+            for (const nomeSorgente of Object.keys(style.sources)) {
+                const sorgente = style.sources[nomeSorgente];
+                if (sorgente && typeof sorgente.url === 'string' && sorgente.url.indexOf('mapbox://') === 0) {
+                    try {
+                        const idTileset = sorgente.url.slice('mapbox://'.length);
+                        const tileJsonUrl = 'https://api.mapbox.com/v4/' + idTileset + '.json?secure&access_token=' + encodeURIComponent(token);
+                        const rispostaTileJson = await fetch(tileJsonUrl, { signal: AbortSignal.timeout(8000) });
+                        if (rispostaTileJson.ok) {
+                            const tileJson = await rispostaTileJson.json();
+                            if (Array.isArray(tileJson.tiles) && tileJson.tiles.length > 0) {
+                                delete sorgente.url;
+                                sorgente.tiles = tileJson.tiles;
+                                if (tileJson.minzoom !== undefined) sorgente.minzoom = tileJson.minzoom;
+                                if (tileJson.maxzoom !== undefined) sorgente.maxzoom = tileJson.maxzoom;
+                            }
+                        }
+                    } catch (erroreSorgente) {
+                        console.error('Impossibile risolvere una sorgente Mapbox:', erroreSorgente.message);
+                    }
+                }
+            }
+        }
+        if (Array.isArray(style.layers)) {
+            style.layers.forEach(function (layer) {
+                if (layer.layout && layer.layout['text-field'] !== undefined) {
+                    let stringaEspressione = JSON.stringify(layer.layout['text-field']);
+                    if (stringaEspressione.indexOf('"name_') !== -1) {
+                        stringaEspressione = stringaEspressione.replace(/"name_[a-zA-Z]{2,3}(-[a-zA-Z]+)?"/g, '"name_' + lingua + '"');
+                        layer.layout['text-field'] = JSON.parse(stringaEspressione);
+                    }
+                }
+            });
+        }
+        return style;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/maps/traffic-tile') === 0) {
         (async function () {
             try {
@@ -2679,7 +2613,7 @@ const server = http.createServer((req, res) => {
                 const buffer = Buffer.from(await rispostaTile.arrayBuffer());
                 res.writeHead(200, {
                     'Content-Type': rispostaTile.headers.get('content-type') || 'image/png',
-                    'Cache-Control': 'public, max-age=120' // il traffico cambia in fretta: cache breve
+                    'Cache-Control': 'public, max-age=120'
                 });
                 return res.end(buffer);
             } catch (err) {
@@ -2727,9 +2661,6 @@ const server = http.createServer((req, res) => {
                 }
                 const puoUsareMapbox = MAPBOX_ACCESS_TOKEN && await permessoUsoMapbox('tiles', SOGLIA_MAPBOX_TILES);
                 if (!puoUsareMapbox) {
-                    // Sopra soglia o chiave non configurata: nessuna tile,
-                    // il browser mostrerà il livello OSM gratuito già
-                    // presente come base — non è un errore bloccante.
                     res.writeHead(204);
                     return res.end();
                 }
@@ -2759,12 +2690,6 @@ const server = http.createServer((req, res) => {
         (async function () {
             try {
                 const fullUrlStile = new URL(req.url, 'http://localhost');
-                // "it" di base perché il sito nasce italiano; il sito inglese
-                // (en_results.html) passa esplicitamente "?lang=en" per avere
-                // le etichette delle città nella sua lingua invece che in
-                // italiano (senza specificarla, Mapbox altrimenti mostra un
-                // misto poco coerente, es. "Milan" invece di "Milano" per le
-                // grandi città ma nomi locali per i paesi più piccoli).
                 const linguaMappa = fullUrlStile.searchParams.get('lang') === 'en' ? 'en' : 'it';
 
                 const usaMapbox = await permessoUsoMapbox('tiles', SOGLIA_MAPBOX_TILES);
@@ -2775,14 +2700,6 @@ const server = http.createServer((req, res) => {
                         if (!rispostaStile.ok) throw new Error('HTTP ' + rispostaStile.status);
                         const styleGrezzo = await rispostaStile.json();
                         const styleConUrlRisolti = await risolviStileMapbox(styleGrezzo, MAPBOX_ACCESS_TOKEN, linguaMappa);
-
-                        // IMPORTANTE: lo stile che Mapbox restituisce include campi
-                        // extra (name, metadata, created, modified, owner,
-                        // visibility, protected...) che sono validi per la LORO
-                        // libreria ufficiale, ma che la versione di MapLibre usata
-                        // qui rifiuta con un errore ("unknown property") perché il
-                        // suo validatore è più rigido. Passiamo avanti SOLO i campi
-                        // che servono davvero a disegnare la mappa.
                         const styleRipulito = {
                             version: styleConUrlRisolti.version,
                             sources: styleConUrlRisolti.sources,
@@ -2790,7 +2707,6 @@ const server = http.createServer((req, res) => {
                             sprite: styleConUrlRisolti.sprite,
                             glyphs: styleConUrlRisolti.glyphs
                         };
-
                         return sendJSON(res, 200, { usaMapbox: true, style: styleRipulito });
                     } catch (erroreMapbox) {
                         console.error('Stile Mapbox non ottenibile/valido, ripiego sul gratuito:', erroreMapbox.message);
@@ -6450,15 +6366,14 @@ if (dbEnabled) {
             });
     }, 60 * 60 * 1000);
 
-    // Le segnalazioni scadute (oltre i 30 minuti) non servono più a nessuno:
-    // "expires_at > now()" le esclude già dalle letture, questa pulizia
-    // tiene solo la tabella leggera nel tempo.
+    // Le segnalazioni scadute (oltre i 30 minuti) non servono più a nessuno.
     setInterval(function () {
         pool.query('DELETE FROM map_reports WHERE expires_at <= now()')
             .catch(function (err) {
                 console.error('Errore pulizia map_reports:', err);
             });
     }, 60 * 60 * 1000);
+
 
 
     // reset password) non servono più: le finestre scadute vengono comunque
