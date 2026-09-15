@@ -2031,8 +2031,21 @@ const server = http.createServer((req, res) => {
                 // "Piazzale Pola" a Brescia/Torino batteva sempre il
                 // "Piazzale Gabrio Piola" di Milano, anche standoci proprio
                 // vicino).
+                // Se conosciamo la posizione di chi cerca, diamo a Nominatim
+                // stesso un "viewbox" (un riquadro largo ~1 grado, circa
+                // 100km) intorno a quella posizione, con bounded=0: questo
+                // significa "preferisci risultati qui dentro, ma non
+                // escludere quelli fuori" — così un posto vicino ha più
+                // probabilità di rientrare già nei primi 10 risultati
+                // restituiti da Nominatim, invece di essere scartato prima
+                // ancora che il nostro riordino per vicinanza possa
+                // intervenire (il riordino può solo riordinare i risultati
+                // che arrivano, non recuperare quelli tagliati fuori).
+                const viewbox = haPosizione
+                    ? ('&viewbox=' + (nearLon - 0.5) + ',' + (nearLat + 0.5) + ',' + (nearLon + 0.5) + ',' + (nearLat - 0.5) + '&bounded=0')
+                    : '';
                 const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
-                    '&q=' + encodeURIComponent(q);
+                    viewbox + '&q=' + encodeURIComponent(q);
                 const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(10000)
