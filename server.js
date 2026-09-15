@@ -1989,9 +1989,9 @@ const server = http.createServer((req, res) => {
                     }
                 };
 
-                const interrogaNominatim = async function (urlExtra) {
+                const interrogaNominatim = async function (urlExtra, testoCercato) {
                     const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
-                        urlExtra + '&q=' + encodeURIComponent(q);
+                        urlExtra + '&q=' + encodeURIComponent(testoCercato);
                     const risposta = await fetch(url, {
                         headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                         signal: AbortSignal.timeout(10000)
@@ -2012,13 +2012,13 @@ const server = http.createServer((req, res) => {
                     });
                 };
 
-                const interrogaNominatimCompleto = async function () {
+                const interrogaNominatimCompleto = async function (testoCercato) {
                     let risultati = [];
                     if (haPosizione) {
                         const raggio = 0.22; // gradi, circa 25km
                         const viewboxRistretto = '&viewbox=' + (nearLon - raggio) + ',' + (nearLat + raggio) + ',' + (nearLon + raggio) + ',' + (nearLat - raggio) + '&bounded=1';
                         try {
-                            risultati = await interrogaNominatim(viewboxRistretto);
+                            risultati = await interrogaNominatim(viewboxRistretto, testoCercato);
                         } catch (erroreRistretto) {
                             console.error('Ricerca ristretta Nominatim fallita:', erroreRistretto.message);
                         }
@@ -2028,7 +2028,7 @@ const server = http.createServer((req, res) => {
                             ? ('&viewbox=' + (nearLon - 0.5) + ',' + (nearLat + 0.5) + ',' + (nearLon + 0.5) + ',' + (nearLat - 0.5) + '&bounded=0')
                             : '';
                         try {
-                            risultati = await interrogaNominatim(viewbox);
+                            risultati = await interrogaNominatim(viewbox, testoCercato);
                         } catch (erroreNazionale) {
                             console.error('Ricerca nazionale Nominatim fallita:', erroreNazionale.message);
                         }
@@ -2036,12 +2036,22 @@ const server = http.createServer((req, res) => {
                     return risultati;
                 };
 
-                // Le due fonti vengono interrogate IN PARALLELO (non una dopo
-                // l'altra): stesso tempo di attesa di prima per chi cerca,
-                // ma ora con il meglio di entrambe.
-                const [risultatiMapbox, risultatiNominatim] = await Promise.all([
+                // Ricerca aggiuntiva con SOLO L'ULTIMA PAROLA della domanda:
+                // quando scrivi "città + luogo" (es. "milano malpensa",
+                // "roma colosseo"), spesso il nome VERO del posto su
+                // OpenStreetMap è solo l'ultima parola da sola — la
+                // combinazione delle due può mandare fuori strada sia
+                // Mapbox che Nominatim (si aspettano più una via "in" una
+                // città che un nome libero a due parole). Proviamo quindi
+                // anche solo l'ultima parola, in parallelo, senza costare
+                // tempo aggiuntivo a chi cerca.
+                const paroleQuery = q.trim().split(/\s+/);
+                const ultimaParola = paroleQuery.length > 1 ? paroleQuery[paroleQuery.length - 1] : null;
+
+                const [risultatiMapbox, risultatiNominatim, risultatiUltimaParola] = await Promise.all([
                     interrogaMapbox(),
-                    interrogaNominatimCompleto()
+                    interrogaNominatimCompleto(q),
+                    ultimaParola ? interrogaNominatimCompleto(ultimaParola) : Promise.resolve([])
                 ]);
 
                 // Unione: stessa posizione (arrotondata) e stesso nome =
@@ -2051,7 +2061,7 @@ const server = http.createServer((req, res) => {
                     return r.lat.toFixed(3) + '|' + r.lon.toFixed(3);
                 };
                 const perChiave = {};
-                risultatiNominatim.concat(risultatiMapbox).forEach(function (r) {
+                risultatiNominatim.concat(risultatiUltimaParola, risultatiMapbox).forEach(function (r) {
                     const k = chiaveDedup(r);
                     if (!perChiave[k]) perChiave[k] = r;
                 });
