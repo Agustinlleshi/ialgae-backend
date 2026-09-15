@@ -2205,7 +2205,7 @@ const server = http.createServer((req, res) => {
                 const fonteUsata = risultati.length ? (risultati[0]._fonte || 'nominatim') : null;
                 risultati.forEach(function (r) { delete r._fonte; });
 
-                return sendJSON(res, 200, { risultati: risultati, fonte: fonteUsata });
+                return sendJSON(res, 200, { risultati: risultati, fonte: fonteUsata, _versioneGeocode: 'merge-overpass-v1' });
 
             } catch (err) {
                 console.error('Errore geocodifica:', err);
