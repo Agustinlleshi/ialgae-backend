@@ -1983,7 +1983,7 @@ const server = http.createServer((req, res) => {
                             return {
                                 lat: f.center[1],
                                 lon: f.center[0],
-                                display_name: f.place_name,
+                                display_name: pulisciDisplayName(f.place_name),
                                 boundingbox: f.bbox ? [f.bbox[1], f.bbox[3], f.bbox[0], f.bbox[2]] : null,
                                 importance: typeof f.relevance === 'number' ? f.relevance : 0.5,
                                 classe: (f.place_type && f.place_type[0]) || null,
@@ -2226,7 +2226,7 @@ const server = http.createServer((req, res) => {
                 const fonteUsata = risultati.length ? (risultati[0]._fonte || 'nominatim') : null;
                 risultati.forEach(function (r) { delete r._fonte; });
 
-                return sendJSON(res, 200, { risultati: risultati, fonte: fonteUsata, _versioneGeocode: 'merge-overpass-v1' });
+                return sendJSON(res, 200, { risultati: risultati, fonte: fonteUsata, _versioneGeocode: 'pulizia-nomi-v2' });
 
             } catch (err) {
                 console.error('Errore geocodifica:', err);
@@ -2354,9 +2354,10 @@ const server = http.createServer((req, res) => {
                                 return relB - relA;
                             })
                             .map(function (f) {
-                                const parti = (f.place_name || '').split(',');
+                                const placePulito = pulisciDisplayName(f.place_name) || '';
+                                const parti = placePulito.split(',');
                                 return {
-                                    testo: f.text || parti[0] || f.place_name,
+                                    testo: f.text || parti[0] || placePulito,
                                     sottotitolo: parti.slice(1).join(',').trim(),
                                     lat: f.center ? f.center[1] : null,
                                     lon: f.center ? f.center[0] : null
@@ -2424,8 +2425,8 @@ const server = http.createServer((req, res) => {
                         if (primo) {
                             return sendJSON(res, 200, {
                                 fonte: 'mapbox',
-                                nome: primo.text || primo.place_name,
-                                indirizzo: primo.place_name,
+                                nome: primo.text || pulisciDisplayName(primo.place_name),
+                                indirizzo: pulisciDisplayName(primo.place_name),
                                 categoria: (primo.properties && primo.properties.category) || null,
                                 wikipedia: null,
                                 lat: primo.center ? primo.center[1] : lat,
