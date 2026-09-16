@@ -2540,6 +2540,66 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // Conferma ("c'è ancora") o rimozione ("se n'è andata") di una
+    // segnalazione esistente, proposta all'utente quando passa vicino a
+    // una segnalazione altrui (vedi il banner di conferma in pwa.html).
+    // Nessun dato personale coinvolto: chiunque passi di lì può confermare
+    // o smentire, un po' come le segnalazioni stesse — per questo un
+    // limite anti-abuso leggero (stesso IP, stesso limite delle
+    // segnalazioni normali) basta a scoraggiare eventuali dispetti.
+    const matchAzioneSegnalazione = req.url.match(/^\/api\/maps\/reports\/([^\/]+)\/(conferma|rimuovi)$/);
+    if (req.method === 'POST' && matchAzioneSegnalazione) {
+        (async function () {
+            try {
+                const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+                const limite = checkAndConsumeRateLimitMemory(reportsRateLimitByIp, ip, 20, 10 * 60 * 1000);
+                if (!limite.allowed) {
+                    return sendJSON(res, 429, { error: 'Troppe richieste in poco tempo. Riprova tra qualche minuto.' });
+                }
+
+                const idParam = matchAzioneSegnalazione[1];
+                const azione = matchAzioneSegnalazione[2];
+
+                if (azione === 'conferma') {
+                    const nuovaScadenza = new Date(Date.now() + DURATA_SEGNALAZIONE_MS);
+                    if (dbEnabled) {
+                        const idNumerico = parseInt(idParam, 10);
+                        if (!Number.isFinite(idNumerico)) return sendJSON(res, 400, { error: 'Id non valido.' });
+                        const aggiornamento = await pool.query(
+                            'UPDATE map_reports SET expires_at = $1 WHERE id = $2 AND expires_at > now() RETURNING id',
+                            [nuovaScadenza, idNumerico]
+                        );
+                        if (!aggiornamento.rows.length) return sendJSON(res, 404, { error: 'Segnalazione non trovata o già scaduta.' });
+                        return sendJSON(res, 200, { ok: true, expiresAt: nuovaScadenza.toISOString() });
+                    }
+                    const segnalazioneMemoria = memoryReports.find(function (r) { return String(r.id) === String(idParam) && r.expiresAt > Date.now(); });
+                    if (!segnalazioneMemoria) return sendJSON(res, 404, { error: 'Segnalazione non trovata o già scaduta.' });
+                    segnalazioneMemoria.expiresAt = nuovaScadenza.getTime();
+                    return sendJSON(res, 200, { ok: true, expiresAt: nuovaScadenza.toISOString() });
+                }
+
+                // azione === 'rimuovi': la segnaliamo scaduta subito, invece
+                // di cancellarla del tutto — stesso effetto pratico (sparisce
+                // dalle letture da questo momento) ma più semplice e sicuro
+                // di un DELETE vero e proprio.
+                if (dbEnabled) {
+                    const idNumerico = parseInt(idParam, 10);
+                    if (!Number.isFinite(idNumerico)) return sendJSON(res, 400, { error: 'Id non valido.' });
+                    await pool.query('UPDATE map_reports SET expires_at = now() WHERE id = $1', [idNumerico]);
+                    return sendJSON(res, 200, { ok: true });
+                }
+                const indiceMemoria = memoryReports.findIndex(function (r) { return String(r.id) === String(idParam); });
+                if (indiceMemoria !== -1) memoryReports[indiceMemoria].expiresAt = Date.now();
+                return sendJSON(res, 200, { ok: true });
+
+            } catch (err) {
+                console.error('Errore conferma/rimozione segnalazione:', err.message);
+                return sendJSON(res, 500, { error: 'Impossibile completare l\'operazione.' });
+            }
+        })();
+        return;
+    }
+
     // ------------------------------------------------------------
     // TILE RASTER MAPBOX / TRAFFICO TOMTOM / STILE MAPPA
     // ------------------------------------------------------------
