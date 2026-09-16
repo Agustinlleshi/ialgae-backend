@@ -1832,25 +1832,19 @@ const server = http.createServer((req, res) => {
     // qualcosa non va, si capisce subito se il problema è il server (Render)
     // o il database (Neon), senza dover indovinare.
     if (req.url === '/api/health' && req.method === 'GET') {
-        (async function () {
-            let dbStatus = 'not_configured';
-            if (dbEnabled) {
-                try {
-                    await pool.query('SELECT 1');
-                    dbStatus = 'ok';
-                } catch (err) {
-                    dbStatus = 'error';
-                }
-            }
-            const allOk = dbStatus === 'ok' || dbStatus === 'not_configured';
-            return sendJSON(res, allOk ? 200 : 503, {
-                status: allOk ? 'ok' : 'degraded',
-                server: 'ok',
-                database: dbStatus,
-                timestamp: new Date().toISOString()
-            });
-        })();
-        return;
+        // NIENTE controllo del database qui apposta: questo endpoint esiste
+        // solo per i servizi di ping esterni che tengono sveglio Render (il
+        // server, non il database). Interrogare Neon a ogni ping — magari
+        // ogni 5-10 minuti, 24 ore su 24 — vanifica lo "scale to zero" che
+        // lo fa dormire gratis: è quasi certamente questa la causa delle
+        // ore di calcolo Neon consumate ben oltre il traffico reale degli
+        // utenti. Un vero controllo del database (se mai servisse) va fatto
+        // manualmente o con una frequenza molto più bassa, non a ogni ping.
+        return sendJSON(res, 200, {
+            status: 'ok',
+            server: 'ok',
+            timestamp: new Date().toISOString()
+        });
     }
 
     // Sitemap generata al volo: le pagine fisse del sito + tutti gli
