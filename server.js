@@ -681,6 +681,20 @@ async function initDb() {
 // prudenza NON usiamo mai Mapbox — meglio il gratuito che un uso
 // scoordinato e potenzialmente costoso.
 // ------------------------------------------------------------
+// Nominatim, per le grandi città italiane, ripete il nome del posto anche
+// nel livello amministrativo che lo contiene (es. "Milano, CITTÀ
+// METROPOLITANA DI MILANO, Italia" — perché Milano è sia la città che il
+// capoluogo della sua città metropolitana). Per chi legge è solo rumore
+// ripetuto: lo togliamo qui, una volta sola, cosicché resti così ovunque
+// questo testo viene mostrato (ricerca, suggerimenti, indicazioni).
+function pulisciDisplayName(testo) {
+    if (!testo) return testo;
+    return testo
+        .replace(/,\s*città metropolitana di [^,]+/gi, '')
+        .replace(/,\s*area metropolitana di [^,]+/gi, '')
+        .replace(/,\s*libero consorzio (comunale )?di [^,]+/gi, '');
+}
+
 async function permessoUsoMapbox(servizio, sogliaMassima) {
     if (!MAPBOX_ACCESS_TOKEN || !dbEnabled) return false;
     const oggi = new Date();
@@ -1995,7 +2009,7 @@ const server = http.createServer((req, res) => {
                         return {
                             lat: parseFloat(r.lat),
                             lon: parseFloat(r.lon),
-                            display_name: r.display_name,
+                            display_name: pulisciDisplayName(r.display_name),
                             boundingbox: r.boundingbox ? r.boundingbox.map(Number) : null,
                             importance: typeof r.importance === 'number' ? r.importance : 0.5,
                             wikipedia: (r.extratags && r.extratags.wikipedia) || null,
@@ -2060,7 +2074,7 @@ const server = http.createServer((req, res) => {
                             return {
                                 lat: parseFloat(r.lat),
                                 lon: parseFloat(r.lon),
-                                display_name: r.display_name,
+                                display_name: pulisciDisplayName(r.display_name),
                                 boundingbox: r.boundingbox ? r.boundingbox.map(Number) : null,
                                 importance: typeof r.importance === 'number' ? r.importance : 0.5,
                                 wikipedia: (r.extratags && r.extratags.wikipedia) || null,
@@ -2156,43 +2170,56 @@ const server = http.createServer((req, res) => {
                 const [risultatiMapbox, risultatiNominatim, risultatiUltimaParola, risultatiPerNome, risultatiOverpass] = await Promise.all([
                     interrogaMapbox(),
                     interrogaNominatimCompleto(q),
-                    ultimaParola ? interrogaNominatimCompleto(ultimaParola) : Promise.resolve([]),
-                    interrogaNominatimPerNome(q),
-                    conTetto(interrogaOverpassPerNome(ultimaParola || q), 5000, [])
+                    (haPosizione && ultimaParola) ? interrogaNominatimCompleto(ultimaParola) : Promise.resolve([]),
+                    haPosizione ? interrogaNominatimPerNome(q) : Promise.resolve([]),
+                    haPosizione ? conTetto(interrogaOverpassPerNome(ultimaParola || q), 5000, []) : Promise.resolve([])
                 ]);
 
-                // Unione: stessa posizione (arrotondata) e stesso nome =
-                // stesso posto, teniamolo una volta sola (preferendo la
-                // versione con più dettagli, cioè Nominatim quando c'è).
-                const chiaveDedup = function (r) {
-                    return r.lat.toFixed(3) + '|' + r.lon.toFixed(3);
-                };
-                const perChiave = {};
-                risultatiNominatim.concat(risultatiUltimaParola, risultatiPerNome, risultatiOverpass, risultatiMapbox).forEach(function (r) {
-                    const k = chiaveDedup(r);
-                    if (!perChiave[k]) perChiave[k] = r;
-                });
-                let risultati = Object.values(perChiave);
-
-                // Riordino per vicinanza + importanza: chi è più vicino a te
-                // guadagna punti, così un posto meno "importante" a livello
-                // nazionale ma proprio nella tua zona (o un aeroporto vero
-                // che una fonte aveva scartato) può battere un omonimo o
-                // quasi-omonimo mediocre trovato dall'altra fonte.
-                if (haPosizione && risultati.length > 1) {
-                    const distanzaKm = function (lat1, lon1, lat2, lon2) {
-                        const R = 6371, toRad = Math.PI / 180;
-                        const dLat = (lat2 - lat1) * toRad, dLon = (lon2 - lon1) * toRad;
-                        const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.sin(dLon / 2) ** 2;
-                        return 2 * R * Math.asin(Math.sqrt(a));
-                    };
-                    risultati.forEach(function (r) {
-                        r._punteggio = r.importance - distanzaKm(nearLat, nearLon, r.lat, r.lon) * 0.003;
-                    });
-                    risultati.sort(function (a, b) { return b._punteggio - a._punteggio; });
-                    risultati.forEach(function (r) { delete r._punteggio; });
+                let risultati;
+                if (!haPosizione) {
+                    // Nessuna posizione con cui giudicare le distanze: un
+                    // indirizzo italiano generico (es. "Via Londra" in
+                    // provincia di Lecce) non è confrontabile in modo
+                    // sensato con un posto estero vero (Londra) usando solo
+                    // l'importanza — le due scale non sono equivalenti. Se
+                    // Mapbox (che copre bene tutto il mondo) ha trovato
+                    // qualcosa, ci fidiamo di lui; Nominatim (sempre
+                    // ristretto all'Italia) entra in gioco solo come
+                    // ripiego, se Mapbox non ha trovato proprio nulla.
+                    risultati = risultatiMapbox.length ? risultatiMapbox : risultatiNominatim.slice().sort(function (a, b) { return (b.importance || 0) - (a.importance || 0); });
                 } else {
-                    risultati.sort(function (a, b) { return (b.importance || 0) - (a.importance || 0); });
+                    // Unione: stessa posizione (arrotondata) e stesso nome =
+                    // stesso posto, teniamolo una volta sola (preferendo la
+                    // versione con più dettagli, cioè Nominatim quando c'è).
+                    const chiaveDedup = function (r) {
+                        return r.lat.toFixed(3) + '|' + r.lon.toFixed(3);
+                    };
+                    const perChiave = {};
+                    risultatiNominatim.concat(risultatiUltimaParola, risultatiPerNome, risultatiOverpass, risultatiMapbox).forEach(function (r) {
+                        const k = chiaveDedup(r);
+                        if (!perChiave[k]) perChiave[k] = r;
+                    });
+                    risultati = Object.values(perChiave);
+
+                    // Riordino per vicinanza + importanza: chi è più vicino a
+                    // te guadagna punti, così un posto meno "importante" a
+                    // livello nazionale ma proprio nella tua zona (o un
+                    // aeroporto vero che una fonte aveva scartato) può
+                    // battere un omonimo o quasi-omonimo mediocre trovato
+                    // dall'altra fonte.
+                    if (risultati.length > 1) {
+                        const distanzaKm = function (lat1, lon1, lat2, lon2) {
+                            const R = 6371, toRad = Math.PI / 180;
+                            const dLat = (lat2 - lat1) * toRad, dLon = (lon2 - lon1) * toRad;
+                            const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.sin(dLon / 2) ** 2;
+                            return 2 * R * Math.asin(Math.sqrt(a));
+                        };
+                        risultati.forEach(function (r) {
+                            r._punteggio = r.importance - distanzaKm(nearLat, nearLon, r.lat, r.lon) * 0.003;
+                        });
+                        risultati.sort(function (a, b) { return b._punteggio - a._punteggio; });
+                        risultati.forEach(function (r) { delete r._punteggio; });
+                    }
                 }
 
                 risultati = risultati.slice(0, 10);
@@ -2315,7 +2342,7 @@ const server = http.createServer((req, res) => {
                     try {
                         const url = 'https://api.mapbox.com/geocoding/v5/mapbox.places/' + encodeURIComponent(q) + '.json' +
                             '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) +
-                            '&autocomplete=true&limit=5&language=it&types=address,place,poi&country=it';
+                            '&autocomplete=true&limit=5&language=it&types=address,place,poi';
                         const risposta = await fetch(url, { signal: AbortSignal.timeout(6000) });
                         if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
                         const dati = await risposta.json();
@@ -2343,7 +2370,7 @@ const server = http.createServer((req, res) => {
                     }
                 }
 
-                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&countrycodes=it&q=' + encodeURIComponent(q);
+                const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&q=' + encodeURIComponent(q);
                 const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(8000)
@@ -2355,9 +2382,10 @@ const server = http.createServer((req, res) => {
                     return impB - impA;
                 });
                 const suggerimentiNominatim = candidatiOrdinati.slice(0, 5).map(function (r) {
-                    const parti = (r.display_name || '').split(',');
+                    const displayPulito = pulisciDisplayName(r.display_name) || '';
+                    const parti = displayPulito.split(',');
                     return {
-                        testo: parti[0] || r.display_name,
+                        testo: parti[0] || displayPulito,
                         sottotitolo: parti.slice(1).join(',').trim(),
                         lat: parseFloat(r.lat),
                         lon: parseFloat(r.lon)
@@ -2424,7 +2452,7 @@ const server = http.createServer((req, res) => {
                 return sendJSON(res, 200, {
                     fonte: 'nominatim',
                     nome: nomeBreve,
-                    indirizzo: datiNominatim.display_name,
+                    indirizzo: pulisciDisplayName(datiNominatim.display_name),
                     categoria: null,
                     wikipedia: (datiNominatim.extratags && datiNominatim.extratags.wikipedia) || null,
                     lat: parseFloat(datiNominatim.lat) || lat,
