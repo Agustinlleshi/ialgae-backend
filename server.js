@@ -118,6 +118,12 @@ const MAPBOX_ACCESS_TOKEN = process.env.MAPBOX_ACCESS_TOKEN || '';
 // Genera una chiave TomTom da https://developer.tomtom.com/ e impostala
 // come variabile d'ambiente TOMTOM_API_KEY su Render.
 const TOMTOM_API_KEY = process.env.TOMTOM_API_KEY || '';
+// Chiave GraphHopper (piano gratuito: 500 crediti/giorno, un percorso
+// semplice costa 1 credito). Impostala come variabile d'ambiente
+// GRAPHHOPPER_API_KEY su Render — MAI nel browser, a differenza di come
+// era stata messa in origine in pwa.html (rischio di uso illimitato da
+// parte di chiunque avesse guardato il codice sorgente della pagina).
+const GRAPHHOPPER_API_KEY = process.env.GRAPHHOPPER_API_KEY || '';
 
 // Chiave segreta per proteggere le statistiche interne (es. iscrizioni
 // giornaliere). Impostala su Render come stringa lunga e casuale, inventata
@@ -604,6 +610,16 @@ async function initDb() {
         ')'
     );
 
+    // Stesso principio di uso_mapbox, ma per GraphHopper: il piano
+    // gratuito (500 crediti) si rinnova ogni GIORNO, non ogni mese — la
+    // chiave qui è la data (es. "2026-09-16"), non l'anno-mese.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS uso_graphhopper (' +
+        '  giorno TEXT PRIMARY KEY,' + // es. "2026-09-16"
+        '  crediti_usati INTEGER NOT NULL DEFAULT 0' +
+        ')'
+    );
+
     // Blog: articoli scritti in markdown, con stato bozza/pubblicato.
     // "slug" è la versione URL-friendly del titolo (es. "la-mia-storia"),
     // usata nell'indirizzo della pagina dell'articolo.
@@ -720,8 +736,41 @@ async function permessoUsoMapbox(servizio, sogliaMassima) {
     }
 }
 
+// Stesso principio di permessoUsoMapbox, ma su base GIORNALIERA (il piano
+// gratuito di GraphHopper si rinnova ogni giorno, 500 crediti). A
+// differenza di Mapbox, qui non c'è rischio di addebito a sorpresa se si
+// sfora — il piano gratuito semplicemente rifiuta le richieste oltre il
+// limite — quindi possiamo usare quasi tutto il margine reale, lasciando
+// solo un piccolo cuscinetto per eventuali richieste già in corso nello
+// stesso istante.
+async function permessoUsoGraphHopper(sogliaMassima) {
+    if (!GRAPHHOPPER_API_KEY || !dbEnabled) return false;
+    const oggi = new Date().toISOString().slice(0, 10); // "2026-09-16"
+    try {
+        const result = await pool.query(
+            'INSERT INTO uso_graphhopper (giorno, crediti_usati) VALUES ($1, 1) ' +
+            'ON CONFLICT (giorno) DO UPDATE SET crediti_usati = uso_graphhopper.crediti_usati + 1 ' +
+            'WHERE uso_graphhopper.crediti_usati < $2 ' +
+            'RETURNING crediti_usati',
+            [oggi, sogliaMassima]
+        );
+        if (result.rows.length > 0) return true;
+        await createNotificationThrottled(
+            'graphhopper_limite',
+            '⚠️ GraphHopper: raggiunta la soglia di sicurezza (' + sogliaMassima + ' crediti/giorno). Passato automaticamente a Mapbox/OSRM per il resto della giornata.',
+            20
+        );
+        return false;
+    } catch (err) {
+        console.error('Errore contatore GraphHopper:', err);
+        return false;
+    }
+}
+
 // Usato SOLO se DATABASE_URL non è configurata (vedi sopra).
 const memoryUsers = new Map();
+
+
 
 // ---- IA: Gemini con Anthropic (Claude) come riserva ----
 // Le tre funzioni sotto sono usate da /api/ask, /api/overview e /api/vision.
@@ -2237,9 +2286,16 @@ const server = http.createServer((req, res) => {
     }
 
     // ------------------------------------------------------------
-    // INDICAZIONI STRADALI (Mapbox se sotto soglia, altrimenti OSRM)
+    // INDICAZIONI STRADALI (GraphHopper se sotto soglia giornaliera,
+    // altrimenti Mapbox se sotto soglia mensile, altrimenti OSRM)
     // ------------------------------------------------------------
     const SOGLIA_MAPBOX_DIRECTIONS = 50000;
+    // Il piano gratuito di GraphHopper dà 500 crediti/giorno (un percorso
+    // semplice = 1 credito). Ci fermiamo a 480, con un piccolo margine di
+    // sicurezza per richieste già in corso nello stesso istante — non per
+    // paura di un addebito (il piano gratuito blocca e basta, non addebita
+    // nulla), ma per lasciare comunque un po' di respiro.
+    const SOGLIA_GRAPHHOPPER_DIRECTIONS = 480;
 
     if (req.method === 'GET' && req.url.indexOf('/api/maps/directions') === 0) {
         (async function () {
@@ -2250,11 +2306,26 @@ const server = http.createServer((req, res) => {
                 const toLat = parseFloat(fullUrl.searchParams.get('toLat'));
                 const toLon = parseFloat(fullUrl.searchParams.get('toLon'));
                 const travelMode = fullUrl.searchParams.get('profile') || 'driving';
+                const evitaPedaggi = fullUrl.searchParams.get('avoidTolls') === '1';
+                const evitaAutostrade = fullUrl.searchParams.get('avoidHighways') === '1';
 
                 if (![fromLat, fromLon, toLat, toLon].every(Number.isFinite)) {
                     return sendJSON(res, 400, { error: 'Coordinate di partenza/arrivo mancanti o non valide.', fonte: null });
                 }
 
+                // Il piano gratuito di GraphHopper non permette il "custom
+                // model" (serve per evitare pedaggi/autostrade davvero) —
+                // se una di queste preferenze è richiesta, saltiamo
+                // GraphHopper e andiamo dritti su Mapbox, che le supporta
+                // in modo semplice e nativo (parametro "exclude").
+                //
+                // In più, per la modalità AUTO diamo sempre la priorità a
+                // Mapbox: è l'unico dei tre che porta il traffico in tempo
+                // reale (riga del percorso colorata + avviso di ritardo).
+                // GraphHopper resta prima scelta per a piedi/bici, dove il
+                // traffico non ha senso.
+                const usaGraphHopper = (!evitaPedaggi && !evitaAutostrade) && travelMode !== 'driving' &&
+                    await permessoUsoGraphHopper(SOGLIA_GRAPHHOPPER_DIRECTIONS);
                 const usaMapbox = await permessoUsoMapbox('directions', SOGLIA_MAPBOX_DIRECTIONS);
 
                 function normalizzaPercorsi(routes, fonte) {
@@ -2264,6 +2335,13 @@ const server = http.createServer((req, res) => {
                             distanza: r.distance,
                             durata: r.duration,
                             coords: (r.geometry && r.geometry.coordinates) ? r.geometry.coordinates.map(function (c) { return [c[1], c[0]]; }) : [],
+                            // Un valore di congestione per ogni segmento tra due
+                            // punti consecutivi di "coords" (un valore in meno
+                            // rispetto alle coordinate) — solo Mapbox con il
+                            // profilo "driving-traffic" lo fornisce; per gli
+                            // altri resta null e la riga del percorso si
+                            // disegna di un colore solo, come prima.
+                            congestione: (r.legs && r.legs[0] && r.legs[0].annotation && r.legs[0].annotation.congestion) || null,
                             passi: ((r.legs && r.legs[0] && r.legs[0].steps) || []).map(function (s) {
                                 return {
                                     istruzione: s.maneuver,
@@ -2277,22 +2355,132 @@ const server = http.createServer((req, res) => {
                     });
                 }
 
+                // GraphHopper usa un formato tutto suo (un numero "sign" per
+                // ogni svolta, invece di type/modifier come OSRM/Mapbox):
+                // lo traduciamo qui in un oggetto "istruzione" identico a
+                // quello di OSRM/Mapbox, così il resto del codice — comprese
+                // le frasi vocali già scritte per pwa.html/results.html —
+                // funziona senza nessuna modifica, senza sapere nemmeno da
+                // dove sia arrivato davvero il percorso.
+                function segnoGraphHopperInIstruzione(sign) {
+                    switch (sign) {
+                        case -8: return { type: 'uturn', modifier: 'left' };
+                        case -7: return { type: 'turn', modifier: 'slight left' };
+                        case -3: return { type: 'turn', modifier: 'sharp left' };
+                        case -2: return { type: 'turn', modifier: 'left' };
+                        case -1: return { type: 'turn', modifier: 'slight left' };
+                        case 1: return { type: 'turn', modifier: 'slight right' };
+                        case 2: return { type: 'turn', modifier: 'right' };
+                        case 3: return { type: 'turn', modifier: 'sharp right' };
+                        case 4: return { type: 'arrive', modifier: null };
+                        case 6: return { type: 'roundabout', modifier: null };
+                        case 7: return { type: 'turn', modifier: 'slight right' };
+                        case 8: return { type: 'uturn', modifier: 'right' };
+                        default: return { type: 'continue', modifier: 'straight' }; // 0 e 5 (via intermedia raggiunta)
+                    }
+                }
+
+                function normalizzaPercorsoGraphHopper(path) {
+                    const coordsCompleti = (path.points && path.points.coordinates)
+                        ? path.points.coordinates.map(function (c) { return [c[1], c[0]]; })
+                        : [];
+                    const passi = (path.instructions || []).map(function (istr) {
+                        const inizio = (istr.interval && istr.interval[0]) || 0;
+                        const fine = (istr.interval && istr.interval[1]) || inizio;
+                        const segCoords = coordsCompleti.slice(inizio, fine + 1);
+                        const puntoManovra = segCoords[0] || coordsCompleti[0] || [0, 0];
+                        const segno = segnoGraphHopperInIstruzione(istr.sign);
+                        return {
+                            istruzione: { type: segno.type, modifier: segno.modifier, location: [puntoManovra[1], puntoManovra[0]] },
+                            nome_via: istr.street_name || '',
+                            distanza: istr.distance,
+                            durata: (istr.time || 0) / 1000,
+                            coords: segCoords
+                        };
+                    });
+                    return {
+                        fonte: 'graphhopper',
+                        distanza: path.distance,
+                        durata: (path.time || 0) / 1000,
+                        coords: coordsCompleti,
+                        passi: passi
+                    };
+                }
+
                 function rispostaConAlternative(percorsi) {
                     return Object.assign({}, percorsi[0], { percorsi: percorsi });
                 }
 
+                if (usaGraphHopper) {
+                    try {
+                        const veicoloGraphHopper = travelMode === 'walking' ? 'foot' : (travelMode === 'cycling' ? 'bike' : 'car');
+                        const urlGraphHopper = 'https://graphhopper.com/api/1/route' +
+                            '?point=' + fromLat + ',' + fromLon + '&point=' + toLat + ',' + toLon +
+                            '&vehicle=' + veicoloGraphHopper + '&locale=it&points_encoded=false&instructions=true&elevation=false' +
+                            '&key=' + encodeURIComponent(GRAPHHOPPER_API_KEY);
+                        const rispostaGH = await fetch(urlGraphHopper, { signal: AbortSignal.timeout(10000) });
+                        if (!rispostaGH.ok) throw new Error('HTTP ' + rispostaGH.status);
+                        const datiGH = await rispostaGH.json();
+                        if (!datiGH.paths || datiGH.paths.length === 0) throw new Error('GraphHopper: nessun percorso trovato');
+                        const percorsoGH = normalizzaPercorsoGraphHopper(datiGH.paths[0]);
+                        return sendJSON(res, 200, rispostaConAlternative([percorsoGH]));
+                    } catch (erroreGraphHopper) {
+                        console.error('Indicazioni GraphHopper fallite, ripiego su Mapbox/OSRM:', erroreGraphHopper.message);
+                    }
+                }
+
                 if (usaMapbox) {
                     try {
-                        const mapboxProfile = travelMode === 'walking' ? 'walking' : (travelMode === 'cycling' ? 'cycling' : 'driving');
+                        // "driving-traffic" invece di "driving": stesso costo
+                        // di credito Mapbox, ma dà anche la congestione reale
+                        // per ogni tratto del percorso (per colorare la riga
+                        // come Google Maps) e un tempo di percorrenza che
+                        // tiene conto del traffico del momento.
+                        const mapboxProfile = travelMode === 'walking' ? 'walking' : (travelMode === 'cycling' ? 'cycling' : 'driving-traffic');
+                        const esclusioni = [];
+                        if (evitaPedaggi) esclusioni.push('toll');
+                        if (evitaAutostrade) esclusioni.push('motorway');
+                        const parametroExclude = esclusioni.length ? ('&exclude=' + esclusioni.join(',')) : '';
+                        const annotazioni = mapboxProfile === 'driving-traffic' ? '&annotations=congestion' : '';
                         const url = 'https://api.mapbox.com/directions/v5/mapbox/' + mapboxProfile + '/' +
                             fromLon + ',' + fromLat + ';' + toLon + ',' + toLat +
                             '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) +
-                            '&geometries=geojson&steps=true&overview=full&language=it&alternatives=true';
-                        const risposta = await fetch(url, { signal: AbortSignal.timeout(10000) });
+                            '&geometries=geojson&steps=true&overview=full&language=it&alternatives=true' + parametroExclude + annotazioni;
+
+                        // Il tempo "tipico" (senza traffico) serve solo per
+                        // calcolare di quanto il traffico stia allungando il
+                        // viaggio in questo momento — un avviso tipo "10 minuti
+                        // di ritardo, arrivo previsto alle 18:20". Richiesta in
+                        // parallelo: stesso tempo di attesa per chi guida.
+                        const urlTipico = mapboxProfile === 'driving-traffic'
+                            ? ('https://api.mapbox.com/directions/v5/mapbox/driving/' +
+                                fromLon + ',' + fromLat + ';' + toLon + ',' + toLat +
+                                '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) + '&overview=false' + parametroExclude)
+                            : null;
+
+                        const [risposta, rispostaTipico] = await Promise.all([
+                            fetch(url, { signal: AbortSignal.timeout(10000) }),
+                            urlTipico ? fetch(urlTipico, { signal: AbortSignal.timeout(10000) }).catch(function () { return null; }) : Promise.resolve(null)
+                        ]);
                         if (!risposta.ok) throw new Error('HTTP ' + risposta.status);
                         const dati = await risposta.json();
                         if (!dati.routes || dati.routes.length === 0) throw new Error('Mapbox: nessun percorso trovato');
-                        return sendJSON(res, 200, rispostaConAlternative(normalizzaPercorsi(dati.routes, 'mapbox')));
+
+                        let durataTipica = null;
+                        if (rispostaTipico && rispostaTipico.ok) {
+                            try {
+                                const datiTipico = await rispostaTipico.json();
+                                if (datiTipico.routes && datiTipico.routes[0]) durataTipica = datiTipico.routes[0].duration;
+                            } catch (erroreTipico) { /* niente banner del ritardo, non blocca il percorso */ }
+                        }
+
+                        const percorsi = normalizzaPercorsi(dati.routes, 'mapbox');
+                        const rispostaFinale = rispostaConAlternative(percorsi);
+                        if (durataTipica != null) {
+                            rispostaFinale.durataTipica = durataTipica;
+                            rispostaFinale.ritardoSecondi = Math.max(0, Math.round(percorsi[0].durata - durataTipica));
+                        }
+                        return sendJSON(res, 200, rispostaFinale);
                     } catch (erroreMapbox) {
                         console.error('Indicazioni Mapbox fallite, ripiego su OSRM:', erroreMapbox.message);
                     }
@@ -2308,7 +2496,15 @@ const server = http.createServer((req, res) => {
                 if (!datiOsrm.routes || datiOsrm.routes.length === 0) {
                     return sendJSON(res, 200, { error: 'Nessun percorso trovato tra questi due punti.', fonte: null });
                 }
-                return sendJSON(res, 200, rispostaConAlternative(normalizzaPercorsi(datiOsrm.routes, 'osrm')));
+                const percorsoOsrm = rispostaConAlternative(normalizzaPercorsi(datiOsrm.routes, 'osrm'));
+                if (evitaPedaggi || evitaAutostrade) {
+                    // Onestà verso chi cerca: questo ripiego (usato solo se
+                    // sia GraphHopper che Mapbox non hanno risposto) non sa
+                    // evitare pedaggi/autostrade — meglio dirlo che far
+                    // credere che la preferenza sia stata rispettata.
+                    percorsoOsrm.preferenzaNonSupportata = true;
+                }
+                return sendJSON(res, 200, percorsoOsrm);
 
             } catch (err) {
                 console.error('Errore indicazioni stradali:', err);
@@ -6454,6 +6650,16 @@ if (dbEnabled) {
         pool.query('DELETE FROM map_reports WHERE expires_at <= now()')
             .catch(function (err) {
                 console.error('Errore pulizia map_reports:', err);
+            });
+    }, 60 * 60 * 1000);
+
+    // Il contatore giornaliero di GraphHopper serve solo per il giorno
+    // corrente: teniamo comunque gli ultimi 7 giorni (utile per un'occhiata
+    // rapida all'andamento), buttando via il resto.
+    setInterval(function () {
+        pool.query("DELETE FROM uso_graphhopper WHERE giorno < to_char(now() - interval '7 days', 'YYYY-MM-DD')")
+            .catch(function (err) {
+                console.error('Errore pulizia uso_graphhopper:', err);
             });
     }, 60 * 60 * 1000);
 
