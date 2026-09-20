@@ -383,7 +383,8 @@ async function initDb() {
         '  verify_token TEXT,' +
         '  verify_token_expires TIMESTAMPTZ,' +
         '  stripe_customer_id TEXT,' +
-        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),' +
+        '  last_login TIMESTAMPTZ NOT NULL DEFAULT now()' +
         ')'
     );
     // Se la tabella esisteva già da prima di queste colonne (es. era stata
@@ -396,6 +397,12 @@ async function initDb() {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT false');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT');
+    // Data dell'ultimo accesso riuscito (login email/password, Google,
+    // Microsoft o conferma email che fa login automatico). Serve per capire
+    // quali account sono inattivi da tempo. Il default now() sugli account
+    // già esistenti è una stima ragionevole al momento della migrazione:
+    // meglio di NULL, che renderebbe impossibile ordinare per inattività.
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ NOT NULL DEFAULT now()');
     // Elenco delle app che l'utente ha scelto di nascondere dal proprio menu
     // "I tuoi preferiti" (personalizzazione disponibile solo da loggati).
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS hidden_apps TEXT[] NOT NULL DEFAULT \'{}\'');
@@ -933,7 +940,9 @@ async function checkAllMilestones() {
         const visitsResult = await pool.query('SELECT COUNT(*)::int AS c FROM page_views');
         await checkMilestone('total_visits', visitsResult.rows[0].c, '🎉 Hai superato le {n} visite totali!');
 
-        const usersResult = await pool.query('SELECT COUNT(*)::int AS c FROM users');
+        // Conta solo gli iscritti "veri" (email confermata), coerentemente
+        // con quello che ora mostra il pannello Iscritti.
+        const usersResult = await pool.query('SELECT COUNT(*)::int AS c FROM users WHERE email_verified = true');
         await checkMilestone('total_users', usersResult.rows[0].c, '🎉 Hai superato i {n} iscritti!');
 
         const postsResult = await pool.query('SELECT COUNT(*)::int AS c FROM blog_posts WHERE published = true');
@@ -972,6 +981,63 @@ function rowsToCsv(rows, columns) {
 // verso una casella che controlli solo tu.
 const BACKUP_EMAIL = 'algae.italia@gmail.com';
 const BACKUP_INTERVAL_DAYS = 7;
+
+// Elimina automaticamente gli account che non fanno un accesso da oltre un
+// anno (email/password, Google, Microsoft, o la conferma email che fa login
+// automatico — tutti aggiornano last_login, vedi touchLastLogin più sopra).
+// Gli utenti a pagamento (is_pro) sono SEMPRE esclusi, indipendentemente da
+// quanto tempo sia passato dall'ultimo accesso.
+// Cancellazione DEFINITIVA e irreversibile, come quella self-service e quella
+// da pannello admin (vedi /api/admin/delete-user). L'annullo di un eventuale
+// abbonamento Stripe resta comunque come rete di sicurezza, per il caso raro
+// in cui is_pro sia rimasto false per errore mentre un abbonamento è ancora
+// tecnicamente attivo lato Stripe.
+async function deleteInactiveAccounts() {
+    if (!dbEnabled) return;
+    try {
+        // Gli utenti a pagamento (is_pro) sono esclusi: un abbonamento attivo
+        // vale come segno di vita dell'account, anche se la persona non apre
+        // più il sito — non ha senso cancellarli in automatico solo perché
+        // non fanno login.
+        const inactiveResult = await pool.query(
+            "SELECT id, email, stripe_customer_id FROM users WHERE last_login <= now() - interval '1 year' AND is_pro = false"
+        );
+        if (inactiveResult.rows.length === 0) return;
+
+        let deletedCount = 0;
+        for (const row of inactiveResult.rows) {
+            try {
+                if (stripe && row.stripe_customer_id) {
+                    try {
+                        const subscriptions = await stripe.subscriptions.list({
+                            customer: row.stripe_customer_id,
+                            status: 'active'
+                        });
+                        for (const sub of subscriptions.data) {
+                            await stripe.subscriptions.cancel(sub.id);
+                        }
+                    } catch (stripeErr) {
+                        console.error('Errore annullando abbonamento Stripe durante eliminazione per inattività:', stripeErr);
+                    }
+                }
+                await pool.query('DELETE FROM users WHERE id = $1', [row.id]);
+                deletedCount++;
+                console.log('Account eliminato per inattività (nessun accesso da oltre un anno):', row.email);
+            } catch (rowErr) {
+                console.error('Errore eliminando account inattivo', row.email, ':', rowErr);
+            }
+        }
+
+        if (deletedCount > 0) {
+            await createNotification(
+                'inactive_accounts_deleted',
+                '🗑️ ' + deletedCount + ' account eliminati automaticamente per inattività (nessun accesso da oltre un anno).'
+            );
+        }
+    } catch (err) {
+        console.error('Errore controllo account inattivi:', err);
+    }
+}
 
 async function runWeeklyBackupIfDue() {
     if (!dbEnabled) return;
@@ -1292,7 +1358,8 @@ function rowToUser(row) {
         totpSecret: row.totp_secret,
         totpPendingSecret: row.totp_pending_secret,
         totpEnabled: row.totp_enabled,
-        createdAt: row.created_at
+        createdAt: row.created_at,
+        lastLogin: row.last_login
     };
 }
 
@@ -1301,6 +1368,24 @@ async function getUserById(id) {
     if (!dbEnabled) return memoryUsers.get(id) || null;
     const result = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
     return rowToUser(result.rows[0]);
+}
+
+// Aggiorna la data di ultimo accesso di un utente. Va chiamata SOLO dopo un
+// login riuscito (mai a ogni richiesta autenticata), perché è esattamente
+// questa data che decide, un anno dopo, se l'account viene eliminato in
+// automatico (vedi deleteInactiveAccounts più in basso).
+async function touchLastLogin(userId) {
+    if (!userId) return;
+    try {
+        if (!dbEnabled) {
+            const memUser = memoryUsers.get(userId);
+            if (memUser) memUser.lastLogin = new Date();
+            return;
+        }
+        await pool.query('UPDATE users SET last_login = now() WHERE id = $1', [userId]);
+    } catch (err) {
+        console.error('Errore aggiornamento last_login per', userId, ':', err);
+    }
 }
 
 // Cerca un utente in base al suo ID cliente Stripe (usato dal webhook quando
@@ -3029,6 +3114,8 @@ const server = http.createServer((req, res) => {
                     });
                 }
 
+                await touchLastLogin(user.sub);
+
                 const sessionToken = jwt.sign(
                     { sub: user.sub },
                     SESSION_SECRET,
@@ -3116,6 +3203,8 @@ const server = http.createServer((req, res) => {
                         message: 'Il tuo account è stato sospeso per violazione dei Termini di Servizio. Se ritieni sia un errore, contattaci a info@ialgae.com.'
                     });
                 }
+
+                await touchLastLogin(user.sub);
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
@@ -3815,17 +3904,22 @@ function parseAdminDateRange(searchParams) {
 
                 const { rangeStart, rangeEnd } = parseAdminDateRange(parsedUrl.searchParams);
 
+                // Chi non ha ancora confermato l'email non è un iscritto "vero"
+                // (è una registrazione a metà, magari mai completata): non deve
+                // comparire da nessuna parte in questo pannello, né nei totali
+                // né nell'elenco. Per questo ogni query qui sotto filtra su
+                // email_verified = true.
                 const totalsResult = await pool.query(
                     'SELECT COUNT(*)::int AS total, ' +
                     'COUNT(*) FILTER (WHERE is_pro)::int AS pro_count, ' +
                     'COUNT(*) FILTER (WHERE email_verified)::int AS verified_count, ' +
                     "COUNT(*) FILTER (WHERE created_at >= date_trunc('day', now()))::int AS new_today " +
-                    'FROM users'
+                    'FROM users WHERE email_verified = true'
                 );
 
                 const dailyResult = await pool.query(
                     "SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day, COUNT(*)::int AS count " +
-                    'FROM users WHERE created_at >= $1 AND created_at <= $2 ' +
+                    'FROM users WHERE email_verified = true AND created_at >= $1 AND created_at <= $2 ' +
                     'GROUP BY 1 ORDER BY 1',
                     [rangeStart, rangeEnd]
                 );
@@ -3835,7 +3929,7 @@ function parseAdminDateRange(searchParams) {
                 // che sia sempre aggiornato indipendentemente dal filtro data.
                 const recentResult = await pool.query(
                     'SELECT name, surname, email, is_pro, created_at ' +
-                    'FROM users ORDER BY created_at DESC LIMIT 20'
+                    'FROM users WHERE email_verified = true ORDER BY created_at DESC LIMIT 20'
                 );
 
                 const total = totalsResult.rows[0].total;
@@ -4461,6 +4555,8 @@ function parseAdminDateRange(searchParams) {
                         isPro: !!user.isPro,
                         provider: user.provider,
                         createdAt: user.createdAt,
+                        emailVerified: !!user.emailVerified,
+                        lastLogin: user.lastLogin,
                         suspended: !!user.suspended,
                         suspendedReason: user.suspendedReason || null
                     }
@@ -4743,6 +4839,7 @@ function parseAdminDateRange(searchParams) {
 
                 // Una volta confermata l'email, colleghiamo subito l'utente:
                 // non deve rifare il login da capo.
+                await touchLastLogin(user.sub);
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
                     message: 'Email confermata con successo!',
@@ -4874,6 +4971,8 @@ function parseAdminDateRange(searchParams) {
                     });
                 }
 
+                await touchLastLogin(user.sub);
+
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
                     sessionToken: sessionToken,
@@ -4936,6 +5035,8 @@ function parseAdminDateRange(searchParams) {
                 if (!verifyTotpCode(user.totpSecret, code)) {
                     return sendJSON(res, 401, { error: 'Codice non valido o scaduto.' });
                 }
+
+                await touchLastLogin(user.sub);
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
@@ -6601,6 +6702,13 @@ if (dbEnabled) {
     // gestisce bene anche i riavvii del server nel mezzo della settimana.
     runWeeklyBackupIfDue();
     setInterval(runWeeklyBackupIfDue, 60 * 60 * 1000);
+
+    // Controlla una volta al giorno se ci sono account inattivi da oltre un
+    // anno (nessun accesso — vedi last_login) e li elimina automaticamente.
+    // Un controllo giornaliero è più che sufficiente: la finestra di un anno
+    // non richiede la stessa granularità oraria degli altri task qui sopra.
+    deleteInactiveAccounts();
+    setInterval(deleteInactiveAccounts, 24 * 60 * 60 * 1000);
 
     // Elimina anche le notifiche più vecchie di 90 giorni, per non far
     // crescere la tabella all'infinito — 90 giorni sono comunque più che
