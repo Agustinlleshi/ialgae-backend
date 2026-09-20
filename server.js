@@ -166,6 +166,11 @@ const INDEXNOW_KEY_LOCATION = 'https://www.ialgae.com/' + INDEXNOW_KEY + '.txt';
 const MAX_QUESTION_LENGTH = 2000;
 const MAX_IMAGE_BASE64_LENGTH = 6000000; // ~4.5 MB di immagine decodificata
 const RESULTS_PER_PAGE = 10;
+// Solo per le notizie: 20 per pagina invece di 10, per arrivare fino a circa
+// 200 notizie totali (20 × le 10 pagine massime che Brave consente) quando
+// l'utente scorre in fondo a news.html. Separata da RESULTS_PER_PAGE apposta,
+// così la ricerca web e i video restano invariati.
+const NEWS_RESULTS_PER_PAGE = 20;
 const IMAGES_COUNT = 200; // per le immagini vogliamo molti più risultati in un'unica richiesta (200 è il massimo consentito da Brave)
 
 // ---- PAGAMENTI CON STRIPE (carta di credito, abbonamenti Pro / Pro Max) ----
@@ -6476,7 +6481,7 @@ function parseAdminDateRange(searchParams) {
 
                 // Le Immagini di Brave non supportano la paginazione con "offset": restituiscono
                 // sempre la prima pagina di risultati, quindi la omettiamo per quel tipo.
-                const countForType = (type === 'images') ? IMAGES_COUNT : RESULTS_PER_PAGE;
+                const countForType = (type === 'images') ? IMAGES_COUNT : (type === 'news') ? NEWS_RESULTS_PER_PAGE : RESULTS_PER_PAGE;
                 let searchUrl = endpoints[type] + '?q=' + encodeURIComponent(q) + '&count=' + countForType + '&country=' + braveCountry + '&search_lang=' + braveSearchLang + '&safesearch=' + safesearch;
                 if (freshness) searchUrl += '&freshness=' + freshness;
                 if (type !== 'images') {
@@ -6522,7 +6527,7 @@ function parseAdminDateRange(searchParams) {
                             return {
                                 title: r.title || '',
                                 url: r.url || '',
-                                imageUrl: (r.thumbnail && r.thumbnail.src) || (r.properties && r.properties.url) || '',
+                                imageUrl: (r.properties && r.properties.url) || (r.thumbnail && (r.thumbnail.original || r.thumbnail.src)) || '',
                                 source: (r.source || extractHost(r.url))
                             };
                         });
@@ -6535,7 +6540,13 @@ function parseAdminDateRange(searchParams) {
                                 description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, ''),
                                 source: (r.meta_url && r.meta_url.hostname) || extractHost(r.url),
                                 age: r.age || '',
-                                thumbnail: (r.thumbnail && r.thumbnail.src) || ''
+                                // r.thumbnail.original è il link diretto alla foto sul sito
+                                // di origine; r.thumbnail.src passa invece dal proxy immagini
+                                // di Brave (imgs.search.brave.com), che al momento risponde
+                                // 402 Payment Required — problema di piano/quota lato Brave,
+                                // non del sito. Usiamo "original" quando c'è, per bypassare
+                                // del tutto quel proxy.
+                                thumbnail: (r.thumbnail && (r.thumbnail.original || r.thumbnail.src)) || ''
                             };
                         });
                     } else if (type === 'videos') {
@@ -6545,7 +6556,7 @@ function parseAdminDateRange(searchParams) {
                                 title: r.title || '',
                                 url: r.url || '',
                                 description: (r.description || '').replace(/<\/?[^>]+(>|$)/g, ''),
-                                thumbnail: (r.thumbnail && r.thumbnail.src) || '',
+                                thumbnail: (r.thumbnail && (r.thumbnail.original || r.thumbnail.src)) || '',
                                 duration: (r.video && r.video.duration) || ''
                             };
                         });
