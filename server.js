@@ -118,12 +118,11 @@ const MAPBOX_ACCESS_TOKEN = process.env.MAPBOX_ACCESS_TOKEN || '';
 // Genera una chiave TomTom da https://developer.tomtom.com/ e impostala
 // come variabile d'ambiente TOMTOM_API_KEY su Render.
 const TOMTOM_API_KEY = process.env.TOMTOM_API_KEY || '';
-// Chiave GraphHopper (piano gratuito: 500 crediti/giorno, un percorso
-// semplice costa 1 credito). Impostala come variabile d'ambiente
-// GRAPHHOPPER_API_KEY su Render — MAI nel browser, a differenza di come
-// era stata messa in origine in pwa.html (rischio di uso illimitato da
-// parte di chiunque avesse guardato il codice sorgente della pagina).
-const GRAPHHOPPER_API_KEY = process.env.GRAPHHOPPER_API_KEY || '';
+// Chiave segreta di Cloudflare Turnstile (protezione anti-bot su login e
+// registrazione). Impostala come variabile d'ambiente TURNSTILE_SECRET_KEY
+// su Render — mai nel browser: solo il server la usa per verificare col
+// servizio di Cloudflare che il token mandato dal modulo sia autentico.
+const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
 
 // Chiave segreta per proteggere le statistiche interne (es. iscrizioni
 // giornaliere). Impostala su Render come stringa lunga e casuale, inventata
@@ -610,16 +609,6 @@ async function initDb() {
         ')'
     );
 
-    // Stesso principio di uso_mapbox, ma per GraphHopper: il piano
-    // gratuito (500 crediti) si rinnova ogni GIORNO, non ogni mese — la
-    // chiave qui è la data (es. "2026-09-16"), non l'anno-mese.
-    await pool.query(
-        'CREATE TABLE IF NOT EXISTS uso_graphhopper (' +
-        '  giorno TEXT PRIMARY KEY,' + // es. "2026-09-16"
-        '  crediti_usati INTEGER NOT NULL DEFAULT 0' +
-        ')'
-    );
-
     // Blog: articoli scritti in markdown, con stato bozza/pubblicato.
     // "slug" è la versione URL-friendly del titolo (es. "la-mia-storia"),
     // usata nell'indirizzo della pagina dell'articolo.
@@ -703,6 +692,35 @@ async function initDb() {
 // capoluogo della sua città metropolitana). Per chi legge è solo rumore
 // ripetuto: lo togliamo qui, una volta sola, cosicché resti così ovunque
 // questo testo viene mostrato (ricerca, suggerimenti, indicazioni).
+// Verifica col servizio di Cloudflare che il token Turnstile mandato dal
+// modulo di login/registrazione sia autentico (non finto, non riusato, non
+// scaduto). Se manca la chiave segreta (non ancora configurata su Render)
+// o il servizio di Cloudflare non risponde, lasciamo passare senza
+// bloccare nessuno — meglio un login/registrazione senza questa protezione
+// in più che un sito dove nessuno riesce più ad accedere per un problema
+// nostro di configurazione.
+async function verificaTurnstile(token, ip) {
+    if (!TURNSTILE_SECRET_KEY) return true;
+    if (!token) return false;
+    try {
+        const parametri = new URLSearchParams();
+        parametri.append('secret', TURNSTILE_SECRET_KEY);
+        parametri.append('response', token);
+        if (ip) parametri.append('remoteip', ip);
+        const risposta = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: parametri.toString(),
+            signal: AbortSignal.timeout(8000)
+        });
+        const dati = await risposta.json();
+        return dati.success === true;
+    } catch (errore) {
+        console.error('Errore verifica Turnstile (lasciamo passare per non bloccare tutti):', errore.message);
+        return true;
+    }
+}
+
 function pulisciDisplayName(testo) {
     if (!testo) return testo;
     return testo
@@ -732,37 +750,6 @@ async function permessoUsoMapbox(servizio, sogliaMassima) {
         return false;
     } catch (err) {
         console.error('Errore contatore Mapbox:', err);
-        return false;
-    }
-}
-
-// Stesso principio di permessoUsoMapbox, ma su base GIORNALIERA (il piano
-// gratuito di GraphHopper si rinnova ogni giorno, 500 crediti). A
-// differenza di Mapbox, qui non c'è rischio di addebito a sorpresa se si
-// sfora — il piano gratuito semplicemente rifiuta le richieste oltre il
-// limite — quindi possiamo usare quasi tutto il margine reale, lasciando
-// solo un piccolo cuscinetto per eventuali richieste già in corso nello
-// stesso istante.
-async function permessoUsoGraphHopper(sogliaMassima) {
-    if (!GRAPHHOPPER_API_KEY || !dbEnabled) return false;
-    const oggi = new Date().toISOString().slice(0, 10); // "2026-09-16"
-    try {
-        const result = await pool.query(
-            'INSERT INTO uso_graphhopper (giorno, crediti_usati) VALUES ($1, 1) ' +
-            'ON CONFLICT (giorno) DO UPDATE SET crediti_usati = uso_graphhopper.crediti_usati + 1 ' +
-            'WHERE uso_graphhopper.crediti_usati < $2 ' +
-            'RETURNING crediti_usati',
-            [oggi, sogliaMassima]
-        );
-        if (result.rows.length > 0) return true;
-        await createNotificationThrottled(
-            'graphhopper_limite',
-            '⚠️ GraphHopper: raggiunta la soglia di sicurezza (' + sogliaMassima + ' crediti/giorno). Passato automaticamente a Mapbox/OSRM per il resto della giornata.',
-            20
-        );
-        return false;
-    } catch (err) {
-        console.error('Errore contatore GraphHopper:', err);
         return false;
     }
 }
@@ -2286,16 +2273,9 @@ const server = http.createServer((req, res) => {
     }
 
     // ------------------------------------------------------------
-    // INDICAZIONI STRADALI (GraphHopper se sotto soglia giornaliera,
-    // altrimenti Mapbox se sotto soglia mensile, altrimenti OSRM)
+    // INDICAZIONI STRADALI (Mapbox se sotto soglia mensile, altrimenti OSRM)
     // ------------------------------------------------------------
     const SOGLIA_MAPBOX_DIRECTIONS = 50000;
-    // Il piano gratuito di GraphHopper dà 500 crediti/giorno (un percorso
-    // semplice = 1 credito). Ci fermiamo a 480, con un piccolo margine di
-    // sicurezza per richieste già in corso nello stesso istante — non per
-    // paura di un addebito (il piano gratuito blocca e basta, non addebita
-    // nulla), ma per lasciare comunque un po' di respiro.
-    const SOGLIA_GRAPHHOPPER_DIRECTIONS = 480;
 
     if (req.method === 'GET' && req.url.indexOf('/api/maps/directions') === 0) {
         (async function () {
@@ -2313,19 +2293,6 @@ const server = http.createServer((req, res) => {
                     return sendJSON(res, 400, { error: 'Coordinate di partenza/arrivo mancanti o non valide.', fonte: null });
                 }
 
-                // Il piano gratuito di GraphHopper non permette il "custom
-                // model" (serve per evitare pedaggi/autostrade davvero) —
-                // se una di queste preferenze è richiesta, saltiamo
-                // GraphHopper e andiamo dritti su Mapbox, che le supporta
-                // in modo semplice e nativo (parametro "exclude").
-                //
-                // In più, per la modalità AUTO diamo sempre la priorità a
-                // Mapbox: è l'unico dei tre che porta il traffico in tempo
-                // reale (riga del percorso colorata + avviso di ritardo).
-                // GraphHopper resta prima scelta per a piedi/bici, dove il
-                // traffico non ha senso.
-                const usaGraphHopper = (!evitaPedaggi && !evitaAutostrade) && travelMode !== 'driving' &&
-                    await permessoUsoGraphHopper(SOGLIA_GRAPHHOPPER_DIRECTIONS);
                 const usaMapbox = await permessoUsoMapbox('directions', SOGLIA_MAPBOX_DIRECTIONS);
 
                 function normalizzaPercorsi(routes, fonte) {
@@ -2355,78 +2322,8 @@ const server = http.createServer((req, res) => {
                     });
                 }
 
-                // GraphHopper usa un formato tutto suo (un numero "sign" per
-                // ogni svolta, invece di type/modifier come OSRM/Mapbox):
-                // lo traduciamo qui in un oggetto "istruzione" identico a
-                // quello di OSRM/Mapbox, così il resto del codice — comprese
-                // le frasi vocali già scritte per pwa.html/results.html —
-                // funziona senza nessuna modifica, senza sapere nemmeno da
-                // dove sia arrivato davvero il percorso.
-                function segnoGraphHopperInIstruzione(sign) {
-                    switch (sign) {
-                        case -8: return { type: 'uturn', modifier: 'left' };
-                        case -7: return { type: 'turn', modifier: 'slight left' };
-                        case -3: return { type: 'turn', modifier: 'sharp left' };
-                        case -2: return { type: 'turn', modifier: 'left' };
-                        case -1: return { type: 'turn', modifier: 'slight left' };
-                        case 1: return { type: 'turn', modifier: 'slight right' };
-                        case 2: return { type: 'turn', modifier: 'right' };
-                        case 3: return { type: 'turn', modifier: 'sharp right' };
-                        case 4: return { type: 'arrive', modifier: null };
-                        case 6: return { type: 'roundabout', modifier: null };
-                        case 7: return { type: 'turn', modifier: 'slight right' };
-                        case 8: return { type: 'uturn', modifier: 'right' };
-                        default: return { type: 'continue', modifier: 'straight' }; // 0 e 5 (via intermedia raggiunta)
-                    }
-                }
-
-                function normalizzaPercorsoGraphHopper(path) {
-                    const coordsCompleti = (path.points && path.points.coordinates)
-                        ? path.points.coordinates.map(function (c) { return [c[1], c[0]]; })
-                        : [];
-                    const passi = (path.instructions || []).map(function (istr) {
-                        const inizio = (istr.interval && istr.interval[0]) || 0;
-                        const fine = (istr.interval && istr.interval[1]) || inizio;
-                        const segCoords = coordsCompleti.slice(inizio, fine + 1);
-                        const puntoManovra = segCoords[0] || coordsCompleti[0] || [0, 0];
-                        const segno = segnoGraphHopperInIstruzione(istr.sign);
-                        return {
-                            istruzione: { type: segno.type, modifier: segno.modifier, location: [puntoManovra[1], puntoManovra[0]] },
-                            nome_via: istr.street_name || '',
-                            distanza: istr.distance,
-                            durata: (istr.time || 0) / 1000,
-                            coords: segCoords
-                        };
-                    });
-                    return {
-                        fonte: 'graphhopper',
-                        distanza: path.distance,
-                        durata: (path.time || 0) / 1000,
-                        coords: coordsCompleti,
-                        passi: passi
-                    };
-                }
-
                 function rispostaConAlternative(percorsi) {
                     return Object.assign({}, percorsi[0], { percorsi: percorsi });
-                }
-
-                if (usaGraphHopper) {
-                    try {
-                        const veicoloGraphHopper = travelMode === 'walking' ? 'foot' : (travelMode === 'cycling' ? 'bike' : 'car');
-                        const urlGraphHopper = 'https://graphhopper.com/api/1/route' +
-                            '?point=' + fromLat + ',' + fromLon + '&point=' + toLat + ',' + toLon +
-                            '&vehicle=' + veicoloGraphHopper + '&locale=it&points_encoded=false&instructions=true&elevation=false' +
-                            '&key=' + encodeURIComponent(GRAPHHOPPER_API_KEY);
-                        const rispostaGH = await fetch(urlGraphHopper, { signal: AbortSignal.timeout(10000) });
-                        if (!rispostaGH.ok) throw new Error('HTTP ' + rispostaGH.status);
-                        const datiGH = await rispostaGH.json();
-                        if (!datiGH.paths || datiGH.paths.length === 0) throw new Error('GraphHopper: nessun percorso trovato');
-                        const percorsoGH = normalizzaPercorsoGraphHopper(datiGH.paths[0]);
-                        return sendJSON(res, 200, rispostaConAlternative([percorsoGH]));
-                    } catch (erroreGraphHopper) {
-                        console.error('Indicazioni GraphHopper fallite, ripiego su Mapbox/OSRM:', erroreGraphHopper.message);
-                    }
                 }
 
                 if (usaMapbox) {
@@ -2499,9 +2396,9 @@ const server = http.createServer((req, res) => {
                 const percorsoOsrm = rispostaConAlternative(normalizzaPercorsi(datiOsrm.routes, 'osrm'));
                 if (evitaPedaggi || evitaAutostrade) {
                     // Onestà verso chi cerca: questo ripiego (usato solo se
-                    // sia GraphHopper che Mapbox non hanno risposto) non sa
-                    // evitare pedaggi/autostrade — meglio dirlo che far
-                    // credere che la preferenza sia stata rispettata.
+                    // Mapbox non ha risposto) non sa evitare pedaggi/
+                    // autostrade — meglio dirlo che far credere che la
+                    // preferenza sia stata rispettata.
                     percorsoOsrm.preferenzaNonSupportata = true;
                 }
                 return sendJSON(res, 200, percorsoOsrm);
@@ -4736,6 +4633,15 @@ function parseAdminDateRange(searchParams) {
                 const name = (payload.name || '').trim() || email.split('@')[0];
                 const surname = (payload.surname || '').trim(); // facoltativo
 
+                const registerIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+                const turnstileOkRegistrazione = await verificaTurnstile(payload.turnstileToken, registerIp);
+                if (!turnstileOkRegistrazione) {
+                    return sendJSON(res, 403, {
+                        error: 'verifica_bot_fallita',
+                        message: 'Verifica di sicurezza non superata. Ricarica la pagina e riprova.'
+                    });
+                }
+
                 if (!EMAIL_REGEX.test(email)) {
                     return sendJSON(res, 400, { error: 'Email non valida.' });
                 }
@@ -4743,7 +4649,6 @@ function parseAdminDateRange(searchParams) {
                     return sendJSON(res, 400, { error: 'La password deve avere almeno 8 caratteri.' });
                 }
 
-                const registerIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
                 const registerIpCheck = await checkAndConsumeRateLimitPersistent('register-ip', registerIp, MAX_REGISTRATIONS_PER_IP, REGISTER_RATE_WINDOW_MS, registerRateLimitByIp);
                 if (!registerIpCheck.allowed) {
                     return sendJSON(res, 429, {
@@ -4772,7 +4677,7 @@ function parseAdminDateRange(searchParams) {
                     passwordHash: hashPassword(password),
                     emailVerified: false,
                     verifyToken: verifyToken,
-                    verifyTokenExpires: Date.now() + 24 * 60 * 60 * 1000 // 24 ore
+                    verifyTokenExpires: Date.now() + 3 * 60 * 60 * 1000 // 3 ore
                 };
                 await saveUser(user);
 
@@ -4781,7 +4686,7 @@ function parseAdminDateRange(searchParams) {
                     user.email,
                     'Conferma la tua email - iAlgae',
                     '<p>Ciao ' + escapeHtmlServer(user.name || '') + ',</p>' +
-                    '<p>Grazie per esserti registrato su iAlgae! Conferma il tuo indirizzo email cliccando sul link qui sotto (valido per 24 ore):</p>' +
+                    '<p>Grazie per esserti registrato su iAlgae! Conferma il tuo indirizzo email cliccando sul link qui sotto (valido per 3 ore):</p>' +
                     '<p><a href="' + verifyUrl + '">' + verifyUrl + '</a></p>' +
                     '<p>Se non trovi questa email nella posta in arrivo, controlla anche nella cartella <strong>spam/posta indesiderata</strong>.</p>' +
                     '<p>Se non sei stato tu a registrarti, ignora pure questa email.</p>'
@@ -4876,7 +4781,7 @@ function parseAdminDateRange(searchParams) {
                 const user = await getUserByEmail(email);
                 if (user && user.provider === 'local' && !user.emailVerified) {
                     user.verifyToken = crypto.randomBytes(32).toString('hex');
-                    user.verifyTokenExpires = Date.now() + 24 * 60 * 60 * 1000;
+                    user.verifyTokenExpires = Date.now() + 3 * 60 * 60 * 1000;
                     await saveUser(user);
 
                     const verifyUrl = SITE_BASE_URL + '/verify-email.html?token=' + user.verifyToken;
@@ -4884,7 +4789,7 @@ function parseAdminDateRange(searchParams) {
                         user.email,
                         'Conferma la tua email - iAlgae',
                         '<p>Ciao ' + escapeHtmlServer(user.name || '') + ',</p>' +
-                        '<p>Ecco un nuovo link per confermare la tua email (valido per 24 ore):</p>' +
+                        '<p>Ecco un nuovo link per confermare la tua email (valido per 3 ore):</p>' +
                         '<p><a href="' + verifyUrl + '">' + verifyUrl + '</a></p>' +
                         '<p>Se non trovi questa email nella posta in arrivo, controlla anche nella cartella <strong>spam/posta indesiderata</strong>.</p>'
                     );
@@ -4917,6 +4822,14 @@ function parseAdminDateRange(searchParams) {
                 const password = payload.password || '';
 
                 const loginIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+                const turnstileOkLogin = await verificaTurnstile(payload.turnstileToken, loginIp);
+                if (!turnstileOkLogin) {
+                    return sendJSON(res, 403, {
+                        error: 'verifica_bot_fallita',
+                        message: 'Verifica di sicurezza non superata. Ricarica la pagina e riprova.'
+                    });
+                }
+
                 const ipCheck = await checkAndConsumeRateLimitPersistent('login-ip', loginIp, MAX_LOGIN_ATTEMPTS_PER_IP, LOGIN_RATE_WINDOW_MS, loginRateLimitByIp);
                 const emailCheck = await checkAndConsumeRateLimitPersistent('login-email', email, MAX_LOGIN_ATTEMPTS_PER_EMAIL, LOGIN_RATE_WINDOW_MS, loginRateLimitByEmail);
                 if (!ipCheck.allowed || !emailCheck.allowed) {
@@ -6650,16 +6563,6 @@ if (dbEnabled) {
         pool.query('DELETE FROM map_reports WHERE expires_at <= now()')
             .catch(function (err) {
                 console.error('Errore pulizia map_reports:', err);
-            });
-    }, 60 * 60 * 1000);
-
-    // Il contatore giornaliero di GraphHopper serve solo per il giorno
-    // corrente: teniamo comunque gli ultimi 7 giorni (utile per un'occhiata
-    // rapida all'andamento), buttando via il resto.
-    setInterval(function () {
-        pool.query("DELETE FROM uso_graphhopper WHERE giorno < to_char(now() - interval '7 days', 'YYYY-MM-DD')")
-            .catch(function (err) {
-                console.error('Errore pulizia uso_graphhopper:', err);
             });
     }, 60 * 60 * 1000);
 
