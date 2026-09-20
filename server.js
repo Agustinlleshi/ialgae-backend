@@ -940,9 +940,7 @@ async function checkAllMilestones() {
         const visitsResult = await pool.query('SELECT COUNT(*)::int AS c FROM page_views');
         await checkMilestone('total_visits', visitsResult.rows[0].c, '🎉 Hai superato le {n} visite totali!');
 
-        // Conta solo gli iscritti "veri" (email confermata), coerentemente
-        // con quello che ora mostra il pannello Iscritti.
-        const usersResult = await pool.query('SELECT COUNT(*)::int AS c FROM users WHERE email_verified = true');
+        const usersResult = await pool.query('SELECT COUNT(*)::int AS c FROM users');
         await checkMilestone('total_users', usersResult.rows[0].c, '🎉 Hai superato i {n} iscritti!');
 
         const postsResult = await pool.query('SELECT COUNT(*)::int AS c FROM blog_posts WHERE published = true');
@@ -3904,41 +3902,48 @@ function parseAdminDateRange(searchParams) {
 
                 const { rangeStart, rangeEnd } = parseAdminDateRange(parsedUrl.searchParams);
 
-                // Chi non ha ancora confermato l'email non è un iscritto "vero"
-                // (è una registrazione a metà, magari mai completata): non deve
-                // comparire da nessuna parte in questo pannello, né nei totali
-                // né nell'elenco. Per questo ogni query qui sotto filtra su
-                // email_verified = true.
+                // I totali e il grafico contano TUTTE le registrazioni (confermate
+                // o no) — è il numero reale di persone che hanno provato a
+                // iscriversi, utile per accorgersi ad es. se tante email di
+                // conferma non arrivano mai. L'elenco "Ultimi iscritti" invece
+                // resta filtrato sui soli confermati (email_verified = true):
+                // chi non ha completato la registrazione non deve comparire lì,
+                // con nome ed email, come iscritto a tutti gli effetti.
                 const totalsResult = await pool.query(
                     'SELECT COUNT(*)::int AS total, ' +
                     'COUNT(*) FILTER (WHERE is_pro)::int AS pro_count, ' +
                     'COUNT(*) FILTER (WHERE email_verified)::int AS verified_count, ' +
                     "COUNT(*) FILTER (WHERE created_at >= date_trunc('day', now()))::int AS new_today " +
-                    'FROM users WHERE email_verified = true'
+                    'FROM users'
                 );
 
                 const dailyResult = await pool.query(
                     "SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day, COUNT(*)::int AS count " +
-                    'FROM users WHERE email_verified = true AND created_at >= $1 AND created_at <= $2 ' +
+                    'FROM users WHERE created_at >= $1 AND created_at <= $2 ' +
                     'GROUP BY 1 ORDER BY 1',
                     [rangeStart, rangeEnd]
                 );
 
-                // I 20 iscritti più recenti in assoluto (non solo nel periodo
-                // scelto) — è un elenco "chi si è appena iscritto", ha senso
-                // che sia sempre aggiornato indipendentemente dal filtro data.
+                // I 20 iscritti CONFERMATI più recenti in assoluto (non solo nel
+                // periodo scelto) — è un elenco "chi si è appena iscritto
+                // davvero", ha senso che sia sempre aggiornato indipendentemente
+                // dal filtro data.
                 const recentResult = await pool.query(
                     'SELECT name, surname, email, is_pro, created_at ' +
                     'FROM users WHERE email_verified = true ORDER BY created_at DESC LIMIT 20'
                 );
 
                 const total = totalsResult.rows[0].total;
+                const verifiedCount = totalsResult.rows[0].verified_count;
+                const pendingCount = total - verifiedCount;
                 const verifiedPercent = total > 0
-                    ? Math.round((totalsResult.rows[0].verified_count / total) * 1000) / 10
+                    ? Math.round((verifiedCount / total) * 1000) / 10
                     : null;
 
                 return sendJSON(res, 200, {
                     totalUsers: total,
+                    verifiedCount: verifiedCount,
+                    pendingCount: pendingCount,
                     newToday: totalsResult.rows[0].new_today,
                     proCount: totalsResult.rows[0].pro_count,
                     verifiedPercent: verifiedPercent,
