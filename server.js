@@ -118,11 +118,25 @@ const MAPBOX_ACCESS_TOKEN = process.env.MAPBOX_ACCESS_TOKEN || '';
 // Genera una chiave TomTom da https://developer.tomtom.com/ e impostala
 // come variabile d'ambiente TOMTOM_API_KEY su Render.
 const TOMTOM_API_KEY = process.env.TOMTOM_API_KEY || '';
-// Chiave segreta di Cloudflare Turnstile (protezione anti-bot su login e
-// registrazione). Impostala come variabile d'ambiente TURNSTILE_SECRET_KEY
-// su Render — mai nel browser: solo il server la usa per verificare col
-// servizio di Cloudflare che il token mandato dal modulo sia autentico.
-const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
+// Chiave API di Google Cloud per reCAPTCHA (protezione anti-bot su login e
+// registrazione, al posto di Cloudflare Turnstile — vedi promemoria: Turnstile
+// dava errore 400020 su ogni sitekey vera di questo account/dominio).
+// A differenza della vecchia reCAPTCHA "classica", nel 2026 Google verifica
+// anche le chiavi v2 checkbox tramite l'API Enterprise (recaptchaenterprise.
+// googleapis.com), quindi qui serve una CHIAVE API di Google Cloud (creata in
+// APIs & Services > Credenziali sul progetto ialgae-ia, con l'API "reCAPTCHA
+// Enterprise" abilitata), non la vecchia "chiave segreta" — quella non esiste
+// più per le chiavi create ora. Impostala come variabile d'ambiente
+// RECAPTCHA_API_KEY su Render — mai nel browser. La site key pubblica invece
+// va nell'HTML di login.html, non qui.
+const RECAPTCHA_API_KEY = process.env.RECAPTCHA_API_KEY || '';
+// Site key pubblica della chiave "ialgae login" (la stessa già presente in
+// login.html/en_login.html) — l'API Enterprise la richiede anche lato server,
+// insieme al token, per sapere quale chiave stiamo verificando.
+const RECAPTCHA_SITE_KEY = '6LdAJMYtAAAAACeCS2zkwpUDidz-D8jFpZETDo_o';
+// ID del progetto Google Cloud che contiene la chiave reCAPTCHA (visibile
+// nell'URL della console, es. .../assessments?project=ialgae-ia).
+const RECAPTCHA_PROJECT_ID = 'ialgae-ia';
 
 // Chiave segreta per proteggere le statistiche interne (es. iscrizioni
 // giornaliere). Impostala su Render come stringa lunga e casuale, inventata
@@ -699,31 +713,40 @@ async function initDb() {
 // capoluogo della sua città metropolitana). Per chi legge è solo rumore
 // ripetuto: lo togliamo qui, una volta sola, cosicché resti così ovunque
 // questo testo viene mostrato (ricerca, suggerimenti, indicazioni).
-// Verifica col servizio di Cloudflare che il token Turnstile mandato dal
-// modulo di login/registrazione sia autentico (non finto, non riusato, non
-// scaduto). Se manca la chiave segreta (non ancora configurata su Render)
-// o il servizio di Cloudflare non risponde, lasciamo passare senza
+// Verifica col servizio di Google (API reCAPTCHA Enterprise) che il token
+// mandato dal modulo di login/registrazione sia autentico (non finto, non
+// riusato, non scaduto). Se manca la chiave API (non ancora configurata su
+// Render) o il servizio di Google non risponde, lasciamo passare senza
 // bloccare nessuno — meglio un login/registrazione senza questa protezione
 // in più che un sito dove nessuno riesce più ad accedere per un problema
-// nostro di configurazione.
-async function verificaTurnstile(token, ip) {
-    if (!TURNSTILE_SECRET_KEY) return true;
+// nostro di configurazione (stessa logica prudente di prima con Turnstile).
+async function verificaRecaptcha(token, ip) {
+    if (!RECAPTCHA_API_KEY) return true;
     if (!token) return false;
     try {
-        const parametri = new URLSearchParams();
-        parametri.append('secret', TURNSTILE_SECRET_KEY);
-        parametri.append('response', token);
-        if (ip) parametri.append('remoteip', ip);
-        const risposta = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+        const url = 'https://recaptchaenterprise.googleapis.com/v1/projects/' +
+            RECAPTCHA_PROJECT_ID + '/assessments?key=' + RECAPTCHA_API_KEY;
+        const risposta = await fetch(url, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: parametri.toString(),
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                event: {
+                    token: token,
+                    siteKey: RECAPTCHA_SITE_KEY
+                }
+            }),
             signal: AbortSignal.timeout(8000)
         });
         const dati = await risposta.json();
-        return dati.success === true;
+        // tokenProperties.valid: per una chiave "v2 checkbox" come la nostra
+        // è l'equivalente del vecchio "success" — indica se l'utente ha
+        // davvero completato la casella "Non sono un robot" con un token
+        // genuino, non scaduto e non già usato. Non guardiamo riskAnalysis.
+        // score qui: quello serve per le chiavi a punteggio (v3), non per
+        // questa.
+        return !!(dati.tokenProperties && dati.tokenProperties.valid === true);
     } catch (errore) {
-        console.error('Errore verifica Turnstile (lasciamo passare per non bloccare tutti):', errore.message);
+        console.error('Errore verifica reCAPTCHA (lasciamo passare per non bloccare tutti):', errore.message);
         return true;
     }
 }
@@ -4735,8 +4758,8 @@ function parseAdminDateRange(searchParams) {
                 const surname = (payload.surname || '').trim(); // facoltativo
 
                 const registerIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
-                const turnstileOkRegistrazione = await verificaTurnstile(payload.turnstileToken, registerIp);
-                if (!turnstileOkRegistrazione) {
+                const recaptchaOkRegistrazione = await verificaRecaptcha(payload.recaptchaToken, registerIp);
+                if (!recaptchaOkRegistrazione) {
                     return sendJSON(res, 403, {
                         error: 'verifica_bot_fallita',
                         message: 'Verifica di sicurezza non superata. Ricarica la pagina e riprova.'
@@ -4924,8 +4947,8 @@ function parseAdminDateRange(searchParams) {
                 const password = payload.password || '';
 
                 const loginIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
-                const turnstileOkLogin = await verificaTurnstile(payload.turnstileToken, loginIp);
-                if (!turnstileOkLogin) {
+                const recaptchaOkLogin = await verificaRecaptcha(payload.recaptchaToken, loginIp);
+                if (!recaptchaOkLogin) {
                     return sendJSON(res, 403, {
                         error: 'verifica_bot_fallita',
                         message: 'Verifica di sicurezza non superata. Ricarica la pagina e riprova.'
