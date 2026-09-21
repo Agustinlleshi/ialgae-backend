@@ -6731,78 +6731,57 @@ initDb()
         });
     });
 
-// Pulizia periodica delle voci di cache scadute, così la tabella non cresce
-// all'infinito nel tempo. Non è indispensabile per il funzionamento (le voci
-// scadute vengono comunque ignorate dalle query grazie a "expires_at > now()"),
-// ma tiene il database più leggero. Gira ogni ora.
+// Tutti i controlli/pulizie periodiche che PRIMA giravano ognuno per conto
+// proprio ogni ora (7 setInterval separati) sono stati uniti qui in un unico
+// giro ogni 6 ore. Motivo: ogni risveglio del database consuma ore di
+// calcolo sul piano gratuito di Neon (che si esauriscono al mese) — nessuna
+// di queste pulizie ha davvero bisogno di girare ogni ora, quindi passare a
+// ogni 6 ore taglia questi risvegli di 4 volte senza cambiare nulla per
+// l'utente (le voci scadute vengono comunque ignorate dalle query grazie ai
+// controlli su expires_at/created_at, indipendentemente da quando arriva la
+// pulizia).
+async function runPeriodicMaintenance() {
+    try {
+        await pool.query('DELETE FROM search_cache WHERE expires_at <= now()');
+    } catch (err) {
+        console.error('Errore pulizia search_cache:', err);
+    }
+    try {
+        await pool.query('DELETE FROM map_reports WHERE expires_at <= now()');
+    } catch (err) {
+        console.error('Errore pulizia map_reports:', err);
+    }
+    try {
+        await pool.query("DELETE FROM rate_limits WHERE window_start <= now() - interval '24 hours'");
+    } catch (err) {
+        console.error('Errore pulizia rate_limits:', err);
+    }
+    try {
+        await pool.query("DELETE FROM ai_response_cache WHERE created_at <= now() - interval '24 hours'");
+    } catch (err) {
+        console.error('Errore pulizia ai_response_cache:', err);
+    }
+    try {
+        await pool.query("DELETE FROM admin_notifications WHERE created_at <= now() - interval '90 days'");
+    } catch (err) {
+        console.error('Errore pulizia admin_notifications:', err);
+    }
+    // Traguardi e backup restano funzioni a parte (già definite più sopra),
+    // richiamate qui invece che da un loro proprio setInterval.
+    await checkAllMilestones();
+    await runWeeklyBackupIfDue();
+}
+
 if (dbEnabled) {
-    setInterval(function () {
-        pool.query('DELETE FROM search_cache WHERE expires_at <= now()')
-            .catch(function (err) {
-                console.error('Errore pulizia search_cache:', err);
-            });
-    }, 60 * 60 * 1000);
-
-    // Le segnalazioni scadute (oltre i 30 minuti) non servono più a nessuno.
-    setInterval(function () {
-        pool.query('DELETE FROM map_reports WHERE expires_at <= now()')
-            .catch(function (err) {
-                console.error('Errore pulizia map_reports:', err);
-            });
-    }, 60 * 60 * 1000);
-
-
-
-    // reset password) non servono più: le finestre scadute vengono comunque
-    // ignorate dalla logica sopra, ma questa pulizia tiene la tabella snella.
-    // Usiamo un margine di sicurezza di 24 ore invece dell'ora esatta, così
-    // funziona anche se in futuro si aggiungono limiti con finestre più lunghe.
-    setInterval(function () {
-        pool.query("DELETE FROM rate_limits WHERE window_start <= now() - interval '24 hours'")
-            .catch(function (err) {
-                console.error('Errore pulizia rate_limits:', err);
-            });
-    }, 60 * 60 * 1000);
-
-    // Stessa idea, per la cache delle risposte IA: qui la "scadenza" non è
-    // una colonna dedicata (vedi AI_CACHE_TTL_MS più sopra), quindi puliamo
-    // usando lo stesso margine di 24 ore direttamente su created_at.
-    setInterval(function () {
-        pool.query("DELETE FROM ai_response_cache WHERE created_at <= now() - interval '24 hours'")
-            .catch(function (err) {
-                console.error('Errore pulizia ai_response_cache:', err);
-            });
-    }, 60 * 60 * 1000);
-
-    // Controlla i traguardi (visite, iscritti, articoli) sia subito all'avvio
-    // del server, sia ogni ora — così una soglia superata viene notificata
-    // entro un'ora al massimo, senza dover aspettare che qualcuno apra la
-    // dashboard per "farla scattare".
-    checkAllMilestones();
-    setInterval(checkAllMilestones, 60 * 60 * 1000);
-
-    // Backup settimanale: controlliamo ogni ora se è "dovuto" (sono passati
-    // 7 giorni dall'ultimo mandato) — questo, invece di un timer fisso,
-    // gestisce bene anche i riavvii del server nel mezzo della settimana.
-    runWeeklyBackupIfDue();
-    setInterval(runWeeklyBackupIfDue, 60 * 60 * 1000);
+    runPeriodicMaintenance();
+    setInterval(runPeriodicMaintenance, 6 * 60 * 60 * 1000);
 
     // Controlla una volta al giorno se ci sono account inattivi da oltre un
     // anno (nessun accesso — vedi last_login) e li elimina automaticamente.
     // Un controllo giornaliero è più che sufficiente: la finestra di un anno
-    // non richiede la stessa granularità oraria degli altri task qui sopra.
+    // non richiede la stessa granularità degli altri task qui sopra.
     deleteInactiveAccounts();
     setInterval(deleteInactiveAccounts, 24 * 60 * 60 * 1000);
-
-    // Elimina anche le notifiche più vecchie di 90 giorni, per non far
-    // crescere la tabella all'infinito — 90 giorni sono comunque più che
-    // sufficienti per uno storico utile nella campanella.
-    setInterval(function () {
-        pool.query("DELETE FROM admin_notifications WHERE created_at <= now() - interval '90 days'")
-            .catch(function (err) {
-                console.error('Errore pulizia admin_notifications:', err);
-            });
-    }, 60 * 60 * 1000);
 
     // Scrive sul database, tutte insieme, le durate di visita accumulate in
     // memoria (vedi pendingDurations e /api/track/duration più sopra).
