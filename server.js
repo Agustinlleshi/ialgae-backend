@@ -422,6 +422,14 @@ async function initDb() {
     // già esistenti è una stima ragionevole al momento della migrazione:
     // meglio di NULL, che renderebbe impossibile ordinare per inattività.
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ NOT NULL DEFAULT now()');
+    // Paese/città dell'ultimo accesso, dedotti dall'IP con lo stesso servizio
+    // di geolocalizzazione già usato per i visitatori anonimi (vedi
+    // getGeoForIp). Aggiornati da touchLastLogin ad ogni login riuscito —
+    // servono per il riepilogo "da quali paesi accedono i tuoi iscritti" nel
+    // pannello admin.
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_country TEXT');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_country_code TEXT');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_city TEXT');
     // Elenco delle app che l'utente ha scelto di nascondere dal proprio menu
     // "I tuoi preferiti" (personalizzazione disponibile solo da loggati).
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS hidden_apps TEXT[] NOT NULL DEFAULT \'{}\'');
@@ -1385,7 +1393,10 @@ function rowToUser(row) {
         totpPendingSecret: row.totp_pending_secret,
         totpEnabled: row.totp_enabled,
         createdAt: row.created_at,
-        lastLogin: row.last_login
+        lastLogin: row.last_login,
+        lastCountry: row.last_country,
+        lastCountryCode: row.last_country_code,
+        lastCity: row.last_city
     };
 }
 
@@ -1396,19 +1407,35 @@ async function getUserById(id) {
     return rowToUser(result.rows[0]);
 }
 
-// Aggiorna la data di ultimo accesso di un utente. Va chiamata SOLO dopo un
-// login riuscito (mai a ogni richiesta autenticata), perché è esattamente
-// questa data che decide, un anno dopo, se l'account viene eliminato in
-// automatico (vedi deleteInactiveAccounts più in basso).
-async function touchLastLogin(userId) {
+// Aggiorna la data (e il paese/città, dedotti dall'IP) dell'ultimo accesso
+// di un utente. Va chiamata SOLO dopo un login riuscito (mai a ogni
+// richiesta autenticata), perché è esattamente questa data che decide, un
+// anno dopo, se l'account viene eliminato in automatico (vedi
+// deleteInactiveAccounts più in basso).
+async function touchLastLogin(userId, ip) {
     if (!userId) return;
     try {
+        // getGeoForIp è definita più sotto in questo file, ma essendo una
+        // "function" (non una const/arrow) è disponibile ovunque nel modulo
+        // grazie all'hoisting — nessun problema a richiamarla da qui.
+        const geo = ip ? await getGeoForIp(ip) : { country: null, countryCode: null, city: null };
+
         if (!dbEnabled) {
             const memUser = memoryUsers.get(userId);
-            if (memUser) memUser.lastLogin = new Date();
+            if (memUser) {
+                memUser.lastLogin = new Date();
+                memUser.lastCountry = geo.country;
+                memUser.lastCountryCode = geo.countryCode;
+                memUser.lastCity = geo.city;
+            }
             return;
         }
-        await pool.query('UPDATE users SET last_login = now() WHERE id = $1', [userId]);
+        await pool.query(
+            'UPDATE users SET last_login = now(), last_country = COALESCE($2, last_country), ' +
+            'last_country_code = COALESCE($3, last_country_code), last_city = COALESCE($4, last_city) ' +
+            'WHERE id = $1',
+            [userId, geo.country, geo.countryCode, geo.city]
+        );
     } catch (err) {
         console.error('Errore aggiornamento last_login per', userId, ':', err);
     }
@@ -3140,7 +3167,8 @@ const server = http.createServer((req, res) => {
                     });
                 }
 
-                await touchLastLogin(user.sub);
+                const googleLoginIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+                await touchLastLogin(user.sub, googleLoginIp);
 
                 const sessionToken = jwt.sign(
                     { sub: user.sub },
@@ -3230,7 +3258,8 @@ const server = http.createServer((req, res) => {
                     });
                 }
 
-                await touchLastLogin(user.sub);
+                const microsoftLoginIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+                await touchLastLogin(user.sub, microsoftLoginIp);
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
@@ -3961,6 +3990,17 @@ function parseAdminDateRange(searchParams) {
                     'FROM users WHERE email_verified = true ORDER BY created_at DESC LIMIT 20'
                 );
 
+                // Da quali paesi accedono gli iscritti (confermati), dedotto
+                // dall'IP dell'ultimo login (vedi touchLastLogin). Chi non ha
+                // ancora mai fatto un secondo accesso da quando abbiamo
+                // iniziato a registrarlo (o il cui IP non è geolocalizzabile)
+                // resta fuori da questo conteggio, non finisce in "sconosciuto".
+                const topUserCountriesResult = await pool.query(
+                    'SELECT last_country AS country, last_country_code AS "countryCode", COUNT(*)::int AS count ' +
+                    'FROM users WHERE email_verified = true AND last_country IS NOT NULL ' +
+                    'GROUP BY last_country, last_country_code ORDER BY count DESC LIMIT 50'
+                );
+
                 const total = totalsResult.rows[0].total;
                 const verifiedCount = totalsResult.rows[0].verified_count;
                 const pendingCount = total - verifiedCount;
@@ -3976,6 +4016,7 @@ function parseAdminDateRange(searchParams) {
                     proCount: totalsResult.rows[0].pro_count,
                     verifiedPercent: verifiedPercent,
                     dailySignups: dailyResult.rows,
+                    topCountries: topUserCountriesResult.rows,
                     recentUsers: recentResult.rows.map(function (r) {
                         return {
                             name: [r.name, r.surname].filter(Boolean).join(' ') || '(senza nome)',
@@ -4590,6 +4631,8 @@ function parseAdminDateRange(searchParams) {
                         createdAt: user.createdAt,
                         emailVerified: !!user.emailVerified,
                         lastLogin: user.lastLogin,
+                        lastCountry: user.lastCountry || null,
+                        lastCity: user.lastCity || null,
                         suspended: !!user.suspended,
                         suspendedReason: user.suspendedReason || null
                     }
@@ -4872,7 +4915,8 @@ function parseAdminDateRange(searchParams) {
 
                 // Una volta confermata l'email, colleghiamo subito l'utente:
                 // non deve rifare il login da capo.
-                await touchLastLogin(user.sub);
+                const verifyEmailIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+                await touchLastLogin(user.sub, verifyEmailIp);
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
                     message: 'Email confermata con successo!',
@@ -5004,7 +5048,7 @@ function parseAdminDateRange(searchParams) {
                     });
                 }
 
-                await touchLastLogin(user.sub);
+                await touchLastLogin(user.sub, loginIp);
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
@@ -5069,7 +5113,8 @@ function parseAdminDateRange(searchParams) {
                     return sendJSON(res, 401, { error: 'Codice non valido o scaduto.' });
                 }
 
-                await touchLastLogin(user.sub);
+                const twoFaLoginIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+                await touchLastLogin(user.sub, twoFaLoginIp);
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
