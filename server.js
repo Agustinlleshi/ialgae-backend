@@ -772,6 +772,30 @@ function pulisciDisplayName(testo) {
         .replace(/,\s*libero consorzio (comunale )?di [^,]+/gi, '');
 }
 
+// Nominatim (OpenStreetMap) impone un massimo di 1 richiesta al secondo per
+// server — sforarlo può far bloccare/limitare il nostro IP, che risponde con
+// una pagina di errore in XML invece dei risultati in JSON. È esattamente
+// il sintomo che ha portato a scoprire questo problema: ricerche che non
+// trovano più nulla, perché il codice mandava fino a 3-4 richieste a
+// Nominatim IN PARALLELO per ogni singola ricerca di un utente.
+// Tutte le chiamate a Nominatim in questo file passano da qui, che le mette
+// in coda così ne parte sempre una alla volta con almeno 1,1 secondi di
+// distanza, qualunque sia il numero di ricerche in corso nello stesso
+// momento da utenti diversi.
+let nominatimCodaUltimaChiamata = Promise.resolve();
+function fetchNominatim(url, options) {
+    const chiamata = nominatimCodaUltimaChiamata.then(function () {
+        return fetch(url, options);
+    });
+    // La prossima chiamata in coda aspetta comunque 1,1s da adesso, sia che
+    // questa vada a buon fine sia che fallisca — altrimenti un errore
+    // veloce farebbe partire subito la successiva, di nuovo troppo vicina.
+    nominatimCodaUltimaChiamata = chiamata.catch(function () {}).then(function () {
+        return new Promise(function (resolve) { setTimeout(resolve, 1100); });
+    });
+    return chiamata;
+}
+
 async function permessoUsoMapbox(servizio, sogliaMassima) {
     if (!MAPBOX_ACCESS_TOKEN || !dbEnabled) return false;
     const oggi = new Date();
@@ -2174,7 +2198,7 @@ const server = http.createServer((req, res) => {
                 const interrogaNominatim = async function (urlExtra, testoCercato) {
                     const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=30&extratags=1&countrycodes=it' +
                         urlExtra + '&q=' + encodeURIComponent(testoCercato);
-                    const risposta = await fetch(url, {
+                    const risposta = await fetchNominatim(url, {
                         headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                         signal: AbortSignal.timeout(10000)
                     });
@@ -2239,7 +2263,7 @@ const server = http.createServer((req, res) => {
                     try {
                         const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
                             '&amenity=' + encodeURIComponent(nome);
-                        const risposta = await fetch(url, {
+                        const risposta = await fetchNominatim(url, {
                             headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                             signal: AbortSignal.timeout(10000)
                         });
@@ -2603,7 +2627,7 @@ const server = http.createServer((req, res) => {
                 }
 
                 const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&q=' + encodeURIComponent(q);
-                const rispostaNominatim = await fetch(urlNominatim, {
+                const rispostaNominatim = await fetchNominatim(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(8000)
                 });
@@ -2670,7 +2694,7 @@ const server = http.createServer((req, res) => {
                 }
 
                 const urlNominatim = 'https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lon + '&zoom=18&addressdetails=1&extratags=1';
-                const rispostaNominatim = await fetch(urlNominatim, {
+                const rispostaNominatim = await fetchNominatim(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(10000)
                 });
