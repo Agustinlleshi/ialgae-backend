@@ -291,16 +291,6 @@ const memory2faAttempts = new Map(); // userId -> { count, windowStart }
 // sul piano gratuito, si traduce in ore di calcolo consumate inutilmente).
 const pendingDurations = new Map(); // page_view id -> durationMs
 
-// Cache di riserva in memoria per il blog: se il database non risponde (es.
-// quota di calcolo di Neon esaurita), le pagine del blog mostrano comunque
-// l'ultima versione letta con successo invece di un errore — un lettore non
-// se ne accorge nemmeno. Si aggiornano da sole ogni volta che una richiesta
-// va a buon fine, nessun'altra azione richiesta. Sono cache di SOLA lettura:
-// non sostituiscono il database per scrivere nuovi articoli dal pannello
-// admin, che restano possibili solo quando il database torna raggiungibile.
-let blogPostsListaDiRiserva = null;
-const blogPostSingoloDiRiserva = new Map(); // slug -> oggetto post
-
 // Segnalazioni stradali (tabella map_reports / endpoint /api/maps/reports):
 // se il database non è configurato, ripiego in memoria.
 const memoryReports = [];
@@ -782,30 +772,6 @@ function pulisciDisplayName(testo) {
         .replace(/,\s*libero consorzio (comunale )?di [^,]+/gi, '');
 }
 
-// Nominatim (OpenStreetMap) impone un massimo di 1 richiesta al secondo per
-// server — sforarlo può far bloccare/limitare il nostro IP, che risponde con
-// una pagina di errore in XML invece dei risultati in JSON. È esattamente
-// il sintomo che ha portato a scoprire questo problema: ricerche che non
-// trovano più nulla, perché il codice mandava fino a 3-4 richieste a
-// Nominatim IN PARALLELO per ogni singola ricerca di un utente.
-// Tutte le chiamate a Nominatim in questo file passano da qui, che le mette
-// in coda così ne parte sempre una alla volta con almeno 1,1 secondi di
-// distanza, qualunque sia il numero di ricerche in corso nello stesso
-// momento da utenti diversi.
-let nominatimCodaUltimaChiamata = Promise.resolve();
-function fetchNominatim(url, options) {
-    const chiamata = nominatimCodaUltimaChiamata.then(function () {
-        return fetch(url, options);
-    });
-    // La prossima chiamata in coda aspetta comunque 1,1s da adesso, sia che
-    // questa vada a buon fine sia che fallisca — altrimenti un errore
-    // veloce farebbe partire subito la successiva, di nuovo troppo vicina.
-    nominatimCodaUltimaChiamata = chiamata.catch(function () {}).then(function () {
-        return new Promise(function (resolve) { setTimeout(resolve, 1100); });
-    });
-    return chiamata;
-}
-
 async function permessoUsoMapbox(servizio, sogliaMassima) {
     if (!MAPBOX_ACCESS_TOKEN || !dbEnabled) return false;
     const oggi = new Date();
@@ -948,179 +914,6 @@ async function callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens) {
             return await callGemini(anthropicMessages, systemPrompt, maxTokens);
         }
         throw err; // errore non transitorio (es. chiave mancante/non valida): non ha senso ritentare
-    }
-}
-
-// ---- VERSIONI "IN STREAMING" (per l'AI Mode di results.html) ----
-// Uguali a callGemini/callAnthropic, ma invece di aspettare la risposta
-// intera e restituirla tutta insieme, chiamano onChunk(testo) man mano che
-// arrivano pezzi dal modello — così l'utente vede il testo comparire pian
-// piano invece di aspettare 5-7 secondi a schermo fermo. Il tempo TOTALE di
-// generazione non cambia, ma la sensazione di lentezza sparisce quasi del
-// tutto. Restituiscono comunque il testo completo alla fine (serve per
-// salvarlo in cache).
-async function callGeminiStream(anthropicMessages, systemPrompt, maxTokens, onChunk) {
-    if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY non configurata');
-
-    const requestBody = {
-        contents: toGeminiContents(anthropicMessages),
-        generationConfig: { maxOutputTokens: maxTokens || 2000 }
-    };
-    if (systemPrompt) requestBody.systemInstruction = { parts: [{ text: systemPrompt }] };
-
-    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL +
-        ':streamGenerateContent?alt=sse&key=' + GEMINI_API_KEY;
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-    });
-
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error('Gemini ' + response.status + ': ' + errText);
-    }
-
-    let fullText = '';
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let eventEnd;
-        while ((eventEnd = buffer.indexOf('\n\n')) !== -1) {
-            const rawEvent = buffer.slice(0, eventEnd);
-            buffer = buffer.slice(eventEnd + 2);
-
-            const dataLine = rawEvent.split('\n').find(function (l) { return l.indexOf('data:') === 0; });
-            if (!dataLine) continue;
-            const jsonStr = dataLine.slice(5).trim();
-            if (!jsonStr) continue;
-
-            try {
-                const parsed = JSON.parse(jsonStr);
-                const candidate = parsed.candidates && parsed.candidates[0];
-                const parts = candidate && candidate.content && candidate.content.parts;
-                const textPiece = Array.isArray(parts) ? parts.map(function (p) { return p.text || ''; }).join('') : '';
-                if (textPiece) {
-                    fullText += textPiece;
-                    onChunk(textPiece);
-                }
-            } catch (e) {
-                // Frammento JSON incompleto/spezzato a metà da un pacchetto di rete:
-                // capita raramente con lo streaming, si ricompone da solo al giro
-                // dopo — qui lo ignoriamo soltanto.
-            }
-        }
-    }
-
-    return fullText;
-}
-
-async function callAnthropicStream(anthropicMessages, systemPrompt, maxTokens, onChunk) {
-    if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY non configurata');
-
-    const requestBody = {
-        model: ANTHROPIC_MODEL,
-        max_tokens: maxTokens || 2000,
-        messages: anthropicMessages,
-        stream: true
-    };
-    if (systemPrompt) requestBody.system = systemPrompt;
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01'
-        },
-        body: JSON.stringify(requestBody)
-    });
-
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error('Anthropic ' + response.status + ': ' + errText);
-    }
-
-    let fullText = '';
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let eventEnd;
-        while ((eventEnd = buffer.indexOf('\n\n')) !== -1) {
-            const rawEvent = buffer.slice(0, eventEnd);
-            buffer = buffer.slice(eventEnd + 2);
-
-            const dataLine = rawEvent.split('\n').find(function (l) { return l.indexOf('data:') === 0; });
-            if (!dataLine) continue;
-            const jsonStr = dataLine.slice(5).trim();
-            if (!jsonStr) continue;
-
-            try {
-                const parsed = JSON.parse(jsonStr);
-                if (parsed.type === 'content_block_delta' && parsed.delta && typeof parsed.delta.text === 'string') {
-                    fullText += parsed.delta.text;
-                    onChunk(parsed.delta.text);
-                }
-            } catch (e) {
-                // Stesso discorso di sopra: frammento incompleto, si ignora.
-            }
-        }
-    }
-
-    return fullText;
-}
-
-// Equivalente in streaming di getAiAnswer: stesso ordine di tentativo
-// (Gemini prima, Claude come riserva), stessa gestione degli errori — solo
-// che il testo arriva a pezzi tramite onChunk invece che tutto insieme.
-// Se Gemini fallisce PRIMA di aver mandato qualsiasi pezzo, passiamo a
-// Claude normalmente: l'utente non ha ancora visto nulla, quindi non se ne
-// accorge. Ma se Gemini fallisce DOPO aver già mandato del testo vero,
-// passare a Claude vorrebbe dire mostrare due risposte diverse incollate
-// insieme — invece ci fermiamo lì, con quello che è arrivato, segnalando
-// solo che si è interrotta (vedi err.parzialmenteInviata più sotto).
-async function streamAiAnswer(anthropicMessages, systemPrompt, maxTokens, onChunk) {
-    let chunkGiaInviato = false;
-    const onChunkTracciato = function (chunk) {
-        chunkGiaInviato = true;
-        onChunk(chunk);
-    };
-
-    try {
-        const answer = await callGeminiStream(anthropicMessages, systemPrompt, maxTokens, onChunkTracciato);
-        return { answer: answer, provider: 'gemini' };
-    } catch (geminiErr) {
-        if (chunkGiaInviato) {
-            console.error('Gemini streaming interrotto a metà — nessun passaggio a Claude, per non mostrare due risposte diverse:', geminiErr.message);
-            const errParziale = new Error('Streaming interrotto a metà.');
-            errParziale.parzialmenteInviata = true;
-            throw errParziale;
-        }
-        console.error('Gemini streaming non disponibile, provo con Claude (Anthropic) come riserva:', geminiErr.message);
-        try {
-            const answer = await callAnthropicStream(anthropicMessages, systemPrompt, maxTokens, onChunkTracciato);
-            createNotificationThrottled(
-                'ai_fallback',
-                '⚠️ Il sito sta rispondendo con Claude invece di Gemini. Probabile problema con Gemini — controlla la sua disponibilità.',
-                6
-            );
-            return { answer: answer, provider: 'anthropic' };
-        } catch (anthropicErr) {
-            console.error('Anche Claude (Anthropic) non disponibile:', anthropicErr.message);
-            throw new Error('Nessun servizio IA disponibile al momento.');
-        }
     }
 }
 
@@ -2381,7 +2174,7 @@ const server = http.createServer((req, res) => {
                 const interrogaNominatim = async function (urlExtra, testoCercato) {
                     const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=30&extratags=1&countrycodes=it' +
                         urlExtra + '&q=' + encodeURIComponent(testoCercato);
-                    const risposta = await fetchNominatim(url, {
+                    const risposta = await fetch(url, {
                         headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                         signal: AbortSignal.timeout(10000)
                     });
@@ -2446,7 +2239,7 @@ const server = http.createServer((req, res) => {
                     try {
                         const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
                             '&amenity=' + encodeURIComponent(nome);
-                        const risposta = await fetchNominatim(url, {
+                        const risposta = await fetch(url, {
                             headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                             signal: AbortSignal.timeout(10000)
                         });
@@ -2810,7 +2603,7 @@ const server = http.createServer((req, res) => {
                 }
 
                 const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&q=' + encodeURIComponent(q);
-                const rispostaNominatim = await fetchNominatim(urlNominatim, {
+                const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(8000)
                 });
@@ -2877,7 +2670,7 @@ const server = http.createServer((req, res) => {
                 }
 
                 const urlNominatim = 'https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lon + '&zoom=18&addressdetails=1&extratags=1';
-                const rispostaNominatim = await fetchNominatim(urlNominatim, {
+                const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(10000)
                 });
@@ -6037,58 +5830,12 @@ function parseAdminDateRange(searchParams) {
                 let aiResult;
                 const isCacheable = anthropicMessages.length === 1;
                 const aiCacheKey = isCacheable ? buildAiCacheKey('overview', anthropicMessages[0].content) : null;
-                // Lo streaming va richiesto esplicitamente dal client (l'AI Mode di
-                // results.html): il riassunto IA e il pannello entità continuano a
-                // usare la risposta unica di prima, che gli basta perché sono
-                // comunque brevi o richiedono un JSON completo da interpretare.
-                const wantStream = payload.stream === true;
 
                 if (isCacheable) {
                     const cached = await getCachedAiAnswer(aiCacheKey);
                     if (cached) {
-                        if (wantStream) {
-                            // Già pronta: niente da "streammare" davvero, la mandiamo
-                            // in un solo pezzo con lo stesso formato che il client si
-                            // aspetta comunque per lo streaming.
-                            res.writeHead(200, {
-                                'Content-Type': 'text/event-stream; charset=utf-8',
-                                'Cache-Control': 'no-cache',
-                                'X-Accel-Buffering': 'no'
-                            });
-                            res.write('data: ' + JSON.stringify({ delta: cached.answer }) + '\n\n');
-                            res.write('data: ' + JSON.stringify({ done: true, aiProvider: cached.provider, fromCache: true }) + '\n\n');
-                            return res.end();
-                        }
                         return sendJSON(res, 200, { answer: cached.answer, aiProvider: cached.provider, fromCache: true });
                     }
-                }
-
-                if (wantStream) {
-                    res.writeHead(200, {
-                        'Content-Type': 'text/event-stream; charset=utf-8',
-                        'Cache-Control': 'no-cache',
-                        'X-Accel-Buffering': 'no' // evita che un eventuale proxy davanti a Render bufferizzi i pezzi invece di inoltrarli subito
-                    });
-                    try {
-                        const streamResult = await streamAiAnswer(anthropicMessages, undefined, undefined, function (chunk) {
-                            res.write('data: ' + JSON.stringify({ delta: chunk }) + '\n\n');
-                        });
-                        if (isCacheable) {
-                            await saveCachedAiAnswer(aiCacheKey, streamResult.answer, streamResult.provider);
-                        }
-                        res.write('data: ' + JSON.stringify({ done: true, aiProvider: streamResult.provider }) + '\n\n');
-                    } catch (aiErr) {
-                        console.error('Errore IA (overview, streaming):', aiErr.message);
-                        if (aiErr.parzialmenteInviata) {
-                            // È già arrivato del testo vero al client: chiudiamo
-                            // segnalando solo che si è interrotta, SENZA mandare un
-                            // "error" che farebbe sparire quanto già mostrato.
-                            res.write('data: ' + JSON.stringify({ done: true, incomplete: true }) + '\n\n');
-                        } else {
-                            res.write('data: ' + JSON.stringify({ error: 'Errore nel contattare il servizio IA. Riprova più tardi.' }) + '\n\n');
-                        }
-                    }
-                    return res.end();
                 }
 
                 try {
@@ -6306,20 +6053,14 @@ function parseAdminDateRange(searchParams) {
     if (req.method === 'GET' && req.url.indexOf('/api/blog/posts') === 0 && req.url.indexOf('/api/blog/admin') !== 0) {
         (async function () {
             try {
-                if (!dbEnabled) {
-                    return sendJSON(res, 200, { posts: blogPostsListaDiRiserva || [] });
-                }
+                if (!dbEnabled) return sendJSON(res, 200, { posts: [] });
                 const result = await pool.query(
                     'SELECT slug, title, excerpt, cover_image, category, author, tags, read_time_minutes, card_size, published_at FROM blog_posts ' +
                     'WHERE published = true ORDER BY sort_order ASC, published_at DESC'
                 );
-                blogPostsListaDiRiserva = result.rows;
                 return sendJSON(res, 200, { posts: result.rows });
             } catch (err) {
-                console.error('Errore /api/blog/posts, uso la cache di riserva:', err.message);
-                if (blogPostsListaDiRiserva) {
-                    return sendJSON(res, 200, { posts: blogPostsListaDiRiserva });
-                }
+                console.error('Errore /api/blog/posts:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         })();
@@ -6329,33 +6070,18 @@ function parseAdminDateRange(searchParams) {
     // Singolo articolo pubblicato, per slug (per blog-post.html).
     if (req.method === 'GET' && req.url.indexOf('/api/blog/post/') === 0) {
         (async function () {
-            let slug = null;
             try {
-                slug = decodeURIComponent(req.url.split('/api/blog/post/')[1].split('?')[0]);
-            } catch (errSlug) {
-                return sendJSON(res, 404, { error: 'Articolo non trovato.' });
-            }
-            try {
-                if (!slug) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
-                if (!dbEnabled) {
-                    if (blogPostSingoloDiRiserva.has(slug)) {
-                        return sendJSON(res, 200, { post: blogPostSingoloDiRiserva.get(slug) });
-                    }
-                    return sendJSON(res, 404, { error: 'Articolo non trovato.' });
-                }
+                const slug = decodeURIComponent(req.url.split('/api/blog/post/')[1].split('?')[0]);
+                if (!dbEnabled || !slug) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
                 const result = await pool.query(
                     'SELECT slug, title, content, cover_image, category, author, tags, read_time_minutes, card_size, published_at FROM blog_posts ' +
                     'WHERE slug = $1 AND published = true',
                     [slug]
                 );
                 if (result.rows.length === 0) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
-                blogPostSingoloDiRiserva.set(slug, result.rows[0]);
                 return sendJSON(res, 200, { post: result.rows[0] });
             } catch (err) {
-                console.error('Errore /api/blog/post/:slug, uso la cache di riserva:', err.message);
-                if (blogPostSingoloDiRiserva.has(slug)) {
-                    return sendJSON(res, 200, { post: blogPostSingoloDiRiserva.get(slug) });
-                }
+                console.error('Errore /api/blog/post/:slug:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         })();
