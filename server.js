@@ -291,6 +291,16 @@ const memory2faAttempts = new Map(); // userId -> { count, windowStart }
 // sul piano gratuito, si traduce in ore di calcolo consumate inutilmente).
 const pendingDurations = new Map(); // page_view id -> durationMs
 
+// Cache di riserva in memoria per il blog: se il database non risponde (es.
+// quota di calcolo di Neon esaurita), le pagine del blog mostrano comunque
+// l'ultima versione letta con successo invece di un errore — un lettore non
+// se ne accorge nemmeno. Si aggiornano da sole ogni volta che una richiesta
+// va a buon fine, nessun'altra azione richiesta. Sono cache di SOLA lettura:
+// non sostituiscono il database per scrivere nuovi articoli dal pannello
+// admin, che restano possibili solo quando il database torna raggiungibile.
+let blogPostsListaDiRiserva = null;
+const blogPostSingoloDiRiserva = new Map(); // slug -> oggetto post
+
 // Segnalazioni stradali (tabella map_reports / endpoint /api/maps/reports):
 // se il database non è configurato, ripiego in memoria.
 const memoryReports = [];
@@ -772,6 +782,30 @@ function pulisciDisplayName(testo) {
         .replace(/,\s*libero consorzio (comunale )?di [^,]+/gi, '');
 }
 
+// Nominatim (OpenStreetMap) impone un massimo di 1 richiesta al secondo per
+// server — sforarlo può far bloccare/limitare il nostro IP, che risponde con
+// una pagina di errore in XML invece dei risultati in JSON. È esattamente
+// il sintomo che ha portato a scoprire questo problema: ricerche che non
+// trovano più nulla, perché il codice mandava fino a 3-4 richieste a
+// Nominatim IN PARALLELO per ogni singola ricerca di un utente.
+// Tutte le chiamate a Nominatim in questo file passano da qui, che le mette
+// in coda così ne parte sempre una alla volta con almeno 1,1 secondi di
+// distanza, qualunque sia il numero di ricerche in corso nello stesso
+// momento da utenti diversi.
+let nominatimCodaUltimaChiamata = Promise.resolve();
+function fetchNominatim(url, options) {
+    const chiamata = nominatimCodaUltimaChiamata.then(function () {
+        return fetch(url, options);
+    });
+    // La prossima chiamata in coda aspetta comunque 1,1s da adesso, sia che
+    // questa vada a buon fine sia che fallisca — altrimenti un errore
+    // veloce farebbe partire subito la successiva, di nuovo troppo vicina.
+    nominatimCodaUltimaChiamata = chiamata.catch(function () {}).then(function () {
+        return new Promise(function (resolve) { setTimeout(resolve, 1100); });
+    });
+    return chiamata;
+}
+
 async function permessoUsoMapbox(servizio, sogliaMassima) {
     if (!MAPBOX_ACCESS_TOKEN || !dbEnabled) return false;
     const oggi = new Date();
@@ -916,6 +950,7 @@ async function callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens) {
         throw err; // errore non transitorio (es. chiave mancante/non valida): non ha senso ritentare
     }
 }
+
 
 // ---- Notifiche per il pannello admin (campanella) ----
 // Quattro tipi: fallback IA, fallback ricerca, nuovo iscritto, traguardo.
@@ -2174,7 +2209,7 @@ const server = http.createServer((req, res) => {
                 const interrogaNominatim = async function (urlExtra, testoCercato) {
                     const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=30&extratags=1&countrycodes=it' +
                         urlExtra + '&q=' + encodeURIComponent(testoCercato);
-                    const risposta = await fetch(url, {
+                    const risposta = await fetchNominatim(url, {
                         headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                         signal: AbortSignal.timeout(10000)
                     });
@@ -2239,7 +2274,7 @@ const server = http.createServer((req, res) => {
                     try {
                         const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
                             '&amenity=' + encodeURIComponent(nome);
-                        const risposta = await fetch(url, {
+                        const risposta = await fetchNominatim(url, {
                             headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                             signal: AbortSignal.timeout(10000)
                         });
@@ -2603,7 +2638,7 @@ const server = http.createServer((req, res) => {
                 }
 
                 const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&q=' + encodeURIComponent(q);
-                const rispostaNominatim = await fetch(urlNominatim, {
+                const rispostaNominatim = await fetchNominatim(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(8000)
                 });
@@ -2670,7 +2705,7 @@ const server = http.createServer((req, res) => {
                 }
 
                 const urlNominatim = 'https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lon + '&zoom=18&addressdetails=1&extratags=1';
-                const rispostaNominatim = await fetch(urlNominatim, {
+                const rispostaNominatim = await fetchNominatim(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(10000)
                 });
@@ -5839,7 +5874,9 @@ function parseAdminDateRange(searchParams) {
                 }
 
                 try {
+                    const overviewTimingStart = Date.now();
                     aiResult = await getAiAnswer(anthropicMessages);
+                    console.log('[overview timing] provider=' + aiResult.provider + ' ms=' + (Date.now() - overviewTimingStart));
                 } catch (aiErr) {
                     console.error('Errore IA (overview):', aiErr.message);
                     return sendJSON(res, 502, { error: 'Errore nel contattare il servizio IA. Riprova più tardi.' });
@@ -6053,14 +6090,20 @@ function parseAdminDateRange(searchParams) {
     if (req.method === 'GET' && req.url.indexOf('/api/blog/posts') === 0 && req.url.indexOf('/api/blog/admin') !== 0) {
         (async function () {
             try {
-                if (!dbEnabled) return sendJSON(res, 200, { posts: [] });
+                if (!dbEnabled) {
+                    return sendJSON(res, 200, { posts: blogPostsListaDiRiserva || [] });
+                }
                 const result = await pool.query(
                     'SELECT slug, title, excerpt, cover_image, category, author, tags, read_time_minutes, card_size, published_at FROM blog_posts ' +
                     'WHERE published = true ORDER BY sort_order ASC, published_at DESC'
                 );
+                blogPostsListaDiRiserva = result.rows;
                 return sendJSON(res, 200, { posts: result.rows });
             } catch (err) {
-                console.error('Errore /api/blog/posts:', err);
+                console.error('Errore /api/blog/posts, uso la cache di riserva:', err.message);
+                if (blogPostsListaDiRiserva) {
+                    return sendJSON(res, 200, { posts: blogPostsListaDiRiserva });
+                }
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         })();
@@ -6070,18 +6113,33 @@ function parseAdminDateRange(searchParams) {
     // Singolo articolo pubblicato, per slug (per blog-post.html).
     if (req.method === 'GET' && req.url.indexOf('/api/blog/post/') === 0) {
         (async function () {
+            let slug = null;
             try {
-                const slug = decodeURIComponent(req.url.split('/api/blog/post/')[1].split('?')[0]);
-                if (!dbEnabled || !slug) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
+                slug = decodeURIComponent(req.url.split('/api/blog/post/')[1].split('?')[0]);
+            } catch (errSlug) {
+                return sendJSON(res, 404, { error: 'Articolo non trovato.' });
+            }
+            try {
+                if (!slug) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
+                if (!dbEnabled) {
+                    if (blogPostSingoloDiRiserva.has(slug)) {
+                        return sendJSON(res, 200, { post: blogPostSingoloDiRiserva.get(slug) });
+                    }
+                    return sendJSON(res, 404, { error: 'Articolo non trovato.' });
+                }
                 const result = await pool.query(
                     'SELECT slug, title, content, cover_image, category, author, tags, read_time_minutes, card_size, published_at FROM blog_posts ' +
                     'WHERE slug = $1 AND published = true',
                     [slug]
                 );
                 if (result.rows.length === 0) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
+                blogPostSingoloDiRiserva.set(slug, result.rows[0]);
                 return sendJSON(res, 200, { post: result.rows[0] });
             } catch (err) {
-                console.error('Errore /api/blog/post/:slug:', err);
+                console.error('Errore /api/blog/post/:slug, uso la cache di riserva:', err.message);
+                if (blogPostSingoloDiRiserva.has(slug)) {
+                    return sendJSON(res, 200, { post: blogPostSingoloDiRiserva.get(slug) });
+                }
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         })();
