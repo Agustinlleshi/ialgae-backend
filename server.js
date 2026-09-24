@@ -194,6 +194,9 @@ const GOOGLE_CLIENT_ID = '897588931636-i6f4hn49mbicag9r46u5pmdf4su0dag9.apps.goo
 // SESSION_SECRET va impostata come variabile d'ambiente su Render (stesso posto di
 // ANTHROPIC_API_KEY): una stringa lunga e casuale, inventata da te, che non condividi con nessuno.
 const SESSION_SECRET = process.env.SESSION_SECRET || 'cambia-questa-stringa-su-render';
+// Sessione separata per il prodotto "snaglist" — chiave propria, non quella
+// del sito principale, proprio perché dovrà diventare un prodotto a sé.
+const SNAGLIST_SESSION_SECRET = process.env.SNAGLIST_SESSION_SECRET || 'cambia-anche-questa-su-render';
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 // ---- LOGIN CON MICROSOFT ----
@@ -720,6 +723,52 @@ async function initDb() {
     );
     await pool.query('CREATE INDEX IF NOT EXISTS idx_map_reports_expires ON map_reports (expires_at)');
 
+    // ------------------------------------------------------------
+    // TABELLE DEL PRODOTTO "SNAGLIST" (lista difetti di cantiere).
+    // Tenute VOLUTAMENTE separate da tutto il resto (prefisso snaglist_,
+    // utenti propri invece di riusare la tabella "users" di iAlgae) perché
+    // è un demo che poi dovrà diventare un prodotto a sé, venduto
+    // separatamente — meno è legato al resto del sito, più sarà facile
+    // staccarlo in futuro senza toccare nient'altro.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS snaglist_users (' +
+        '  id TEXT PRIMARY KEY,' +
+        '  email TEXT UNIQUE NOT NULL,' +
+        '  name TEXT,' +
+        '  password_hash TEXT NOT NULL,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
+        ')'
+    );
+
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS snaglist_reports (' +
+        '  id SERIAL PRIMARY KEY,' +
+        '  user_id TEXT NOT NULL REFERENCES snaglist_users(id) ON DELETE CASCADE,' +
+        '  cantiere TEXT NOT NULL,' +
+        '  commessa TEXT,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
+        ')'
+    );
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_snaglist_reports_user ON snaglist_reports (user_id, created_at DESC)');
+
+    // Le foto sono salvate come testo base64 direttamente nella riga: per un
+    // demo evita di dover configurare uno spazio di archiviazione file a
+    // parte. Il client le comprime prima di mandarle (vedi snaglist.html),
+    // così restano di dimensioni ragionevoli.
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS snaglist_entries (' +
+        '  id SERIAL PRIMARY KEY,' +
+        '  report_id INTEGER NOT NULL REFERENCES snaglist_reports(id) ON DELETE CASCADE,' +
+        '  piano TEXT,' +
+        '  scala TEXT,' +
+        '  ambiente TEXT,' +
+        '  descrizione TEXT,' +
+        '  foto_base64 TEXT,' +
+        '  ordine INTEGER NOT NULL DEFAULT 0' +
+        ')'
+    );
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_snaglist_entries_report ON snaglist_entries (report_id, ordine)');
+
     console.log('Database pronto (tabella users verificata/creata).');
 }
 
@@ -942,12 +991,22 @@ async function callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens) {
     } catch (err) {
         const match = /^Gemini (\d+):/.exec(err.message || '');
         const status = match ? parseInt(match[1], 10) : null;
-        if (status && TRANSIENT_GEMINI_STATUS.indexOf(status) !== -1) {
+
+        // Un 429 può voler dire due cose molto diverse: "sono sovraccarico
+        // proprio ora" (transitorio, ritentare tra mezzo secondo ha senso) o
+        // "hai superato la quota del piano" (NON si risolve in mezzo secondo:
+        // il conteggio si azzera solo dopo la finestra intera, tipicamente
+        // un minuto). Ritentare in quel secondo caso significa solo sprecare
+        // un'altra chiamata (e mezzo secondo) per fallire di nuovo quasi
+        // sempre — meglio arrendersi subito e passare a Claude.
+        const isQuotaError = status === 429 && /quota/i.test(err.message || '');
+
+        if (status && TRANSIENT_GEMINI_STATUS.indexOf(status) !== -1 && !isQuotaError) {
             console.error('Gemini ' + status + ' (probabile intoppo momentaneo), ritento tra mezzo secondo:', err.message);
             await new Promise(function (resolve) { setTimeout(resolve, 500); });
             return await callGemini(anthropicMessages, systemPrompt, maxTokens);
         }
-        throw err; // errore non transitorio (es. chiave mancante/non valida): non ha senso ritentare
+        throw err; // errore non transitorio (chiave mancante/non valida, o quota superata): non ha senso ritentare
     }
 }
 
@@ -6768,6 +6827,216 @@ function parseAdminDateRange(searchParams) {
         return;
     }
 
+
+    // ==================================================================
+    // ENDPOINT DEL PRODOTTO "SNAGLIST" (lista difetti di cantiere)
+    // Tutti sotto /api/snaglist/ — namespace separato apposta, così in
+    // futuro (quando diventerà un prodotto a sé) basta copiare queste righe
+    // e le tre tabelle snaglist_* in un backend nuovo, senza toccare altro.
+    // ==================================================================
+
+    function snaglistUserIdFromEmail(email) {
+        return 'sl:' + email.toLowerCase().trim();
+    }
+
+    async function getSnaglistUserFromRequest(req) {
+        const authHeader = req.headers['authorization'] || '';
+        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        if (!token) return null;
+        try {
+            const payload = jwt.verify(token, SNAGLIST_SESSION_SECRET);
+            const result = await pool.query('SELECT id, email, name FROM snaglist_users WHERE id = $1', [payload.sub]);
+            return result.rows[0] || null;
+        } catch (err) {
+            return null;
+        }
+    }
+
+    // ---- Registrazione ----
+    if (req.method === 'POST' && req.url === '/api/snaglist/register') {
+        (async function () {
+            try {
+                if (!dbEnabled) return sendJSON(res, 503, { error: 'Servizio non disponibile al momento.' });
+                let body = '';
+                req.on('data', function (chunk) { body += chunk; });
+                req.on('end', async function () {
+                    try {
+                        const payload = JSON.parse(body || '{}');
+                        const email = (payload.email || '').trim().toLowerCase();
+                        const password = payload.password || '';
+                        const name = (payload.name || '').trim();
+
+                        if (!email || !email.includes('@')) return sendJSON(res, 400, { error: 'Email non valida.' });
+                        if (password.length < 8) return sendJSON(res, 400, { error: 'La password deve avere almeno 8 caratteri.' });
+
+                        const id = snaglistUserIdFromEmail(email);
+                        const existing = await pool.query('SELECT id FROM snaglist_users WHERE email = $1', [email]);
+                        if (existing.rows.length > 0) return sendJSON(res, 409, { error: 'Esiste già un account con questa email.' });
+
+                        await pool.query(
+                            'INSERT INTO snaglist_users (id, email, name, password_hash) VALUES ($1, $2, $3, $4)',
+                            [id, email, name, hashPassword(password)]
+                        );
+
+                        const sessionToken = jwt.sign({ sub: id }, SNAGLIST_SESSION_SECRET, { expiresIn: '90d' });
+                        return sendJSON(res, 200, { sessionToken: sessionToken, user: { email: email, name: name } });
+                    } catch (err) {
+                        console.error('Errore registrazione snaglist:', err);
+                        return sendJSON(res, 500, { error: 'Errore interno del server.' });
+                    }
+                });
+            } catch (err) {
+                console.error('Errore registrazione snaglist:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // ---- Login ----
+    if (req.method === 'POST' && req.url === '/api/snaglist/login') {
+        (async function () {
+            try {
+                if (!dbEnabled) return sendJSON(res, 503, { error: 'Servizio non disponibile al momento.' });
+                let body = '';
+                req.on('data', function (chunk) { body += chunk; });
+                req.on('end', async function () {
+                    try {
+                        const payload = JSON.parse(body || '{}');
+                        const email = (payload.email || '').trim().toLowerCase();
+                        const password = payload.password || '';
+
+                        const result = await pool.query('SELECT id, email, name, password_hash FROM snaglist_users WHERE email = $1', [email]);
+                        const user = result.rows[0];
+                        if (!user || !verifyPassword(password, user.password_hash)) {
+                            return sendJSON(res, 401, { error: 'Email o password non corretti.' });
+                        }
+
+                        const sessionToken = jwt.sign({ sub: user.id }, SNAGLIST_SESSION_SECRET, { expiresIn: '90d' });
+                        return sendJSON(res, 200, { sessionToken: sessionToken, user: { email: user.email, name: user.name } });
+                    } catch (err) {
+                        console.error('Errore login snaglist:', err);
+                        return sendJSON(res, 500, { error: 'Errore interno del server.' });
+                    }
+                });
+            } catch (err) {
+                console.error('Errore login snaglist:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // ---- Creare un nuovo rapporto (con le sue voci) ----
+    if (req.method === 'POST' && req.url === '/api/snaglist/reports') {
+        (async function () {
+            try {
+                const user = await getSnaglistUserFromRequest(req);
+                if (!user) return sendJSON(res, 401, { error: 'Devi accedere prima.' });
+
+                let body = '';
+                req.on('data', function (chunk) { body += chunk; });
+                req.on('end', async function () {
+                    const client = await pool.connect();
+                    try {
+                        const payload = JSON.parse(body || '{}');
+                        const cantiere = (payload.cantiere || '').trim();
+                        const commessa = (payload.commessa || '').trim();
+                        const entries = Array.isArray(payload.entries) ? payload.entries : [];
+
+                        if (!cantiere) return sendJSON(res, 400, { error: 'Il campo Cantiere è obbligatorio.' });
+                        if (entries.length === 0) return sendJSON(res, 400, { error: 'Aggiungi almeno una voce prima di salvare.' });
+
+                        await client.query('BEGIN');
+                        const reportResult = await client.query(
+                            'INSERT INTO snaglist_reports (user_id, cantiere, commessa) VALUES ($1, $2, $3) RETURNING id, created_at',
+                            [user.id, cantiere, commessa]
+                        );
+                        const reportId = reportResult.rows[0].id;
+
+                        for (let i = 0; i < entries.length; i++) {
+                            const e = entries[i];
+                            await client.query(
+                                'INSERT INTO snaglist_entries (report_id, piano, scala, ambiente, descrizione, foto_base64, ordine) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+                                [reportId, e.piano || '', e.scala || '', e.ambiente || '', e.descrizione || '', e.foto || null, i]
+                            );
+                        }
+                        await client.query('COMMIT');
+
+                        return sendJSON(res, 200, { id: reportId, createdAt: reportResult.rows[0].created_at });
+                    } catch (err) {
+                        await client.query('ROLLBACK');
+                        console.error('Errore creazione rapporto snaglist:', err);
+                        return sendJSON(res, 500, { error: 'Errore nel salvare il rapporto.' });
+                    } finally {
+                        client.release();
+                    }
+                });
+            } catch (err) {
+                console.error('Errore creazione rapporto snaglist:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // ---- Elenco dei rapporti passati (storico) ----
+    if (req.method === 'GET' && req.url === '/api/snaglist/reports') {
+        (async function () {
+            try {
+                const user = await getSnaglistUserFromRequest(req);
+                if (!user) return sendJSON(res, 401, { error: 'Devi accedere prima.' });
+
+                const result = await pool.query(
+                    'SELECT r.id, r.cantiere, r.commessa, r.created_at, COUNT(e.id)::int AS voci ' +
+                    'FROM snaglist_reports r LEFT JOIN snaglist_entries e ON e.report_id = r.id ' +
+                    'WHERE r.user_id = $1 GROUP BY r.id ORDER BY r.created_at DESC LIMIT 100',
+                    [user.id]
+                );
+                return sendJSON(res, 200, { reports: result.rows });
+            } catch (err) {
+                console.error('Errore elenco rapporti snaglist:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // ---- Dettaglio di un rapporto (per riaprirlo/ricondividerlo) ----
+    if (req.method === 'GET' && req.url.indexOf('/api/snaglist/reports/') === 0) {
+        (async function () {
+            try {
+                const user = await getSnaglistUserFromRequest(req);
+                if (!user) return sendJSON(res, 401, { error: 'Devi accedere prima.' });
+
+                const reportId = parseInt(req.url.split('/api/snaglist/reports/')[1], 10);
+                if (!reportId) return sendJSON(res, 404, { error: 'Rapporto non trovato.' });
+
+                const reportResult = await pool.query(
+                    'SELECT id, cantiere, commessa, created_at FROM snaglist_reports WHERE id = $1 AND user_id = $2',
+                    [reportId, user.id]
+                );
+                if (reportResult.rows.length === 0) return sendJSON(res, 404, { error: 'Rapporto non trovato.' });
+
+                const entriesResult = await pool.query(
+                    'SELECT piano, scala, ambiente, descrizione, foto_base64 AS foto FROM snaglist_entries WHERE report_id = $1 ORDER BY ordine',
+                    [reportId]
+                );
+
+                return sendJSON(res, 200, {
+                    report: reportResult.rows[0],
+                    entries: entriesResult.rows
+                });
+            } catch (err) {
+                console.error('Errore dettaglio rapporto snaglist:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // (L'attivazione della demo "Lista Difetti di Cantiere" vive ora nel suo
+    // server dedicato, separato da questo — vedi la cartella snaglist-server.)
 
     sendJSON(res, 404, { error: 'Percorso non trovato.' });
 });
