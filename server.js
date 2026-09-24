@@ -194,9 +194,6 @@ const GOOGLE_CLIENT_ID = '897588931636-i6f4hn49mbicag9r46u5pmdf4su0dag9.apps.goo
 // SESSION_SECRET va impostata come variabile d'ambiente su Render (stesso posto di
 // ANTHROPIC_API_KEY): una stringa lunga e casuale, inventata da te, che non condividi con nessuno.
 const SESSION_SECRET = process.env.SESSION_SECRET || 'cambia-questa-stringa-su-render';
-// Sessione separata per il prodotto "snaglist" — chiave propria, non quella
-// del sito principale, proprio perché dovrà diventare un prodotto a sé.
-const SNAGLIST_SESSION_SECRET = process.env.SNAGLIST_SESSION_SECRET || 'cambia-anche-questa-su-render';
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 // ---- LOGIN CON MICROSOFT ----
@@ -293,16 +290,6 @@ const memory2faAttempts = new Map(); // userId -> { count, windowStart }
 // giorno non tengono sveglio il database in continuazione (che su Neon,
 // sul piano gratuito, si traduce in ore di calcolo consumate inutilmente).
 const pendingDurations = new Map(); // page_view id -> durationMs
-
-// Cache di riserva in memoria per il blog: se il database non risponde (es.
-// quota di calcolo di Neon esaurita), le pagine del blog mostrano comunque
-// l'ultima versione letta con successo invece di un errore — un lettore non
-// se ne accorge nemmeno. Si aggiornano da sole ogni volta che una richiesta
-// va a buon fine, nessun'altra azione richiesta. Sono cache di SOLA lettura:
-// non sostituiscono il database per scrivere nuovi articoli dal pannello
-// admin, che restano possibili solo quando il database torna raggiungibile.
-let blogPostsListaDiRiserva = null;
-const blogPostSingoloDiRiserva = new Map(); // slug -> oggetto post
 
 // Segnalazioni stradali (tabella map_reports / endpoint /api/maps/reports):
 // se il database non è configurato, ripiego in memoria.
@@ -435,14 +422,6 @@ async function initDb() {
     // già esistenti è una stima ragionevole al momento della migrazione:
     // meglio di NULL, che renderebbe impossibile ordinare per inattività.
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ NOT NULL DEFAULT now()');
-    // Paese/città dell'ultimo accesso, dedotti dall'IP con lo stesso servizio
-    // di geolocalizzazione già usato per i visitatori anonimi (vedi
-    // getGeoForIp). Aggiornati da touchLastLogin ad ogni login riuscito —
-    // servono per il riepilogo "da quali paesi accedono i tuoi iscritti" nel
-    // pannello admin.
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_country TEXT');
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_country_code TEXT');
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_city TEXT');
     // Elenco delle app che l'utente ha scelto di nascondere dal proprio menu
     // "I tuoi preferiti" (personalizzazione disponibile solo da loggati).
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS hidden_apps TEXT[] NOT NULL DEFAULT \'{}\'');
@@ -723,52 +702,6 @@ async function initDb() {
     );
     await pool.query('CREATE INDEX IF NOT EXISTS idx_map_reports_expires ON map_reports (expires_at)');
 
-    // ------------------------------------------------------------
-    // TABELLE DEL PRODOTTO "SNAGLIST" (lista difetti di cantiere).
-    // Tenute VOLUTAMENTE separate da tutto il resto (prefisso snaglist_,
-    // utenti propri invece di riusare la tabella "users" di iAlgae) perché
-    // è un demo che poi dovrà diventare un prodotto a sé, venduto
-    // separatamente — meno è legato al resto del sito, più sarà facile
-    // staccarlo in futuro senza toccare nient'altro.
-    await pool.query(
-        'CREATE TABLE IF NOT EXISTS snaglist_users (' +
-        '  id TEXT PRIMARY KEY,' +
-        '  email TEXT UNIQUE NOT NULL,' +
-        '  name TEXT,' +
-        '  password_hash TEXT NOT NULL,' +
-        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
-        ')'
-    );
-
-    await pool.query(
-        'CREATE TABLE IF NOT EXISTS snaglist_reports (' +
-        '  id SERIAL PRIMARY KEY,' +
-        '  user_id TEXT NOT NULL REFERENCES snaglist_users(id) ON DELETE CASCADE,' +
-        '  cantiere TEXT NOT NULL,' +
-        '  commessa TEXT,' +
-        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
-        ')'
-    );
-    await pool.query('CREATE INDEX IF NOT EXISTS idx_snaglist_reports_user ON snaglist_reports (user_id, created_at DESC)');
-
-    // Le foto sono salvate come testo base64 direttamente nella riga: per un
-    // demo evita di dover configurare uno spazio di archiviazione file a
-    // parte. Il client le comprime prima di mandarle (vedi snaglist.html),
-    // così restano di dimensioni ragionevoli.
-    await pool.query(
-        'CREATE TABLE IF NOT EXISTS snaglist_entries (' +
-        '  id SERIAL PRIMARY KEY,' +
-        '  report_id INTEGER NOT NULL REFERENCES snaglist_reports(id) ON DELETE CASCADE,' +
-        '  piano TEXT,' +
-        '  scala TEXT,' +
-        '  ambiente TEXT,' +
-        '  descrizione TEXT,' +
-        '  foto_base64 TEXT,' +
-        '  ordine INTEGER NOT NULL DEFAULT 0' +
-        ')'
-    );
-    await pool.query('CREATE INDEX IF NOT EXISTS idx_snaglist_entries_report ON snaglist_entries (report_id, ordine)');
-
     console.log('Database pronto (tabella users verificata/creata).');
 }
 
@@ -829,30 +762,6 @@ function pulisciDisplayName(testo) {
         .replace(/,\s*città metropolitana di [^,]+/gi, '')
         .replace(/,\s*area metropolitana di [^,]+/gi, '')
         .replace(/,\s*libero consorzio (comunale )?di [^,]+/gi, '');
-}
-
-// Nominatim (OpenStreetMap) impone un massimo di 1 richiesta al secondo per
-// server — sforarlo può far bloccare/limitare il nostro IP, che risponde con
-// una pagina di errore in XML invece dei risultati in JSON. È esattamente
-// il sintomo che ha portato a scoprire questo problema: ricerche che non
-// trovano più nulla, perché il codice mandava fino a 3-4 richieste a
-// Nominatim IN PARALLELO per ogni singola ricerca di un utente.
-// Tutte le chiamate a Nominatim in questo file passano da qui, che le mette
-// in coda così ne parte sempre una alla volta con almeno 1,1 secondi di
-// distanza, qualunque sia il numero di ricerche in corso nello stesso
-// momento da utenti diversi.
-let nominatimCodaUltimaChiamata = Promise.resolve();
-function fetchNominatim(url, options) {
-    const chiamata = nominatimCodaUltimaChiamata.then(function () {
-        return fetch(url, options);
-    });
-    // La prossima chiamata in coda aspetta comunque 1,1s da adesso, sia che
-    // questa vada a buon fine sia che fallisca — altrimenti un errore
-    // veloce farebbe partire subito la successiva, di nuovo troppo vicina.
-    nominatimCodaUltimaChiamata = chiamata.catch(function () {}).then(function () {
-        return new Promise(function (resolve) { setTimeout(resolve, 1100); });
-    });
-    return chiamata;
 }
 
 async function permessoUsoMapbox(servizio, sogliaMassima) {
@@ -991,25 +900,14 @@ async function callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens) {
     } catch (err) {
         const match = /^Gemini (\d+):/.exec(err.message || '');
         const status = match ? parseInt(match[1], 10) : null;
-
-        // Un 429 può voler dire due cose molto diverse: "sono sovraccarico
-        // proprio ora" (transitorio, ritentare tra mezzo secondo ha senso) o
-        // "hai superato la quota del piano" (NON si risolve in mezzo secondo:
-        // il conteggio si azzera solo dopo la finestra intera, tipicamente
-        // un minuto). Ritentare in quel secondo caso significa solo sprecare
-        // un'altra chiamata (e mezzo secondo) per fallire di nuovo quasi
-        // sempre — meglio arrendersi subito e passare a Claude.
-        const isQuotaError = status === 429 && /quota/i.test(err.message || '');
-
-        if (status && TRANSIENT_GEMINI_STATUS.indexOf(status) !== -1 && !isQuotaError) {
+        if (status && TRANSIENT_GEMINI_STATUS.indexOf(status) !== -1) {
             console.error('Gemini ' + status + ' (probabile intoppo momentaneo), ritento tra mezzo secondo:', err.message);
             await new Promise(function (resolve) { setTimeout(resolve, 500); });
             return await callGemini(anthropicMessages, systemPrompt, maxTokens);
         }
-        throw err; // errore non transitorio (chiave mancante/non valida, o quota superata): non ha senso ritentare
+        throw err; // errore non transitorio (es. chiave mancante/non valida): non ha senso ritentare
     }
 }
-
 
 // ---- Notifiche per il pannello admin (campanella) ----
 // Quattro tipi: fallback IA, fallback ricerca, nuovo iscritto, traguardo.
@@ -1487,10 +1385,7 @@ function rowToUser(row) {
         totpPendingSecret: row.totp_pending_secret,
         totpEnabled: row.totp_enabled,
         createdAt: row.created_at,
-        lastLogin: row.last_login,
-        lastCountry: row.last_country,
-        lastCountryCode: row.last_country_code,
-        lastCity: row.last_city
+        lastLogin: row.last_login
     };
 }
 
@@ -1501,35 +1396,19 @@ async function getUserById(id) {
     return rowToUser(result.rows[0]);
 }
 
-// Aggiorna la data (e il paese/città, dedotti dall'IP) dell'ultimo accesso
-// di un utente. Va chiamata SOLO dopo un login riuscito (mai a ogni
-// richiesta autenticata), perché è esattamente questa data che decide, un
-// anno dopo, se l'account viene eliminato in automatico (vedi
-// deleteInactiveAccounts più in basso).
-async function touchLastLogin(userId, ip) {
+// Aggiorna la data di ultimo accesso di un utente. Va chiamata SOLO dopo un
+// login riuscito (mai a ogni richiesta autenticata), perché è esattamente
+// questa data che decide, un anno dopo, se l'account viene eliminato in
+// automatico (vedi deleteInactiveAccounts più in basso).
+async function touchLastLogin(userId) {
     if (!userId) return;
     try {
-        // getGeoForIp è definita più sotto in questo file, ma essendo una
-        // "function" (non una const/arrow) è disponibile ovunque nel modulo
-        // grazie all'hoisting — nessun problema a richiamarla da qui.
-        const geo = ip ? await getGeoForIp(ip) : { country: null, countryCode: null, city: null };
-
         if (!dbEnabled) {
             const memUser = memoryUsers.get(userId);
-            if (memUser) {
-                memUser.lastLogin = new Date();
-                memUser.lastCountry = geo.country;
-                memUser.lastCountryCode = geo.countryCode;
-                memUser.lastCity = geo.city;
-            }
+            if (memUser) memUser.lastLogin = new Date();
             return;
         }
-        await pool.query(
-            'UPDATE users SET last_login = now(), last_country = COALESCE($2, last_country), ' +
-            'last_country_code = COALESCE($3, last_country_code), last_city = COALESCE($4, last_city) ' +
-            'WHERE id = $1',
-            [userId, geo.country, geo.countryCode, geo.city]
-        );
+        await pool.query('UPDATE users SET last_login = now() WHERE id = $1', [userId]);
     } catch (err) {
         console.error('Errore aggiornamento last_login per', userId, ':', err);
     }
@@ -2268,7 +2147,7 @@ const server = http.createServer((req, res) => {
                 const interrogaNominatim = async function (urlExtra, testoCercato) {
                     const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=30&extratags=1&countrycodes=it' +
                         urlExtra + '&q=' + encodeURIComponent(testoCercato);
-                    const risposta = await fetchNominatim(url, {
+                    const risposta = await fetch(url, {
                         headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                         signal: AbortSignal.timeout(10000)
                     });
@@ -2333,7 +2212,7 @@ const server = http.createServer((req, res) => {
                     try {
                         const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&extratags=1&countrycodes=it' +
                             '&amenity=' + encodeURIComponent(nome);
-                        const risposta = await fetchNominatim(url, {
+                        const risposta = await fetch(url, {
                             headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                             signal: AbortSignal.timeout(10000)
                         });
@@ -2697,7 +2576,7 @@ const server = http.createServer((req, res) => {
                 }
 
                 const urlNominatim = 'https://nominatim.openstreetmap.org/search?format=json&limit=10&q=' + encodeURIComponent(q);
-                const rispostaNominatim = await fetchNominatim(urlNominatim, {
+                const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(8000)
                 });
@@ -2764,7 +2643,7 @@ const server = http.createServer((req, res) => {
                 }
 
                 const urlNominatim = 'https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lon + '&zoom=18&addressdetails=1&extratags=1';
-                const rispostaNominatim = await fetchNominatim(urlNominatim, {
+                const rispostaNominatim = await fetch(urlNominatim, {
                     headers: { 'User-Agent': 'iAlgae/1.0 (https://www.ialgae.com)' },
                     signal: AbortSignal.timeout(10000)
                 });
@@ -3261,8 +3140,7 @@ const server = http.createServer((req, res) => {
                     });
                 }
 
-                const googleLoginIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-                await touchLastLogin(user.sub, googleLoginIp);
+                await touchLastLogin(user.sub);
 
                 const sessionToken = jwt.sign(
                     { sub: user.sub },
@@ -3352,8 +3230,7 @@ const server = http.createServer((req, res) => {
                     });
                 }
 
-                const microsoftLoginIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-                await touchLastLogin(user.sub, microsoftLoginIp);
+                await touchLastLogin(user.sub);
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
@@ -4084,17 +3961,6 @@ function parseAdminDateRange(searchParams) {
                     'FROM users WHERE email_verified = true ORDER BY created_at DESC LIMIT 20'
                 );
 
-                // Da quali paesi accedono gli iscritti (confermati), dedotto
-                // dall'IP dell'ultimo login (vedi touchLastLogin). Chi non ha
-                // ancora mai fatto un secondo accesso da quando abbiamo
-                // iniziato a registrarlo (o il cui IP non è geolocalizzabile)
-                // resta fuori da questo conteggio, non finisce in "sconosciuto".
-                const topUserCountriesResult = await pool.query(
-                    'SELECT last_country AS country, last_country_code AS "countryCode", COUNT(*)::int AS count ' +
-                    'FROM users WHERE email_verified = true AND last_country IS NOT NULL ' +
-                    'GROUP BY last_country, last_country_code ORDER BY count DESC LIMIT 50'
-                );
-
                 const total = totalsResult.rows[0].total;
                 const verifiedCount = totalsResult.rows[0].verified_count;
                 const pendingCount = total - verifiedCount;
@@ -4110,7 +3976,6 @@ function parseAdminDateRange(searchParams) {
                     proCount: totalsResult.rows[0].pro_count,
                     verifiedPercent: verifiedPercent,
                     dailySignups: dailyResult.rows,
-                    topCountries: topUserCountriesResult.rows,
                     recentUsers: recentResult.rows.map(function (r) {
                         return {
                             name: [r.name, r.surname].filter(Boolean).join(' ') || '(senza nome)',
@@ -4725,8 +4590,6 @@ function parseAdminDateRange(searchParams) {
                         createdAt: user.createdAt,
                         emailVerified: !!user.emailVerified,
                         lastLogin: user.lastLogin,
-                        lastCountry: user.lastCountry || null,
-                        lastCity: user.lastCity || null,
                         suspended: !!user.suspended,
                         suspendedReason: user.suspendedReason || null
                     }
@@ -5009,8 +4872,7 @@ function parseAdminDateRange(searchParams) {
 
                 // Una volta confermata l'email, colleghiamo subito l'utente:
                 // non deve rifare il login da capo.
-                const verifyEmailIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-                await touchLastLogin(user.sub, verifyEmailIp);
+                await touchLastLogin(user.sub);
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
                     message: 'Email confermata con successo!',
@@ -5142,7 +5004,7 @@ function parseAdminDateRange(searchParams) {
                     });
                 }
 
-                await touchLastLogin(user.sub, loginIp);
+                await touchLastLogin(user.sub);
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
@@ -5207,8 +5069,7 @@ function parseAdminDateRange(searchParams) {
                     return sendJSON(res, 401, { error: 'Codice non valido o scaduto.' });
                 }
 
-                const twoFaLoginIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-                await touchLastLogin(user.sub, twoFaLoginIp);
+                await touchLastLogin(user.sub);
 
                 const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
                 return sendJSON(res, 200, {
@@ -5933,9 +5794,7 @@ function parseAdminDateRange(searchParams) {
                 }
 
                 try {
-                    const overviewTimingStart = Date.now();
                     aiResult = await getAiAnswer(anthropicMessages);
-                    console.log('[overview timing] provider=' + aiResult.provider + ' ms=' + (Date.now() - overviewTimingStart));
                 } catch (aiErr) {
                     console.error('Errore IA (overview):', aiErr.message);
                     return sendJSON(res, 502, { error: 'Errore nel contattare il servizio IA. Riprova più tardi.' });
@@ -6149,20 +6008,14 @@ function parseAdminDateRange(searchParams) {
     if (req.method === 'GET' && req.url.indexOf('/api/blog/posts') === 0 && req.url.indexOf('/api/blog/admin') !== 0) {
         (async function () {
             try {
-                if (!dbEnabled) {
-                    return sendJSON(res, 200, { posts: blogPostsListaDiRiserva || [] });
-                }
+                if (!dbEnabled) return sendJSON(res, 200, { posts: [] });
                 const result = await pool.query(
                     'SELECT slug, title, excerpt, cover_image, category, author, tags, read_time_minutes, card_size, published_at FROM blog_posts ' +
                     'WHERE published = true ORDER BY sort_order ASC, published_at DESC'
                 );
-                blogPostsListaDiRiserva = result.rows;
                 return sendJSON(res, 200, { posts: result.rows });
             } catch (err) {
-                console.error('Errore /api/blog/posts, uso la cache di riserva:', err.message);
-                if (blogPostsListaDiRiserva) {
-                    return sendJSON(res, 200, { posts: blogPostsListaDiRiserva });
-                }
+                console.error('Errore /api/blog/posts:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         })();
@@ -6172,33 +6025,18 @@ function parseAdminDateRange(searchParams) {
     // Singolo articolo pubblicato, per slug (per blog-post.html).
     if (req.method === 'GET' && req.url.indexOf('/api/blog/post/') === 0) {
         (async function () {
-            let slug = null;
             try {
-                slug = decodeURIComponent(req.url.split('/api/blog/post/')[1].split('?')[0]);
-            } catch (errSlug) {
-                return sendJSON(res, 404, { error: 'Articolo non trovato.' });
-            }
-            try {
-                if (!slug) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
-                if (!dbEnabled) {
-                    if (blogPostSingoloDiRiserva.has(slug)) {
-                        return sendJSON(res, 200, { post: blogPostSingoloDiRiserva.get(slug) });
-                    }
-                    return sendJSON(res, 404, { error: 'Articolo non trovato.' });
-                }
+                const slug = decodeURIComponent(req.url.split('/api/blog/post/')[1].split('?')[0]);
+                if (!dbEnabled || !slug) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
                 const result = await pool.query(
                     'SELECT slug, title, content, cover_image, category, author, tags, read_time_minutes, card_size, published_at FROM blog_posts ' +
                     'WHERE slug = $1 AND published = true',
                     [slug]
                 );
                 if (result.rows.length === 0) return sendJSON(res, 404, { error: 'Articolo non trovato.' });
-                blogPostSingoloDiRiserva.set(slug, result.rows[0]);
                 return sendJSON(res, 200, { post: result.rows[0] });
             } catch (err) {
-                console.error('Errore /api/blog/post/:slug, uso la cache di riserva:', err.message);
-                if (blogPostSingoloDiRiserva.has(slug)) {
-                    return sendJSON(res, 200, { post: blogPostSingoloDiRiserva.get(slug) });
-                }
+                console.error('Errore /api/blog/post/:slug:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         })();
@@ -6828,216 +6666,6 @@ function parseAdminDateRange(searchParams) {
     }
 
 
-    // ==================================================================
-    // ENDPOINT DEL PRODOTTO "SNAGLIST" (lista difetti di cantiere)
-    // Tutti sotto /api/snaglist/ — namespace separato apposta, così in
-    // futuro (quando diventerà un prodotto a sé) basta copiare queste righe
-    // e le tre tabelle snaglist_* in un backend nuovo, senza toccare altro.
-    // ==================================================================
-
-    function snaglistUserIdFromEmail(email) {
-        return 'sl:' + email.toLowerCase().trim();
-    }
-
-    async function getSnaglistUserFromRequest(req) {
-        const authHeader = req.headers['authorization'] || '';
-        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-        if (!token) return null;
-        try {
-            const payload = jwt.verify(token, SNAGLIST_SESSION_SECRET);
-            const result = await pool.query('SELECT id, email, name FROM snaglist_users WHERE id = $1', [payload.sub]);
-            return result.rows[0] || null;
-        } catch (err) {
-            return null;
-        }
-    }
-
-    // ---- Registrazione ----
-    if (req.method === 'POST' && req.url === '/api/snaglist/register') {
-        (async function () {
-            try {
-                if (!dbEnabled) return sendJSON(res, 503, { error: 'Servizio non disponibile al momento.' });
-                let body = '';
-                req.on('data', function (chunk) { body += chunk; });
-                req.on('end', async function () {
-                    try {
-                        const payload = JSON.parse(body || '{}');
-                        const email = (payload.email || '').trim().toLowerCase();
-                        const password = payload.password || '';
-                        const name = (payload.name || '').trim();
-
-                        if (!email || !email.includes('@')) return sendJSON(res, 400, { error: 'Email non valida.' });
-                        if (password.length < 8) return sendJSON(res, 400, { error: 'La password deve avere almeno 8 caratteri.' });
-
-                        const id = snaglistUserIdFromEmail(email);
-                        const existing = await pool.query('SELECT id FROM snaglist_users WHERE email = $1', [email]);
-                        if (existing.rows.length > 0) return sendJSON(res, 409, { error: 'Esiste già un account con questa email.' });
-
-                        await pool.query(
-                            'INSERT INTO snaglist_users (id, email, name, password_hash) VALUES ($1, $2, $3, $4)',
-                            [id, email, name, hashPassword(password)]
-                        );
-
-                        const sessionToken = jwt.sign({ sub: id }, SNAGLIST_SESSION_SECRET, { expiresIn: '90d' });
-                        return sendJSON(res, 200, { sessionToken: sessionToken, user: { email: email, name: name } });
-                    } catch (err) {
-                        console.error('Errore registrazione snaglist:', err);
-                        return sendJSON(res, 500, { error: 'Errore interno del server.' });
-                    }
-                });
-            } catch (err) {
-                console.error('Errore registrazione snaglist:', err);
-                return sendJSON(res, 500, { error: 'Errore interno del server.' });
-            }
-        })();
-        return;
-    }
-
-    // ---- Login ----
-    if (req.method === 'POST' && req.url === '/api/snaglist/login') {
-        (async function () {
-            try {
-                if (!dbEnabled) return sendJSON(res, 503, { error: 'Servizio non disponibile al momento.' });
-                let body = '';
-                req.on('data', function (chunk) { body += chunk; });
-                req.on('end', async function () {
-                    try {
-                        const payload = JSON.parse(body || '{}');
-                        const email = (payload.email || '').trim().toLowerCase();
-                        const password = payload.password || '';
-
-                        const result = await pool.query('SELECT id, email, name, password_hash FROM snaglist_users WHERE email = $1', [email]);
-                        const user = result.rows[0];
-                        if (!user || !verifyPassword(password, user.password_hash)) {
-                            return sendJSON(res, 401, { error: 'Email o password non corretti.' });
-                        }
-
-                        const sessionToken = jwt.sign({ sub: user.id }, SNAGLIST_SESSION_SECRET, { expiresIn: '90d' });
-                        return sendJSON(res, 200, { sessionToken: sessionToken, user: { email: user.email, name: user.name } });
-                    } catch (err) {
-                        console.error('Errore login snaglist:', err);
-                        return sendJSON(res, 500, { error: 'Errore interno del server.' });
-                    }
-                });
-            } catch (err) {
-                console.error('Errore login snaglist:', err);
-                return sendJSON(res, 500, { error: 'Errore interno del server.' });
-            }
-        })();
-        return;
-    }
-
-    // ---- Creare un nuovo rapporto (con le sue voci) ----
-    if (req.method === 'POST' && req.url === '/api/snaglist/reports') {
-        (async function () {
-            try {
-                const user = await getSnaglistUserFromRequest(req);
-                if (!user) return sendJSON(res, 401, { error: 'Devi accedere prima.' });
-
-                let body = '';
-                req.on('data', function (chunk) { body += chunk; });
-                req.on('end', async function () {
-                    const client = await pool.connect();
-                    try {
-                        const payload = JSON.parse(body || '{}');
-                        const cantiere = (payload.cantiere || '').trim();
-                        const commessa = (payload.commessa || '').trim();
-                        const entries = Array.isArray(payload.entries) ? payload.entries : [];
-
-                        if (!cantiere) return sendJSON(res, 400, { error: 'Il campo Cantiere è obbligatorio.' });
-                        if (entries.length === 0) return sendJSON(res, 400, { error: 'Aggiungi almeno una voce prima di salvare.' });
-
-                        await client.query('BEGIN');
-                        const reportResult = await client.query(
-                            'INSERT INTO snaglist_reports (user_id, cantiere, commessa) VALUES ($1, $2, $3) RETURNING id, created_at',
-                            [user.id, cantiere, commessa]
-                        );
-                        const reportId = reportResult.rows[0].id;
-
-                        for (let i = 0; i < entries.length; i++) {
-                            const e = entries[i];
-                            await client.query(
-                                'INSERT INTO snaglist_entries (report_id, piano, scala, ambiente, descrizione, foto_base64, ordine) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-                                [reportId, e.piano || '', e.scala || '', e.ambiente || '', e.descrizione || '', e.foto || null, i]
-                            );
-                        }
-                        await client.query('COMMIT');
-
-                        return sendJSON(res, 200, { id: reportId, createdAt: reportResult.rows[0].created_at });
-                    } catch (err) {
-                        await client.query('ROLLBACK');
-                        console.error('Errore creazione rapporto snaglist:', err);
-                        return sendJSON(res, 500, { error: 'Errore nel salvare il rapporto.' });
-                    } finally {
-                        client.release();
-                    }
-                });
-            } catch (err) {
-                console.error('Errore creazione rapporto snaglist:', err);
-                return sendJSON(res, 500, { error: 'Errore interno del server.' });
-            }
-        })();
-        return;
-    }
-
-    // ---- Elenco dei rapporti passati (storico) ----
-    if (req.method === 'GET' && req.url === '/api/snaglist/reports') {
-        (async function () {
-            try {
-                const user = await getSnaglistUserFromRequest(req);
-                if (!user) return sendJSON(res, 401, { error: 'Devi accedere prima.' });
-
-                const result = await pool.query(
-                    'SELECT r.id, r.cantiere, r.commessa, r.created_at, COUNT(e.id)::int AS voci ' +
-                    'FROM snaglist_reports r LEFT JOIN snaglist_entries e ON e.report_id = r.id ' +
-                    'WHERE r.user_id = $1 GROUP BY r.id ORDER BY r.created_at DESC LIMIT 100',
-                    [user.id]
-                );
-                return sendJSON(res, 200, { reports: result.rows });
-            } catch (err) {
-                console.error('Errore elenco rapporti snaglist:', err);
-                return sendJSON(res, 500, { error: 'Errore interno del server.' });
-            }
-        })();
-        return;
-    }
-
-    // ---- Dettaglio di un rapporto (per riaprirlo/ricondividerlo) ----
-    if (req.method === 'GET' && req.url.indexOf('/api/snaglist/reports/') === 0) {
-        (async function () {
-            try {
-                const user = await getSnaglistUserFromRequest(req);
-                if (!user) return sendJSON(res, 401, { error: 'Devi accedere prima.' });
-
-                const reportId = parseInt(req.url.split('/api/snaglist/reports/')[1], 10);
-                if (!reportId) return sendJSON(res, 404, { error: 'Rapporto non trovato.' });
-
-                const reportResult = await pool.query(
-                    'SELECT id, cantiere, commessa, created_at FROM snaglist_reports WHERE id = $1 AND user_id = $2',
-                    [reportId, user.id]
-                );
-                if (reportResult.rows.length === 0) return sendJSON(res, 404, { error: 'Rapporto non trovato.' });
-
-                const entriesResult = await pool.query(
-                    'SELECT piano, scala, ambiente, descrizione, foto_base64 AS foto FROM snaglist_entries WHERE report_id = $1 ORDER BY ordine',
-                    [reportId]
-                );
-
-                return sendJSON(res, 200, {
-                    report: reportResult.rows[0],
-                    entries: entriesResult.rows
-                });
-            } catch (err) {
-                console.error('Errore dettaglio rapporto snaglist:', err);
-                return sendJSON(res, 500, { error: 'Errore interno del server.' });
-            }
-        })();
-        return;
-    }
-
-    // (L'attivazione della demo "Lista Difetti di Cantiere" vive ora nel suo
-    // server dedicato, separato da questo — vedi la cartella snaglist-server.)
-
     sendJSON(res, 404, { error: 'Percorso non trovato.' });
 });
 
@@ -7058,57 +6686,78 @@ initDb()
         });
     });
 
-// Tutti i controlli/pulizie periodiche che PRIMA giravano ognuno per conto
-// proprio ogni ora (7 setInterval separati) sono stati uniti qui in un unico
-// giro ogni 6 ore. Motivo: ogni risveglio del database consuma ore di
-// calcolo sul piano gratuito di Neon (che si esauriscono al mese) — nessuna
-// di queste pulizie ha davvero bisogno di girare ogni ora, quindi passare a
-// ogni 6 ore taglia questi risvegli di 4 volte senza cambiare nulla per
-// l'utente (le voci scadute vengono comunque ignorate dalle query grazie ai
-// controlli su expires_at/created_at, indipendentemente da quando arriva la
-// pulizia).
-async function runPeriodicMaintenance() {
-    try {
-        await pool.query('DELETE FROM search_cache WHERE expires_at <= now()');
-    } catch (err) {
-        console.error('Errore pulizia search_cache:', err);
-    }
-    try {
-        await pool.query('DELETE FROM map_reports WHERE expires_at <= now()');
-    } catch (err) {
-        console.error('Errore pulizia map_reports:', err);
-    }
-    try {
-        await pool.query("DELETE FROM rate_limits WHERE window_start <= now() - interval '24 hours'");
-    } catch (err) {
-        console.error('Errore pulizia rate_limits:', err);
-    }
-    try {
-        await pool.query("DELETE FROM ai_response_cache WHERE created_at <= now() - interval '24 hours'");
-    } catch (err) {
-        console.error('Errore pulizia ai_response_cache:', err);
-    }
-    try {
-        await pool.query("DELETE FROM admin_notifications WHERE created_at <= now() - interval '90 days'");
-    } catch (err) {
-        console.error('Errore pulizia admin_notifications:', err);
-    }
-    // Traguardi e backup restano funzioni a parte (già definite più sopra),
-    // richiamate qui invece che da un loro proprio setInterval.
-    await checkAllMilestones();
-    await runWeeklyBackupIfDue();
-}
-
+// Pulizia periodica delle voci di cache scadute, così la tabella non cresce
+// all'infinito nel tempo. Non è indispensabile per il funzionamento (le voci
+// scadute vengono comunque ignorate dalle query grazie a "expires_at > now()"),
+// ma tiene il database più leggero. Gira ogni ora.
 if (dbEnabled) {
-    runPeriodicMaintenance();
-    setInterval(runPeriodicMaintenance, 6 * 60 * 60 * 1000);
+    setInterval(function () {
+        pool.query('DELETE FROM search_cache WHERE expires_at <= now()')
+            .catch(function (err) {
+                console.error('Errore pulizia search_cache:', err);
+            });
+    }, 60 * 60 * 1000);
+
+    // Le segnalazioni scadute (oltre i 30 minuti) non servono più a nessuno.
+    setInterval(function () {
+        pool.query('DELETE FROM map_reports WHERE expires_at <= now()')
+            .catch(function (err) {
+                console.error('Errore pulizia map_reports:', err);
+            });
+    }, 60 * 60 * 1000);
+
+
+
+    // reset password) non servono più: le finestre scadute vengono comunque
+    // ignorate dalla logica sopra, ma questa pulizia tiene la tabella snella.
+    // Usiamo un margine di sicurezza di 24 ore invece dell'ora esatta, così
+    // funziona anche se in futuro si aggiungono limiti con finestre più lunghe.
+    setInterval(function () {
+        pool.query("DELETE FROM rate_limits WHERE window_start <= now() - interval '24 hours'")
+            .catch(function (err) {
+                console.error('Errore pulizia rate_limits:', err);
+            });
+    }, 60 * 60 * 1000);
+
+    // Stessa idea, per la cache delle risposte IA: qui la "scadenza" non è
+    // una colonna dedicata (vedi AI_CACHE_TTL_MS più sopra), quindi puliamo
+    // usando lo stesso margine di 24 ore direttamente su created_at.
+    setInterval(function () {
+        pool.query("DELETE FROM ai_response_cache WHERE created_at <= now() - interval '24 hours'")
+            .catch(function (err) {
+                console.error('Errore pulizia ai_response_cache:', err);
+            });
+    }, 60 * 60 * 1000);
+
+    // Controlla i traguardi (visite, iscritti, articoli) sia subito all'avvio
+    // del server, sia ogni ora — così una soglia superata viene notificata
+    // entro un'ora al massimo, senza dover aspettare che qualcuno apra la
+    // dashboard per "farla scattare".
+    checkAllMilestones();
+    setInterval(checkAllMilestones, 60 * 60 * 1000);
+
+    // Backup settimanale: controlliamo ogni ora se è "dovuto" (sono passati
+    // 7 giorni dall'ultimo mandato) — questo, invece di un timer fisso,
+    // gestisce bene anche i riavvii del server nel mezzo della settimana.
+    runWeeklyBackupIfDue();
+    setInterval(runWeeklyBackupIfDue, 60 * 60 * 1000);
 
     // Controlla una volta al giorno se ci sono account inattivi da oltre un
     // anno (nessun accesso — vedi last_login) e li elimina automaticamente.
     // Un controllo giornaliero è più che sufficiente: la finestra di un anno
-    // non richiede la stessa granularità degli altri task qui sopra.
+    // non richiede la stessa granularità oraria degli altri task qui sopra.
     deleteInactiveAccounts();
     setInterval(deleteInactiveAccounts, 24 * 60 * 60 * 1000);
+
+    // Elimina anche le notifiche più vecchie di 90 giorni, per non far
+    // crescere la tabella all'infinito — 90 giorni sono comunque più che
+    // sufficienti per uno storico utile nella campanella.
+    setInterval(function () {
+        pool.query("DELETE FROM admin_notifications WHERE created_at <= now() - interval '90 days'")
+            .catch(function (err) {
+                console.error('Errore pulizia admin_notifications:', err);
+            });
+    }, 60 * 60 * 1000);
 
     // Scrive sul database, tutte insieme, le durate di visita accumulate in
     // memoria (vedi pendingDurations e /api/track/duration più sopra).
