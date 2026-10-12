@@ -98,6 +98,10 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
 const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
+// risultati dei libri tenuti in memoria per 6 ore (meno richieste a Google, più veloce)
+const booksCache = new Map();
+const BOOKS_CACHE_MS = 6 * 60 * 60 * 1000;
+setInterval(function () { const now = Date.now(); for (const [k, v] of booksCache) if (now - v.t > BOOKS_CACHE_MS) booksCache.delete(k); }, 60 * 60 * 1000).unref();
 // Duffel: prezzi voli reali per la pagina Viaggiare/Travel.
 // Registrazione gratuita e immediata su duffel.com (niente approvazione
 // commerciale, a differenza di Amadeus che ha chiuso il self-service a
@@ -6178,32 +6182,76 @@ function parseAdminDateRange(searchParams) {
     }
 
     // Scheda "Libri": facciamo da tramite verso Google Books, così la chiave
-    // API resta solo sul server e non è mai visibile a chi guarda il
-    // codice sorgente della pagina.
+    // API resta solo sul server. Se Google Books non risponde (quota finita,
+    // chiave bloccata o scaduta), proviamo Google Books senza chiave e poi
+    // Open Library (gratis, senza chiave), restituendo i risultati nello stesso
+    // formato: la pagina results.html non si accorge della differenza.
     if (req.method === 'GET' && req.url.indexOf('/api/books') === 0) {
         (async function () {
             try {
                 const fullUrl = new URL(req.url, 'http://localhost');
-                const q = (fullUrl.searchParams.get('q') || '').trim();
+                const q = (fullUrl.searchParams.get('q') || '').trim().slice(0, 200);
+                if (!q) return sendJSON(res, 200, { items: [] });
 
-                if (!q) {
-                    return sendJSON(res, 200, { items: [] });
+                const cacheKey = q.toLowerCase();
+                const cached = booksCache.get(cacheKey);
+                if (cached && Date.now() - cached.t < BOOKS_CACHE_MS) return sendJSON(res, 200, { items: cached.items, source: cached.source });
+
+                const tries = [];
+                if (GOOGLE_BOOKS_API_KEY) tries.push(['google', 'https://www.googleapis.com/books/v1/volumes?q=' + encodeURIComponent(q) + '&maxResults=20&key=' + GOOGLE_BOOKS_API_KEY]);
+                tries.push(['google-nokey', 'https://www.googleapis.com/books/v1/volumes?q=' + encodeURIComponent(q) + '&maxResults=20']);
+
+                for (const [source, url] of tries) {
+                    try {
+                        const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+                        const data = await r.json().catch(function () { return {}; });
+                        if (r.ok && !data.error) {
+                            const items = data.items || [];
+                            booksCache.set(cacheKey, { t: Date.now(), items: items, source: source });
+                            return sendJSON(res, 200, { items: items, source: source });
+                        }
+                        console.error('Google Books (' + source + ') non disponibile:', r.status, data.error ? (data.error.message || JSON.stringify(data.error)) : '');
+                    } catch (e) {
+                        console.error('Google Books (' + source + ') errore di rete:', e.message);
+                    }
                 }
 
-                if (!GOOGLE_BOOKS_API_KEY) {
-                    return sendJSON(res, 500, { error: 'Chiave Google Books non configurata sul server (GOOGLE_BOOKS_API_KEY).' });
+                // Ultima possibilità: Open Library
+                try {
+                    const r = await fetch('https://openlibrary.org/search.json?limit=20&fields=key,title,author_name,first_publish_year,cover_i,publisher,number_of_pages_median,language,first_sentence&q=' + encodeURIComponent(q), {
+                        headers: { 'User-Agent': 'iAlgae/1.0 (info@ialgae.com)' }, signal: AbortSignal.timeout(10000)
+                    });
+                    if (r.ok) {
+                        const data = await r.json();
+                        const items = (data.docs || []).map(function (d) {
+                            const link = 'https://openlibrary.org' + (d.key || '');
+                            const first = Array.isArray(d.first_sentence) ? d.first_sentence[0] : (d.first_sentence || '');
+                            return {
+                                id: 'ol:' + (d.key || '').replace('/works/', ''),
+                                volumeInfo: {
+                                    title: d.title || '',
+                                    authors: d.author_name ? d.author_name.slice(0, 4) : undefined,
+                                    publisher: d.publisher ? d.publisher[0] : undefined,
+                                    publishedDate: d.first_publish_year ? String(d.first_publish_year) : undefined,
+                                    description: first || undefined,
+                                    pageCount: d.number_of_pages_median || undefined,
+                                    imageLinks: d.cover_i ? {
+                                        smallThumbnail: 'https://covers.openlibrary.org/b/id/' + d.cover_i + '-S.jpg',
+                                        thumbnail: 'https://covers.openlibrary.org/b/id/' + d.cover_i + '-M.jpg'
+                                    } : undefined,
+                                    infoLink: link, previewLink: link, canonicalVolumeLink: link
+                                }
+                            };
+                        });
+                        booksCache.set(cacheKey, { t: Date.now(), items: items, source: 'openlibrary' });
+                        return sendJSON(res, 200, { items: items, source: 'openlibrary' });
+                    }
+                    console.error('Open Library non disponibile:', r.status);
+                } catch (e) {
+                    console.error('Open Library errore di rete:', e.message);
                 }
 
-                const booksUrl = 'https://www.googleapis.com/books/v1/volumes?q=' + encodeURIComponent(q) + '&maxResults=20&key=' + GOOGLE_BOOKS_API_KEY;
-                const booksResponse = await fetch(booksUrl);
-                const data = await booksResponse.json();
-
-                if (!booksResponse.ok || data.error) {
-                    console.error('Errore Google Books API:', booksResponse.status, data.error || data);
-                    return sendJSON(res, 502, { error: 'Servizio libri non raggiungibile al momento.' });
-                }
-
-                return sendJSON(res, 200, { items: data.items || [] });
+                return sendJSON(res, 502, { error: 'Servizio libri non raggiungibile al momento.' });
             } catch (err) {
                 console.error('Errore endpoint /api/books:', err);
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
@@ -6993,6 +7041,25 @@ if (dbEnabled) {
     // non richiede la stessa granularità oraria degli altri task qui sopra.
     deleteInactiveAccounts();
     setInterval(deleteInactiveAccounts, 24 * 60 * 60 * 1000);
+
+    // Statistiche delle visite: dopo 14 mesi togliamo tutto ciò che può
+    // riguardare una persona (codice visitatore, città, coordinate) e teniamo
+    // solo pagina, paese, dispositivo e data — dati anonimi. Così i totali
+    // della dashboard e i traguardi restano uguali. È il periodo scritto
+    // nella privacy (privacy.html, sezione 6): se lo cambi, cambia anche lì.
+    function anonymizeOldStats() {
+        pool.query(
+            "UPDATE page_views SET visitor_id = NULL, city = NULL, latitude = NULL, longitude = NULL " +
+            "WHERE created_at < now() - interval '14 months' " +
+            "AND (visitor_id IS NOT NULL OR city IS NOT NULL OR latitude IS NOT NULL OR longitude IS NOT NULL)"
+        ).catch(function (err) { console.error('Errore anonimizzazione page_views:', err); });
+        pool.query(
+            "UPDATE core_downloads SET visitor_id = NULL " +
+            "WHERE created_at < now() - interval '14 months' AND visitor_id IS NOT NULL"
+        ).catch(function (err) { console.error('Errore anonimizzazione core_downloads:', err); });
+    }
+    anonymizeOldStats();
+    setInterval(anonymizeOldStats, 24 * 60 * 60 * 1000);
 
     // Elimina anche le notifiche più vecchie di 90 giorni, per non far
     // crescere la tabella all'infinito — 90 giorni sono comunque più che
