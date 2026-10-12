@@ -448,6 +448,15 @@ async function initDb() {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_pending_secret TEXT');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT false');
 
+    // Consensi raccolti alla registrazione (privacy):
+    // - age_confirmed_at: quando l'utente ha dichiarato di avere almeno 14 anni
+    //   (in Italia sotto i 14 anni il consenso lo dà un genitore);
+    // - marketing_consent: ha spuntato "voglio ricevere novità e offerte".
+    //   Le email promozionali vanno SOLO a chi ha marketing_consent = true.
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS age_confirmed_at TIMESTAMPTZ');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_consent BOOLEAN NOT NULL DEFAULT false');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_consent_at TIMESTAMPTZ');
+
     // Tracciamento visite (per la dashboard): una riga per ogni pagina
     // caricata, con paese/città dedotti dall'IP del visitatore. Niente dati
     // personali identificabili (no IP salvato, no cookie, no account collegato)
@@ -4883,6 +4892,11 @@ function parseAdminDateRange(searchParams) {
                 if (password.length < MIN_PASSWORD_LENGTH) {
                     return sendJSON(res, 400, { error: 'La password deve avere almeno 8 caratteri.' });
                 }
+                // Serve la dichiarazione "ho almeno 14 anni" (casella nel modulo).
+                if (payload.ageConfirmed !== true) {
+                    return sendJSON(res, 400, { error: 'Per creare un account devi avere almeno 14 anni (spunta la casella).' });
+                }
+                const marketingConsent = payload.marketingConsent === true;
 
                 const registerIpCheck = await checkAndConsumeRateLimitPersistent('register-ip', registerIp, MAX_REGISTRATIONS_PER_IP, REGISTER_RATE_WINDOW_MS, registerRateLimitByIp);
                 if (!registerIpCheck.allowed) {
@@ -4915,6 +4929,16 @@ function parseAdminDateRange(searchParams) {
                     verifyTokenExpires: Date.now() + 3 * 60 * 60 * 1000 // 3 ore
                 };
                 await saveUser(user);
+                if (dbEnabled) {
+                    try {
+                        await pool.query(
+                            'UPDATE users SET age_confirmed_at = now(), marketing_consent = $2, marketing_consent_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1',
+                            [id, marketingConsent]
+                        );
+                    } catch (consentErr) {
+                        console.error('Errore salvataggio consensi (non bloccante):', consentErr.message);
+                    }
+                }
 
                 const verifyUrl = SITE_BASE_URL + '/verify-email.html?token=' + verifyToken;
                 await sendEmail(
