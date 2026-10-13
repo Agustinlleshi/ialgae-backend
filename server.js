@@ -282,6 +282,25 @@ const MAX_REGISTRATIONS_PER_IP = 4;
 const registerRateLimitByIp = new Map();
 
 const ME_RATE_WINDOW_MS = 5 * 60 * 1000; // 5 minuti
+// iAlgae Studio online: limiti di spazio per ogni utente
+// (gratis e Pro hanno limiti diversi; in più c'è un tetto per TUTTI gli
+// utenti insieme, così il database non si riempie mai del tutto)
+const MB = 1024 * 1024;
+const STUDIO_LIMITS = {
+    free: { doc: 3 * MB, total: 25 * MB, files: 100 },
+    pro: { doc: 10 * MB, total: 500 * MB, files: 2000 }
+};
+const STUDIO_MAX_DOC = STUDIO_LIMITS.pro.doc; // il più grande: oltre questo non leggiamo nemmeno la richiesta
+const STUDIO_GLOBAL_MAX = (Number(process.env.STUDIO_GLOBAL_MAX_MB) || 700) * MB; // spazio massimo per Studio in tutto il database
+let studioGlobalCache = { used: 0, at: 0 };
+let studioFullNotifiedAt = 0;
+async function studioGlobalUsed() {
+    if (Date.now() - studioGlobalCache.at < 60000) return studioGlobalCache.used;
+    const r = await pool.query('SELECT COALESCE(SUM(size),0)::bigint AS used FROM studio_docs');
+    studioGlobalCache = { used: Number(r.rows[0].used), at: Date.now() };
+    return studioGlobalCache.used;
+}
+function studioLimitsFor(user) { return user && user.isPro ? STUDIO_LIMITS.pro : STUDIO_LIMITS.free; }
 const MAX_ME_REQUESTS = 30; // abbondante per un uso normale (la pagina profilo lo chiama una volta al caricamento), pensato per bloccare un loop impazzito, non un utente vero
 const meRateLimitByUser = new Map();
 
@@ -545,6 +564,23 @@ async function initDb() {
         '  provider TEXT PRIMARY KEY,' +
         '  refresh_token TEXT NOT NULL,' +
         '  connected_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
+        ')'
+    );
+
+    // iAlgae Studio online: i documenti (Writer, Sheets, Slides) di ogni
+    // utente, salvati nel suo account così li ritrova su qualsiasi computer.
+    // "data" è il contenuto completo del file in JSON. Se l'account viene
+    // cancellato, i suoi documenti spariscono insieme (ON DELETE CASCADE).
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS studio_docs (' +
+        '  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,' +
+        '  doc_id TEXT NOT NULL,' +
+        '  type TEXT NOT NULL,' +
+        '  title TEXT NOT NULL,' +
+        '  data JSONB NOT NULL,' +
+        '  size INTEGER NOT NULL DEFAULT 0,' +
+        '  updated BIGINT NOT NULL,' +
+        '  PRIMARY KEY (user_id, doc_id)' +
         ')'
     );
 
@@ -3365,6 +3401,88 @@ const server = http.createServer((req, res) => {
     // Restituisce l'elenco delle app che l'utente loggato ha scelto di
     // nascondere, più le eventuali app personalizzate che ha aggiunto lui
     // stesso al proprio menu "I tuoi preferiti".
+    // ---- iAlgae Studio online: documenti salvati nell'account ----
+    // Solo GET e POST (come il resto del sito), così non serve cambiare le
+    // regole CORS. Ogni utente vede e modifica SOLO i propri documenti.
+    if (req.method === 'GET' && (req.url === '/api/studio/list' || req.url.indexOf('/api/studio/doc?') === 0)) {
+        (async function () {
+            const user = await getUserFromRequest(req);
+            if (!user) return sendJSON(res, 401, { error: 'not_logged_in' });
+            try {
+                if (req.url === '/api/studio/list') {
+                    const r = await pool.query('SELECT doc_id, type, title, updated, size FROM studio_docs WHERE user_id = $1 ORDER BY updated DESC', [user.sub]);
+                    const used = r.rows.reduce(function (t, x) { return t + (x.size || 0); }, 0);
+                    const lim = studioLimitsFor(user);
+                    return sendJSON(res, 200, { docs: r.rows.map(function (x) { return { id: x.doc_id, type: x.type, title: x.title, updated: Number(x.updated), size: x.size }; }), used: used, limit: lim.total, maxFiles: lim.files, maxDoc: lim.doc, pro: !!user.isPro });
+                }
+                const id = new URL(req.url, 'http://x').searchParams.get('id') || '';
+                const r = await pool.query('SELECT doc_id, type, title, updated, data FROM studio_docs WHERE user_id = $1 AND doc_id = $2', [user.sub, id]);
+                if (!r.rows[0]) return sendJSON(res, 404, { error: 'not_found' });
+                const x = r.rows[0];
+                return sendJSON(res, 200, { id: x.doc_id, type: x.type, title: x.title, updated: Number(x.updated), data: x.data });
+            } catch (err) {
+                console.error('Errore /api/studio GET:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+    if (req.method === 'POST' && (req.url === '/api/studio/save' || req.url === '/api/studio/delete')) {
+        let studioBody = '';
+        let tooBig = false;
+        req.on('data', function (chunk) {
+            if (tooBig) return;
+            studioBody += chunk;
+            if (studioBody.length > STUDIO_MAX_DOC) { tooBig = true; studioBody = ''; }
+        });
+        req.on('end', async function () {
+            if (tooBig) return sendJSON(res, 413, { error: 'too_big', message: 'Il file è troppo grande per essere salvato online. Prova a togliere qualche immagine.' });
+            const user = await getUserFromRequest(req);
+            if (!user) return sendJSON(res, 401, { error: 'not_logged_in' });
+            let p;
+            try { p = JSON.parse(studioBody || '{}'); } catch (e) { return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' }); }
+            const id = String(p.id || '').slice(0, 40);
+            if (!/^[a-z0-9]{4,40}$/i.test(id)) return sendJSON(res, 400, { error: 'id non valido' });
+            try {
+                if (req.url === '/api/studio/delete') {
+                    await pool.query('DELETE FROM studio_docs WHERE user_id = $1 AND doc_id = $2', [user.sub, id]);
+                    return sendJSON(res, 200, { ok: true });
+                }
+                const type = ['writer', 'sheets', 'slides'].indexOf(p.type) !== -1 ? p.type : null;
+                if (!type || !p.data || typeof p.data !== 'object') return sendJSON(res, 400, { error: 'dati non validi' });
+                const title = String(p.title || 'Senza titolo').slice(0, 200);
+                const updated = Number(p.updated) || Date.now();
+                const json = JSON.stringify(p.data);
+                const size = Buffer.byteLength(json);
+                const lim = studioLimitsFor(user);
+                const mb = function (n) { return Math.round(n / MB) + ' MB'; };
+                const upgrade = user.isPro ? '' : ' Con iAlgae Pro hai ' + mb(STUDIO_LIMITS.pro.total) + '.';
+                if (size > lim.doc) return sendJSON(res, 413, { error: 'too_big', message: 'Questo file è troppo grande per essere salvato online (massimo ' + mb(lim.doc) + ' per file). Prova a togliere qualche immagine.' });
+                const others = await pool.query('SELECT COALESCE(SUM(size),0)::bigint AS used, COUNT(*)::int AS n, COALESCE(MAX(size) FILTER (WHERE doc_id = $2), 0)::bigint AS mine FROM studio_docs WHERE user_id = $1 OR (user_id = $1 AND doc_id = $2)', [user.sub, id]);
+                const usedOthers = Number(others.rows[0].used) - Number(others.rows[0].mine);
+                const exists = Number(others.rows[0].mine) > 0;
+                if (usedOthers + size > lim.total) return sendJSON(res, 413, { error: 'quota', message: 'Hai finito lo spazio online (' + mb(lim.total) + '). Elimina qualche file che non ti serve più.' + upgrade });
+                if (!exists && others.rows[0].n >= lim.files) return sendJSON(res, 413, { error: 'quota', message: 'Hai raggiunto il numero massimo di file online (' + lim.files + '). Elimina qualche file che non ti serve più.' });
+                // tetto generale: se il database è quasi pieno, i file NUOVI o più grandi aspettano
+                if (size > Number(others.rows[0].mine) && (await studioGlobalUsed()) + size > STUDIO_GLOBAL_MAX) {
+                    if (Date.now() - studioFullNotifiedAt > 6 * 3600 * 1000) { studioFullNotifiedAt = Date.now(); createNotification('studio_full', 'Lo spazio di iAlgae Studio online è pieno (' + mb(STUDIO_GLOBAL_MAX) + '): i nuovi file non vengono salvati online. Puoi alzare il limite con la variabile STUDIO_GLOBAL_MAX_MB su Render.'); }
+                    return sendJSON(res, 507, { error: 'server_full', message: 'Lo spazio online di iAlgae Studio è momentaneamente pieno. Il file resta salvato in questo browser: riprova più tardi.' });
+                }
+                await pool.query(
+                    'INSERT INTO studio_docs (user_id, doc_id, type, title, data, size, updated) VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7) ' +
+                    'ON CONFLICT (user_id, doc_id) DO UPDATE SET type = EXCLUDED.type, title = EXCLUDED.title, data = EXCLUDED.data, size = EXCLUDED.size, updated = EXCLUDED.updated',
+                    [user.sub, id, type, title, json, size, updated]
+                );
+                studioGlobalCache.used += size - Number(others.rows[0].mine);
+                return sendJSON(res, 200, { ok: true, size: size });
+            } catch (err) {
+                console.error('Errore /api/studio POST:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
     if (req.method === 'GET' && req.url === '/api/user/hidden-apps') {
         (async function () {
             const user = await getUserFromRequest(req);
