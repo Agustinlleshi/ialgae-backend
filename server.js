@@ -29,6 +29,10 @@
 // /api/auth/verify-email e POST /api/auth/resend-verification (conferma email
 // obbligatoria per chi si registra con email/password: non può accedere finché
 // non clicca il link ricevuto).
+// Accesso senza password: POST /api/auth/email-code/request e /verify (codice a
+// 6 cifre via email) e passkey: POST /api/auth/passkey/register-options,
+// /register-verify, /login-options, /login-verify, GET /api/auth/passkey/list,
+// POST /api/auth/passkey/delete.
 //
 // VARIABILI D'AMBIENTE PER ACCOUNT PERMANENTI (database) ED EMAIL:
 //   DATABASE_URL      = Connection String di Neon (postgresql://...). Senza,
@@ -774,6 +778,38 @@ async function initDb() {
         ')'
     );
     await pool.query('CREATE INDEX IF NOT EXISTS idx_map_reports_expires ON map_reports (expires_at)');
+
+    // ACCESSO SENZA PASSWORD (aggiunto in questa versione):
+    // - login_codes: il codice a 6 cifre mandato via email per entrare
+    //   ("Inviami un codice"). Uno solo per email alla volta, salvato come
+    //   impronta (hash) e mai in chiaro, valido 10 minuti, max 5 tentativi.
+    // - passkeys: le chiavi d'accesso (impronta, Face ID, PIN del computer).
+    //   Salviamo SOLO la chiave pubblica: quella privata resta sul
+    //   dispositivo dell'utente e non arriva mai al server. Se l'account
+    //   viene eliminato, le sue passkey spariscono con lui (ON DELETE CASCADE).
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS login_codes (' +
+        '  email TEXT PRIMARY KEY,' +
+        '  code_hash TEXT NOT NULL,' +
+        '  expires_at TIMESTAMPTZ NOT NULL,' +
+        '  attempts INTEGER NOT NULL DEFAULT 0,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now()' +
+        ')'
+    );
+    await pool.query(
+        'CREATE TABLE IF NOT EXISTS passkeys (' +
+        '  id TEXT PRIMARY KEY,' +
+        '  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,' +
+        '  public_key TEXT NOT NULL,' +
+        '  alg INTEGER NOT NULL,' +
+        '  sign_count BIGINT NOT NULL DEFAULT 0,' +
+        '  transports TEXT[] NOT NULL DEFAULT \'{}\',' +
+        '  name TEXT,' +
+        '  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),' +
+        '  last_used_at TIMESTAMPTZ' +
+        ')'
+    );
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_passkeys_user ON passkeys (user_id)');
 
     console.log('Database pronto (tabella users verificata/creata).');
 }
@@ -1991,6 +2027,247 @@ async function sendEmail(to, subject, html, attachments) {
         console.error('Errore di rete inviando email:', err);
         return false;
     }
+}
+
+// ============================================================
+// ACCESSO SENZA PASSWORD: CODICE VIA EMAIL E PASSKEY
+// ============================================================
+// Due modi per entrare che NON dipendono da Google:
+// 1. Codice via email: l'utente scrive la sua email, riceve un codice a 6
+//    cifre (valido 10 minuti, max 5 tentativi) e con quello entra. Chi non
+//    ha accesso a quella casella non vede il codice e quindi non entra.
+// 2. Passkey (standard WebAuthn, lo stesso di Apple, Google e Microsoft):
+//    l'utente entra con impronta, Face ID o PIN del computer. Il server
+//    conserva solo la chiave pubblica e controlla la firma: nessuna
+//    password, niente da rubare. Tutto fatto con il modulo "crypto" di Node,
+//    senza librerie in più da installare su Render.
+//
+// Variabili d'ambiente FACOLTATIVE (servono solo per le prove in locale):
+//   WEBAUTHN_RP_ID   = dominio delle passkey (predefinito: ialgae.com, vale
+//                      sia per www.ialgae.com sia per ialgae.com)
+//   WEBAUTHN_ORIGINS = elenco di origini ammesse separate da virgola
+//                      (predefinito: https://www.ialgae.com,https://ialgae.com)
+const WEBAUTHN_RP_ID = process.env.WEBAUTHN_RP_ID || 'ialgae.com';
+const WEBAUTHN_RP_NAME = 'iAlgae';
+const WEBAUTHN_ORIGINS = (process.env.WEBAUTHN_ORIGINS || 'https://www.ialgae.com,https://ialgae.com')
+    .split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+
+const LOGIN_CODE_TTL_MS = 10 * 60 * 1000;   // il codice vale 10 minuti
+const LOGIN_CODE_MAX_ATTEMPTS = 5;          // dopo 5 codici sbagliati va chiesto un codice nuovo
+const MAX_CODE_REQUESTS_PER_EMAIL = 5;      // codici inviati alla stessa email in un'ora
+const MAX_CODE_REQUESTS_PER_IP = 10;        // codici chiesti dallo stesso IP in un'ora
+const memoryLoginCodes = new Map();         // ripiego senza database: email -> { codeHash, expiresAt, attempts }
+const memoryPasskeys = new Map();           // ripiego senza database: id -> { ... }
+const codeRequestLimitByEmail = new Map();
+const codeRequestLimitByIp = new Map();
+const codeVerifyLimitByEmail = new Map();
+const passkeyLoginLimitByIp = new Map();
+const usedPasskeyChallenges = new Map();
+
+function b64url(buf) { return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+function fromB64url(str) { return Buffer.from(String(str || '').replace(/-/g, '+').replace(/_/g, '/'), 'base64'); }
+function sha256(data) { return crypto.createHash('sha256').update(data).digest(); }
+function clientIp(req) { return (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim(); }
+
+// Impronta del codice: legata all'email e a SESSION_SECRET, così anche chi
+// leggesse il database non potrebbe risalire al codice.
+function hashLoginCode(email, code) {
+    return crypto.createHmac('sha256', SESSION_SECRET).update(email + ':' + code).digest('hex');
+}
+
+async function saveLoginCode(email, codeHash) {
+    const expiresAt = new Date(Date.now() + LOGIN_CODE_TTL_MS);
+    if (!dbEnabled) { memoryLoginCodes.set(email, { codeHash: codeHash, expiresAt: expiresAt.getTime(), attempts: 0 }); return; }
+    await pool.query(
+        'INSERT INTO login_codes (email, code_hash, expires_at, attempts, created_at) VALUES ($1,$2,$3,0,now()) ' +
+        'ON CONFLICT (email) DO UPDATE SET code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at, attempts = 0, created_at = now()',
+        [email, codeHash, expiresAt]
+    );
+}
+async function getLoginCode(email) {
+    if (!dbEnabled) return memoryLoginCodes.get(email) || null;
+    const r = await pool.query('SELECT code_hash, expires_at, attempts FROM login_codes WHERE email = $1', [email]);
+    const row = r.rows[0];
+    return row ? { codeHash: row.code_hash, expiresAt: new Date(row.expires_at).getTime(), attempts: row.attempts } : null;
+}
+async function bumpLoginCodeAttempts(email) {
+    if (!dbEnabled) { const e = memoryLoginCodes.get(email); if (e) e.attempts += 1; return; }
+    await pool.query('UPDATE login_codes SET attempts = attempts + 1 WHERE email = $1', [email]);
+}
+async function deleteLoginCode(email) {
+    if (!dbEnabled) { memoryLoginCodes.delete(email); return; }
+    await pool.query('DELETE FROM login_codes WHERE email = $1', [email]);
+}
+
+// Risposta di accesso riuscito, uguale per tutti i modi di entrare. Se
+// l'account ha la verifica in due passaggi (app di autenticazione) e il modo
+// usato non è già "forte" da solo, chiediamo anche quel codice, esattamente
+// come succede con email e password. La passkey è già a due fattori (il
+// dispositivo + impronta/PIN), quindi non serve chiederlo di nuovo.
+async function finishLogin(res, sendJSON, user, opts) {
+    if (user.suspended) {
+        return sendJSON(res, 403, {
+            error: 'account_suspended',
+            message: 'Il tuo account è stato sospeso per violazione dei Termini di Servizio. Se ritieni sia un errore, contattaci a info@ialgae.com.'
+        });
+    }
+    if (user.totpEnabled && !(opts && opts.strong)) {
+        const twoFactorToken = jwt.sign({ sub: user.sub, purpose: '2fa-pending' }, SESSION_SECRET, { expiresIn: '5m' });
+        return sendJSON(res, 200, { requires2FA: true, twoFactorToken: twoFactorToken });
+    }
+    await touchLastLogin(user.sub);
+    const sessionToken = jwt.sign({ sub: user.sub }, SESSION_SECRET, { expiresIn: '30d' });
+    return sendJSON(res, 200, {
+        sessionToken: sessionToken,
+        user: { email: user.email, name: user.name, picture: user.picture, isPro: user.isPro }
+    });
+}
+
+function loginCodeEmailHtml(code, lang) {
+    const en = lang === 'en';
+    const title = en ? 'Your iAlgae sign-in code' : 'Il tuo codice per entrare in iAlgae';
+    const intro = en ? 'Use this code to sign in. It is valid for 10 minutes and can be used only once.'
+                     : 'Usa questo codice per entrare. Vale 10 minuti e si può usare una volta sola.';
+    const notYou = en ? 'If it wasn\'t you, just ignore this email: nobody can sign in without this code, your account is safe.'
+                      : 'Se non sei stato tu, ignora questa email: senza questo codice nessuno può entrare, il tuo account è al sicuro.';
+    const never = en ? 'iAlgae will never ask you for this code by phone, chat or email.'
+                     : 'iAlgae non ti chiederà mai questo codice al telefono, in chat o via email.';
+    return '<div style="font-family:Segoe UI,Roboto,Arial,sans-serif;max-width:480px;margin:0 auto;padding:28px 24px;color:#202124">' +
+        '<div style="font-size:26px;font-weight:700;color:#4F46E5;margin-bottom:18px">iAlgae</div>' +
+        '<div style="font-size:19px;font-weight:600;margin-bottom:8px">' + title + '</div>' +
+        '<p style="font-size:14.5px;color:#5f6368;line-height:1.55;margin:0 0 20px">' + intro + '</p>' +
+        '<div style="font-size:34px;font-weight:700;letter-spacing:10px;text-align:center;background:#f1f3ff;border-radius:14px;padding:18px 0;margin-bottom:20px">' + code + '</div>' +
+        '<p style="font-size:13px;color:#5f6368;line-height:1.55;margin:0 0 8px">' + notYou + '</p>' +
+        '<p style="font-size:13px;color:#9aa0a6;line-height:1.55;margin:0">' + never + '</p>' +
+        '</div>';
+}
+
+// ---- Lettore CBOR minimo (formato binario usato dalle passkey) ----
+// Restituisce [valore, posizione successiva]. Basta per i dati WebAuthn:
+// numeri, byte, testo, liste, mappe e valori semplici.
+function cborDecode(buf, pos) {
+    pos = pos || 0;
+    const first = buf[pos++];
+    const major = first >> 5;
+    let info = first & 0x1f;
+    let len;
+    if (info < 24) len = info;
+    else if (info === 24) { len = buf[pos]; pos += 1; }
+    else if (info === 25) { len = buf.readUInt16BE(pos); pos += 2; }
+    else if (info === 26) { len = buf.readUInt32BE(pos); pos += 4; }
+    else if (info === 27) { len = Number(buf.readBigUInt64BE(pos)); pos += 8; }
+    else throw new Error('CBOR non supportato');
+    switch (major) {
+        case 0: return [len, pos];
+        case 1: return [-1 - len, pos];
+        case 2: return [buf.subarray(pos, pos + len), pos + len];
+        case 3: return [buf.subarray(pos, pos + len).toString('utf8'), pos + len];
+        case 4: { const arr = []; for (let i = 0; i < len; i++) { const r = cborDecode(buf, pos); arr.push(r[0]); pos = r[1]; } return [arr, pos]; }
+        case 5: { const map = new Map(); for (let i = 0; i < len; i++) { const k = cborDecode(buf, pos); const v = cborDecode(buf, k[1]); map.set(k[0], v[0]); pos = v[1]; } return [map, pos]; }
+        case 6: return cborDecode(buf, pos); // etichetta: la saltiamo
+        case 7: return [info === 20 ? false : info === 21 ? true : null, pos];
+    }
+    throw new Error('CBOR non valido');
+}
+
+// Legge i "dati dell'autenticatore" (authenticatorData) di una passkey.
+function parseAuthData(ad) {
+    if (!Buffer.isBuffer(ad) || ad.length < 37) throw new Error('authData troppo corti');
+    const out = { rpIdHash: ad.subarray(0, 32), flags: ad[32], signCount: ad.readUInt32BE(33) };
+    out.up = !!(out.flags & 0x01); out.uv = !!(out.flags & 0x04);
+    if (out.flags & 0x40) {
+        let p = 37 + 16; // salto l'AAGUID
+        const idLen = ad.readUInt16BE(p); p += 2;
+        out.credId = ad.subarray(p, p + idLen); p += idLen;
+        const r = cborDecode(ad, p);
+        out.coseKey = r[0];
+    }
+    return out;
+}
+
+// Chiave COSE (dentro la passkey) -> chiave pubblica JWK utilizzabile da Node.
+function coseToJwk(cose) {
+    const kty = cose.get(1), alg = cose.get(3);
+    if (kty === 2 && cose.get(-1) === 1) return { alg: alg || -7, jwk: { kty: 'EC', crv: 'P-256', x: b64url(cose.get(-2)), y: b64url(cose.get(-3)) } };
+    if (kty === 3) return { alg: alg || -257, jwk: { kty: 'RSA', n: b64url(cose.get(-1)), e: b64url(cose.get(-2)) } };
+    if (kty === 1 && cose.get(-1) === 6) return { alg: alg || -8, jwk: { kty: 'OKP', crv: 'Ed25519', x: b64url(cose.get(-2)) } };
+    throw new Error('Tipo di chiave non supportato');
+}
+
+function verifyPasskeySignature(alg, jwk, data, signature) {
+    const key = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+    if (alg === -8) return crypto.verify(null, data, key, signature);
+    return crypto.verify('sha256', data, key, signature); // ES256 (firma DER) e RS256
+}
+
+// Controlli comuni su clientDataJSON: tipo di operazione, sfida e sito.
+function checkClientData(clientDataJSON, type, challenge) {
+    let cd;
+    try { cd = JSON.parse(fromB64url(clientDataJSON).toString('utf8')); } catch (e) { throw new Error('clientData non valido'); }
+    if (cd.type !== type) throw new Error('Tipo di operazione sbagliato');
+    if (cd.challenge !== challenge) throw new Error('Sfida non corrispondente');
+    if (WEBAUTHN_ORIGINS.indexOf(cd.origin) === -1) throw new Error('Sito di provenienza non ammesso: ' + cd.origin);
+    return cd;
+}
+
+// Ogni "sfida" (challenge) vale una volta sola: così una firma intercettata
+// non può essere riusata.
+async function consumeChallengeOnce(challenge) {
+    const r = await checkAndConsumeRateLimitPersistent('passkey-challenge', challenge, 1, 10 * 60 * 1000, usedPasskeyChallenges);
+    return r.allowed;
+}
+
+// Identificativo utente dentro la passkey: un'impronta dell'id dell'account
+// (non l'email, così sul dispositivo non finiscono dati personali in più).
+function passkeyUserHandle(sub) { return b64url(sha256('ialgae-user:' + sub)); }
+
+function rowToPasskey(row) {
+    return { id: row.id, userId: row.user_id, publicKey: JSON.parse(row.public_key), alg: row.alg, signCount: Number(row.sign_count),
+             transports: row.transports || [], name: row.name, createdAt: row.created_at, lastUsedAt: row.last_used_at };
+}
+async function getPasskeyById(id) {
+    if (!dbEnabled) return memoryPasskeys.get(id) || null;
+    const r = await pool.query('SELECT * FROM passkeys WHERE id = $1', [id]);
+    return r.rows[0] ? rowToPasskey(r.rows[0]) : null;
+}
+async function listPasskeys(userId) {
+    if (!dbEnabled) return Array.from(memoryPasskeys.values()).filter(function (p) { return p.userId === userId && memoryUsers.has(userId); });
+    const r = await pool.query('SELECT * FROM passkeys WHERE user_id = $1 ORDER BY created_at', [userId]);
+    return r.rows.map(rowToPasskey);
+}
+async function insertPasskey(pk) {
+    if (!dbEnabled) { memoryPasskeys.set(pk.id, Object.assign({ createdAt: new Date(), lastUsedAt: null }, pk)); return; }
+    await pool.query('INSERT INTO passkeys (id, user_id, public_key, alg, sign_count, transports, name) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+        [pk.id, pk.userId, JSON.stringify(pk.publicKey), pk.alg, pk.signCount, pk.transports, pk.name]);
+}
+async function touchPasskey(id, signCount) {
+    if (!dbEnabled) { const p = memoryPasskeys.get(id); if (p) { p.signCount = signCount; p.lastUsedAt = new Date(); } return; }
+    await pool.query('UPDATE passkeys SET sign_count = $2, last_used_at = now() WHERE id = $1', [id, signCount]);
+}
+async function deletePasskey(id, userId) {
+    if (!dbEnabled) { const p = memoryPasskeys.get(id); if (p && p.userId === userId) { memoryPasskeys.delete(id); return true; } return false; }
+    const r = await pool.query('DELETE FROM passkeys WHERE id = $1 AND user_id = $2', [id, userId]);
+    return r.rowCount > 0;
+}
+
+// Nome leggibile della passkey, dedotto dal browser che l'ha creata
+// (l'utente può comunque riconoscerla dalla data).
+function guessDeviceName(ua) {
+    ua = ua || '';
+    const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android' :
+        /Mac OS X|Macintosh/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : 'Dispositivo';
+    const br = /iAlgaeCore/.test(ua) ? 'iAlgae Core' : /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' :
+        /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : '';
+    return br ? os + ' · ' + br : os;
+}
+
+function readJsonBody(req, maxBytes) {
+    return new Promise(function (resolve) {
+        let body = '', tooBig = false;
+        req.on('data', function (chunk) { body += chunk; if (body.length > (maxBytes || 64 * 1024)) { tooBig = true; req.destroy(); } });
+        req.on('end', function () { if (tooBig) return resolve(null); try { resolve(JSON.parse(body || '{}')); } catch (e) { resolve(null); } });
+        req.on('error', function () { resolve(null); });
+    });
 }
 
 function extractHost(url) {
@@ -5334,6 +5611,256 @@ function parseAdminDateRange(searchParams) {
                 return sendJSON(res, 500, { error: 'Errore interno del server.' });
             }
         });
+        return;
+    }
+
+    // ============ ACCESSO CON CODICE VIA EMAIL ============
+    // 1) /api/auth/email-code/request: manda il codice. Risponde SEMPRE allo
+    //    stesso modo, anche se l'email non ha un account: così nessuno può
+    //    usare questa pagina per scoprire chi è iscritto a iAlgae.
+    if (req.method === 'POST' && req.url === '/api/auth/email-code/request') {
+        (async function () {
+            try {
+                const payload = await readJsonBody(req);
+                if (!payload) return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                const email = String(payload.email || '').trim().toLowerCase();
+                const lang = payload.lang === 'en' ? 'en' : 'it';
+                if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+                    return sendJSON(res, 400, { error: lang === 'en' ? 'Enter a valid email.' : 'Scrivi un\'email valida.' });
+                }
+                const ip = clientIp(req);
+                const recaptchaOk = await verificaRecaptcha(payload.recaptchaToken, ip);
+                if (!recaptchaOk) {
+                    return sendJSON(res, 403, { error: 'verifica_bot_fallita', message: lang === 'en' ? 'Security check failed. Reload the page and try again.' : 'Verifica di sicurezza non superata. Ricarica la pagina e riprova.' });
+                }
+                const ipCheck = await checkAndConsumeRateLimitPersistent('code-req-ip', ip, MAX_CODE_REQUESTS_PER_IP, 60 * 60 * 1000, codeRequestLimitByIp);
+                const emailCheck = await checkAndConsumeRateLimitPersistent('code-req-email', email, MAX_CODE_REQUESTS_PER_EMAIL, 60 * 60 * 1000, codeRequestLimitByEmail);
+                if (!ipCheck.allowed || !emailCheck.allowed) {
+                    return sendJSON(res, 429, { error: 'too_many_attempts', message: lang === 'en' ? 'Too many codes requested. Try again in an hour.' : 'Hai chiesto troppi codici. Riprova tra un\'ora.' });
+                }
+                const generic = { ok: true, message: lang === 'en'
+                    ? 'If this email has an iAlgae account, we\'ve sent you a 6-digit code. Check your inbox (and spam).'
+                    : 'Se questa email ha un account iAlgae, ti abbiamo mandato un codice a 6 cifre. Controlla la posta (anche lo spam).' };
+                const user = await getUserByEmail(email);
+                if (!user || user.suspended) return sendJSON(res, 200, generic);
+                const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+                await saveLoginCode(email, hashLoginCode(email, code));
+                const subject = lang === 'en' ? code + ' is your iAlgae code' : code + ' è il tuo codice iAlgae';
+                const sent = await sendEmail(user.email, subject, loginCodeEmailHtml(code, lang));
+                if (!sent && !RESEND_API_KEY) console.warn('Codice di accesso (solo nei log, email non configurata) per', email, ':', code);
+                return sendJSON(res, 200, generic);
+            } catch (err) {
+                console.error('Errore invio codice di accesso:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // 2) /api/auth/email-code/verify: controlla il codice e fa entrare.
+    if (req.method === 'POST' && req.url === '/api/auth/email-code/verify') {
+        (async function () {
+            try {
+                const payload = await readJsonBody(req);
+                if (!payload) return sendJSON(res, 400, { error: 'Corpo della richiesta non valido.' });
+                const email = String(payload.email || '').trim().toLowerCase();
+                const code = String(payload.code || '').replace(/\D/g, '');
+                const en = payload.lang === 'en';
+                const bad = en ? 'Wrong or expired code.' : 'Codice sbagliato o scaduto.';
+                if (!email || code.length !== 6) return sendJSON(res, 400, { error: en ? 'Enter the 6-digit code.' : 'Inserisci il codice a 6 cifre.' });
+                const limit = await checkAndConsumeRateLimitPersistent('code-verify-email', email, 10, 15 * 60 * 1000, codeVerifyLimitByEmail);
+                if (!limit.allowed) return sendJSON(res, 429, { error: en ? 'Too many attempts. Try again in a few minutes.' : 'Troppi tentativi. Riprova tra qualche minuto.' });
+                const entry = await getLoginCode(email);
+                if (!entry || entry.expiresAt < Date.now()) {
+                    if (entry) await deleteLoginCode(email);
+                    return sendJSON(res, 401, { error: bad + (en ? ' Request a new one.' : ' Chiedine uno nuovo.'), expired: true });
+                }
+                const expected = Buffer.from(entry.codeHash, 'hex');
+                const given = Buffer.from(hashLoginCode(email, code), 'hex');
+                if (expected.length !== given.length || !crypto.timingSafeEqual(expected, given)) {
+                    await bumpLoginCodeAttempts(email);
+                    if (entry.attempts + 1 >= LOGIN_CODE_MAX_ATTEMPTS) {
+                        await deleteLoginCode(email);
+                        return sendJSON(res, 401, { error: en ? 'Too many wrong codes: request a new one.' : 'Troppi codici sbagliati: chiedine uno nuovo.', expired: true });
+                    }
+                    const left = LOGIN_CODE_MAX_ATTEMPTS - entry.attempts - 1;
+                    return sendJSON(res, 401, { error: bad + (en ? ' Attempts left: ' : ' Tentativi rimasti: ') + left + '.' });
+                }
+                await deleteLoginCode(email);
+                const user = await getUserByEmail(email);
+                if (!user) return sendJSON(res, 401, { error: bad });
+                // Ha dimostrato di leggere quella casella: l'email è confermata.
+                if (!user.emailVerified) { user.emailVerified = true; user.verifyToken = null; user.verifyTokenExpires = null; await saveUser(user); }
+                return finishLogin(res, sendJSON, user);
+            } catch (err) {
+                console.error('Errore verifica codice di accesso:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // ============ PASSKEY ============
+    // Creazione (serve essere già entrati): il browser chiede le "opzioni",
+    // l'utente conferma con impronta/viso/PIN, il browser manda la nuova
+    // chiave pubblica e noi la controlliamo e la salviamo.
+    if (req.method === 'POST' && req.url === '/api/auth/passkey/register-options') {
+        (async function () {
+            try {
+                const user = await getUserFromRequest(req);
+                if (!user) return sendJSON(res, 401, { error: 'Devi essere entrato per creare una passkey.' });
+                const existing = await listPasskeys(user.sub);
+                if (existing.length >= 10) return sendJSON(res, 400, { error: 'Hai già 10 passkey: eliminane una dal profilo per aggiungerne un\'altra.' });
+                const challenge = b64url(crypto.randomBytes(32));
+                const state = jwt.sign({ purpose: 'passkey-register', sub: user.sub, challenge: challenge }, SESSION_SECRET, { expiresIn: '5m' });
+                const displayName = [user.name, user.surname].filter(Boolean).join(' ') || user.email;
+                return sendJSON(res, 200, {
+                    state: state,
+                    publicKey: {
+                        challenge: challenge,
+                        rp: { name: WEBAUTHN_RP_NAME, id: WEBAUTHN_RP_ID },
+                        user: { id: passkeyUserHandle(user.sub), name: user.email, displayName: displayName },
+                        pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -8 }, { type: 'public-key', alg: -257 }],
+                        timeout: 120000,
+                        attestation: 'none',
+                        authenticatorSelection: { residentKey: 'required', requireResidentKey: true, userVerification: 'required' },
+                        excludeCredentials: existing.map(function (p) { return { type: 'public-key', id: p.id, transports: p.transports }; })
+                    }
+                });
+            } catch (err) {
+                console.error('Errore opzioni passkey:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    if (req.method === 'POST' && req.url === '/api/auth/passkey/register-verify') {
+        (async function () {
+            try {
+                const user = await getUserFromRequest(req);
+                if (!user) return sendJSON(res, 401, { error: 'Devi essere entrato per creare una passkey.' });
+                const payload = await readJsonBody(req);
+                if (!payload || !payload.credential || !payload.credential.response) return sendJSON(res, 400, { error: 'Dati della passkey mancanti.' });
+                let state;
+                try { state = jwt.verify(payload.state || '', SESSION_SECRET); } catch (e) { return sendJSON(res, 400, { error: 'Tempo scaduto: riprova.' }); }
+                if (state.purpose !== 'passkey-register' || state.sub !== user.sub) return sendJSON(res, 400, { error: 'Richiesta non valida.' });
+                if (!(await consumeChallengeOnce(state.challenge))) return sendJSON(res, 400, { error: 'Richiesta già usata: riprova.' });
+                const cred = payload.credential;
+                try {
+                    checkClientData(cred.response.clientDataJSON, 'webauthn.create', state.challenge);
+                    const att = cborDecode(fromB64url(cred.response.attestationObject))[0];
+                    const ad = parseAuthData(att.get('authData'));
+                    if (!ad.rpIdHash.equals(sha256(WEBAUTHN_RP_ID))) throw new Error('Dominio della passkey sbagliato');
+                    if (!ad.up || !ad.uv) throw new Error('Serve la conferma con impronta, viso o PIN');
+                    if (!ad.credId || !ad.coseKey) throw new Error('Chiave mancante');
+                    const id = b64url(ad.credId);
+                    if (cred.id && cred.id !== id) throw new Error('Identificativo non corrispondente');
+                    if (await getPasskeyById(id)) throw new Error('Questa passkey è già registrata');
+                    const key = coseToJwk(ad.coseKey);
+                    crypto.createPublicKey({ key: key.jwk, format: 'jwk' }); // controlla che la chiave sia valida
+                    const transports = Array.isArray(cred.response.transports) ? cred.response.transports.filter(function (t) { return typeof t === 'string'; }).slice(0, 6) : [];
+                    const name = String(payload.name || guessDeviceName(req.headers['user-agent'])).slice(0, 60);
+                    await insertPasskey({ id: id, userId: user.sub, publicKey: key.jwk, alg: key.alg, signCount: ad.signCount, transports: transports, name: name });
+                    return sendJSON(res, 200, { ok: true, passkey: { id: id, name: name } });
+                } catch (e) {
+                    console.warn('Passkey rifiutata:', e.message);
+                    return sendJSON(res, 400, { error: 'Passkey non valida: ' + e.message });
+                }
+            } catch (err) {
+                console.error('Errore registrazione passkey:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Accesso con passkey (nessun dato da scrivere: il dispositivo propone
+    // da solo le passkey di iAlgae che ha salvate).
+    if (req.method === 'POST' && req.url === '/api/auth/passkey/login-options') {
+        (async function () {
+            const ip = clientIp(req);
+            const lim = await checkAndConsumeRateLimitPersistent('passkey-opt-ip', ip, 30, 15 * 60 * 1000, passkeyLoginLimitByIp);
+            if (!lim.allowed) return sendJSON(res, 429, { error: 'Troppi tentativi. Riprova tra qualche minuto.' });
+            const challenge = b64url(crypto.randomBytes(32));
+            const state = jwt.sign({ purpose: 'passkey-login', challenge: challenge }, SESSION_SECRET, { expiresIn: '5m' });
+            return sendJSON(res, 200, { state: state, publicKey: { challenge: challenge, rpId: WEBAUTHN_RP_ID, timeout: 120000, userVerification: 'required', allowCredentials: [] } });
+        })();
+        return;
+    }
+
+    if (req.method === 'POST' && req.url === '/api/auth/passkey/login-verify') {
+        (async function () {
+            try {
+                const payload = await readJsonBody(req);
+                const en = payload && payload.lang === 'en';
+                const notOk = en ? 'Passkey sign-in failed. Try again or use the email code.' : 'Accesso con passkey non riuscito. Riprova o usa il codice via email.';
+                if (!payload || !payload.credential || !payload.credential.response) return sendJSON(res, 400, { error: notOk });
+                let state;
+                try { state = jwt.verify(payload.state || '', SESSION_SECRET); } catch (e) { return sendJSON(res, 400, { error: en ? 'Time expired: try again.' : 'Tempo scaduto: riprova.' }); }
+                if (state.purpose !== 'passkey-login') return sendJSON(res, 400, { error: notOk });
+                const cred = payload.credential;
+                const pk = await getPasskeyById(String(cred.id || ''));
+                if (!pk) return sendJSON(res, 401, { error: en ? 'This passkey is no longer linked to an iAlgae account. Sign in with the email code and create a new one.' : 'Questa passkey non è più collegata a un account iAlgae. Entra con il codice via email e creane una nuova.' });
+                try {
+                    checkClientData(cred.response.clientDataJSON, 'webauthn.get', state.challenge);
+                    const adBuf = fromB64url(cred.response.authenticatorData);
+                    const ad = parseAuthData(adBuf);
+                    if (!ad.rpIdHash.equals(sha256(WEBAUTHN_RP_ID))) throw new Error('Dominio sbagliato');
+                    if (!ad.up || !ad.uv) throw new Error('Manca la conferma con impronta, viso o PIN');
+                    if (cred.response.userHandle && cred.response.userHandle !== passkeyUserHandle(pk.userId)) throw new Error('Utente non corrispondente');
+                    const signed = Buffer.concat([adBuf, sha256(fromB64url(cred.response.clientDataJSON))]);
+                    if (!verifyPasskeySignature(pk.alg, pk.publicKey, signed, fromB64url(cred.response.signature))) throw new Error('Firma non valida');
+                    // Il contatore deve crescere (se il dispositivo lo usa): se torna
+                    // indietro, qualcuno potrebbe aver copiato la passkey.
+                    if ((ad.signCount > 0 || pk.signCount > 0) && ad.signCount <= pk.signCount) throw new Error('Contatore non valido (possibile copia della passkey)');
+                    if (!(await consumeChallengeOnce(state.challenge))) throw new Error('Sfida già usata');
+                    await touchPasskey(pk.id, ad.signCount);
+                } catch (e) {
+                    console.warn('Accesso passkey rifiutato:', e.message);
+                    return sendJSON(res, 401, { error: notOk });
+                }
+                const user = await getUserById(pk.userId);
+                if (!user) return sendJSON(res, 401, { error: notOk });
+                return finishLogin(res, sendJSON, user, { strong: true });
+            } catch (err) {
+                console.error('Errore accesso passkey:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    // Elenco ed eliminazione delle passkey (pagina profilo).
+    if (req.method === 'GET' && req.url === '/api/auth/passkey/list') {
+        (async function () {
+            try {
+                const user = await getUserFromRequest(req);
+                if (!user) return sendJSON(res, 401, { error: 'Non autorizzato.' });
+                const list = await listPasskeys(user.sub);
+                return sendJSON(res, 200, { passkeys: list.map(function (p) { return { id: p.id, name: p.name, createdAt: p.createdAt, lastUsedAt: p.lastUsedAt }; }) });
+            } catch (err) {
+                console.error('Errore elenco passkey:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
+        return;
+    }
+
+    if (req.method === 'POST' && req.url === '/api/auth/passkey/delete') {
+        (async function () {
+            try {
+                const user = await getUserFromRequest(req);
+                if (!user) return sendJSON(res, 401, { error: 'Non autorizzato.' });
+                const payload = await readJsonBody(req);
+                const ok = payload && payload.id ? await deletePasskey(String(payload.id), user.sub) : false;
+                if (!ok) return sendJSON(res, 404, { error: 'Passkey non trovata.' });
+                return sendJSON(res, 200, { ok: true });
+            } catch (err) {
+                console.error('Errore eliminazione passkey:', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        })();
         return;
     }
 
