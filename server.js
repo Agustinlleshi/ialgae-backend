@@ -104,6 +104,26 @@ const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
 const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
 // risultati dei libri tenuti in memoria per 6 ore (meno richieste a Google, più veloce)
 const booksCache = new Map();
+// Servizi utili di iAlgae Maps (farmacie, defibrillatori, fontanelle, bagni, punti di interesse):
+// il server chiede i dati a Overpass (OpenStreetMap) provando più copie pubbliche e li tiene
+// in memoria per qualche minuto, così non dipendiamo dal browser dell'utente e pesiamo meno su OSM.
+const placesCache = new Map();
+const PLACES_CACHE_MS = 15 * 60 * 1000;
+const placesRate = new Map();
+const OVERPASS_SERVERS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
+];
+let overpassPreferred = 0;
+const PLACES_QUERIES = {
+    pharmacy: function (a) { return 'nwr["amenity"="pharmacy"](around:' + a + ');'; },
+    aed: function (a) { return 'nwr["emergency"="defibrillator"](around:' + a + ');'; },
+    water: function (a) { return 'nwr["amenity"="drinking_water"](around:' + a + ');nwr["drinking_water"="yes"]["amenity"="fountain"](around:' + a + ');'; },
+    toilets: function (a) { return 'nwr["amenity"="toilets"]["wheelchair"~"^(yes|limited|designated)$"](around:' + a + ');'; },
+    poi: function (a) { return 'node["amenity"~"^(restaurant|fast_food|cafe|bar|pub|fuel|bank|atm|pharmacy|hospital|clinic)$"](around:' + a + ');node["shop"](around:' + a + ');node["railway"~"^(station|subway_entrance|tram_stop)$"](around:' + a + ');node["highway"="bus_stop"](around:' + a + ');'; }
+};
 const BOOKS_CACHE_MS = 6 * 60 * 60 * 1000;
 setInterval(function () { const now = Date.now(); for (const [k, v] of booksCache) if (now - v.t > BOOKS_CACHE_MS) booksCache.delete(k); }, 60 * 60 * 1000).unref();
 // Duffel: prezzi voli reali per la pagina Viaggiare/Travel.
@@ -6831,6 +6851,53 @@ function parseAdminDateRange(searchParams) {
     // chiave bloccata o scaduta), proviamo Google Books senza chiave e poi
     // Open Library (gratis, senza chiave), restituendo i risultati nello stesso
     // formato: la pagina results.html non si accorge della differenza.
+    if (req.method === 'GET' && req.url.indexOf('/api/places-nearby') === 0) {
+        (async function () {
+            try {
+                const u = new URL(req.url, 'http://localhost');
+                const kind = u.searchParams.get('kind');
+                const lat = Number(u.searchParams.get('lat')), lon = Number(u.searchParams.get('lon'));
+                let r = Math.round(Number(u.searchParams.get('r')) || 1000);
+                if (!PLACES_QUERIES[kind] || !isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return sendJSON(res, 400, { error: 'Richiesta non valida' });
+                r = Math.min(kind === 'poi' ? 1200 : 5000, Math.max(300, Math.round(r / 100) * 100));
+                // stessa zona (circa 100 m) = stessa risposta dalla memoria
+                const key = kind + ':' + lat.toFixed(3) + ':' + lon.toFixed(3) + ':' + r;
+                const hit = placesCache.get(key);
+                if (hit && Date.now() - hit.t < PLACES_CACHE_MS) return sendJSON(res, 200, { elements: hit.elements, cached: true });
+                const ip = clientIp(req);
+                if (!checkAndConsumeRateLimitMemory(placesRate, ip, 60, 10 * 60 * 1000).allowed) return sendJSON(res, 429, { error: 'Troppe richieste, riprova tra poco' });
+                const limit = kind === 'poi' ? 70 : 150;
+                const query = '[out:json][timeout:15];(' + PLACES_QUERIES[kind](r + ',' + lat.toFixed(5) + ',' + lon.toFixed(5)) + ');out center ' + limit + ';';
+                const order = OVERPASS_SERVERS.map(function (_, i) { return (overpassPreferred + i) % OVERPASS_SERVERS.length; });
+                for (const i of order) {
+                    try {
+                        const resp = await fetch(OVERPASS_SERVERS[i], {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'iAlgae-Maps/1.0 (https://www.ialgae.com)' },
+                            body: 'data=' + encodeURIComponent(query),
+                            signal: AbortSignal.timeout(12000)
+                        });
+                        if (!resp.ok) { console.error('Overpass ' + OVERPASS_SERVERS[i] + ' HTTP ' + resp.status); continue; }
+                        const data = await resp.json();
+                        if (!data || !Array.isArray(data.elements)) continue;
+                        if (data.remark && !data.elements.length && /runtime error|timed out|out of memory/i.test(data.remark)) { console.error('Overpass ' + OVERPASS_SERVERS[i] + ': ' + data.remark); continue; }
+                        overpassPreferred = i;
+                        // teniamo solo quello che serve alla pagina
+                        const elements = data.elements.map(function (e) { return { type: e.type, lat: e.lat, lon: e.lon, center: e.center, tags: e.tags || {} }; });
+                        if (placesCache.size > 800) placesCache.delete(placesCache.keys().next().value);
+                        placesCache.set(key, { t: Date.now(), elements: elements });
+                        return sendJSON(res, 200, { elements: elements });
+                    } catch (e) { console.error('Overpass ' + OVERPASS_SERVERS[i] + ' errore:', e.message); }
+                }
+                return sendJSON(res, 503, { error: 'Servizio dei dati pubblici non disponibile' });
+            } catch (err) {
+                console.error('Errore endpoint /api/places-nearby:', err);
+                return sendJSON(res, 500, { error: 'Errore interno' });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/books') === 0) {
         (async function () {
             try {
