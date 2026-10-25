@@ -1,6 +1,8 @@
 {
   "name": "ialgae-backend",
   "version": "1.0.0",
+  "private": true,
+  "license": "UNLICENSED",
   "description": "Backend iAlgae: assistente IA, ricerca web, login Google, pagamenti Stripe",
   "main": "server.js",
   "scripts": {
