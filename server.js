@@ -6763,7 +6763,7 @@ function parseAdminDateRange(searchParams) {
                     return sendJSON(res, 429, { error: 'Hai fatto tante richieste: riprova tra un po\'.' });
                 }
                 if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY) return sendJSON(res, 500, { error: 'Servizio IA non configurato.' });
-                const LANGS = { en: 'inglese', la: 'latino', fr: 'francese', de: 'tedesco', es: 'spagnolo', it: 'italiano' };
+                const LANGS = { it: 'italiano', en: 'inglese', la: 'latino', fr: 'francese', de: 'tedesco', es: 'spagnolo', pt: 'portoghese', ro: 'rumeno', sq: 'albanese', uk: 'ucraino', ar: 'arabo', zh: 'cinese' };
                 const mode = String(p.mode || '');
                 let messages, system, maxTok = 1600;
                 if (mode === 'ocr') {
@@ -6778,11 +6778,13 @@ function parseAdminDateRange(searchParams) {
                 } else if (mode === 'translate') {
                     const text = String(p.text || '').trim().slice(0, 1200);
                     const from = LANGS[p.from] ? p.from : 'en';
+                    let to = LANGS[p.to] ? p.to : 'it';
+                    if (to === from) to = from === 'it' ? 'en' : 'it';
                     if (!text) return sendJSON(res, 400, { error: 'Scrivi una frase da tradurre.' });
                     system = 'Sei un insegnante di lingue paziente per studenti italiani delle medie e delle superiori. Rispondi SOLO con JSON valido, senza testo prima o dopo.';
                     messages = [{ role: 'user', content: 'Testo in ' + LANGS[from] + ':\n"""' + text + '"""\n\n' +
-                        'Rispondi con questo JSON:\n{"translation":"traduzione naturale in italiano","level":"livello QCER stimato, es. A2","notes":[{"phrase":"parole ESATTE copiate dal testo originale","title":"nome breve della regola","explain":"spiegazione semplice in italiano, massimo 2 frasi"}],"practice":["3 frasi brevi nella stessa lingua per esercitarsi sulla stessa regola"]}\n' +
-                        'Metti da 1 a 3 note, solo sulle cose davvero utili (tempi verbali, casi del latino, preposizioni, falsi amici). "phrase" deve comparire identica nel testo originale.' }];
+                        'Traducilo in ' + LANGS[to] + '.\n\nRispondi con questo JSON:\n{"translation":"traduzione naturale in ' + LANGS[to] + '","level":"livello QCER stimato, es. A2","notes":[{"phrase":"parole ESATTE copiate dal testo originale","title":"nome breve della regola","explain":"spiegazione semplice in italiano, massimo 2 frasi"}],"practice":["3 frasi brevi nella stessa lingua per esercitarsi sulla stessa regola"]}\n' +
+                        'Le spiegazioni ("title" e "explain") scrivile SEMPRE in italiano. Metti da 1 a 3 note, solo sulle cose davvero utili per capire come si passa da una lingua all\'altra (tempi verbali, casi del latino, preposizioni, ordine delle parole, falsi amici). "phrase" deve comparire identica nel testo originale. Le frasi di "practice" scrivile in ' + LANGS[from] + '.' }];
                 } else if (mode === 'math') {
                     const prob = String(p.text || '').trim().slice(0, 400);
                     if (!prob) return sendJSON(res, 400, { error: 'Scrivi l\'esercizio.' });
