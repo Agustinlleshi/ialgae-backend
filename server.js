@@ -1035,26 +1035,37 @@ const TRANSIENT_GEMINI_STATUS = [429, 500, 502, 503, 504];
 // con il nome di un altro modello Gemini (es. uno "lite"). Si usa solo quando quello
 // principale è sovraccarico (errore 503 "high demand").
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || '';
+// Quando un modello ha finito la quota del giorno (429 "quota exceeded"), è inutile
+// richiamarlo a ogni domanda: ce lo segniamo e fino all'orario indicato da Google
+// passiamo subito al modello di riserva o a Claude (risposte più veloci).
+const geminiBlockedUntil = {};
+function quotaWaitMs(msg) {
+    if (!/quota|RESOURCE_EXHAUSTED/i.test(msg || '')) return 0;
+    const m = /retry in ([\d.]+)s|"retryDelay":\s*"(\d+)s"/.exec(msg || '');
+    const sec = m ? parseFloat(m[1] || m[2]) : 0;
+    return sec > 60 ? Math.min(sec, 86400) * 1000 : 0; // solo blocchi lunghi (quota del giorno), non i picchi di un minuto
+}
 async function callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens, opts) {
     const statusOf = function (err) { const m = /^Gemini (\d+):/.exec((err && err.message) || ''); return m ? parseInt(m[1], 10) : null; };
     const wait = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
-    try {
-        return await callGemini(anthropicMessages, systemPrompt, maxTokens, opts);
-    } catch (err) {
-        let status = statusOf(err);
-        if (!status || TRANSIENT_GEMINI_STATUS.indexOf(status) === -1) throw err; // es. chiave non valida: inutile ritentare
-        console.error('Gemini ' + status + ' (probabile intoppo momentaneo), ritento tra un secondo e mezzo.');
-        await wait(1500);
-        try { return await callGemini(anthropicMessages, systemPrompt, maxTokens, opts); }
-        catch (err2) {
-            status = statusOf(err2);
-            if (GEMINI_FALLBACK_MODEL && status && TRANSIENT_GEMINI_STATUS.indexOf(status) !== -1) {
-                console.error('Gemini ancora ' + status + ': provo il modello di riserva ' + GEMINI_FALLBACK_MODEL);
-                return await callGemini(anthropicMessages, systemPrompt, maxTokens, Object.assign({}, opts || {}, { model: GEMINI_FALLBACK_MODEL }));
+    const models = [GEMINI_MODEL].concat(GEMINI_FALLBACK_MODEL ? [GEMINI_FALLBACK_MODEL] : []);
+    let lastErr = null;
+    for (const model of models) {
+        if (geminiBlockedUntil[model] && Date.now() < geminiBlockedUntil[model]) { lastErr = new Error('Gemini 429: quota del giorno finita per ' + model); continue; }
+        const o = Object.assign({}, opts || {}, { model: model });
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try { return await callGemini(anthropicMessages, systemPrompt, maxTokens, o); }
+            catch (err) {
+                lastErr = err; const status = statusOf(err);
+                if (!status || TRANSIENT_GEMINI_STATUS.indexOf(status) === -1) throw err; // es. chiave non valida
+                const block = status === 429 ? quotaWaitMs(err.message) : 0;
+                if (block) { geminiBlockedUntil[model] = Date.now() + block; console.error('Gemini ' + model + ': quota del giorno finita, lo salto per ' + Math.round(block / 60000) + ' minuti.'); break; }
+                if (attempt === 0) { console.error('Gemini ' + model + ' ' + status + ' (intoppo momentaneo), ritento tra un secondo e mezzo.'); await wait(1500); }
             }
-            throw err2;
         }
+        if (models.length > 1 && model === GEMINI_MODEL) console.error('Provo il modello Gemini di riserva: ' + GEMINI_FALLBACK_MODEL);
     }
+    throw lastErr || new Error('Gemini non disponibile');
 }
 
 // ---- Notifiche per il pannello admin (campanella) ----
@@ -1267,19 +1278,83 @@ async function runWeeklyBackupIfDue() {
 // (e volendo anche il frontend) sanno sempre quale dei due ha risposto
 // davvero. Se falliscono entrambi (o nessuno dei due è configurato), lancia
 // un errore che il chiamante trasforma in una risposta 502 per l'utente.
+// ---- Groq (riserva gratuita, veloce) ----
+// Su Render, in Environment: GROQ_API_KEY = la chiave creata su console.groq.com
+// Facoltativi: GROQ_MODEL (predefinito openai/gpt-oss-120b) e
+// GROQ_FALLBACK_MODEL (predefinito openai/gpt-oss-20b, più piccolo e con limiti più larghi).
+// Il nome esatto dei modelli si copia dalla pagina "Models" di console.groq.com.
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+const GROQ_FALLBACK_MODEL = process.env.GROQ_FALLBACK_MODEL || 'openai/gpt-oss-20b';
+const groqBlockedUntil = {};
+async function callGroqModel(model, anthropicMessages, systemPrompt, maxTokens, opts) {
+    const messages = [];
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+    anthropicMessages.forEach(function (m) {
+        const text = typeof m.content === 'string' ? m.content : (m.content || []).map(function (b) { return b.type === 'text' ? b.text : ''; }).join('\n');
+        messages.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: text });
+    });
+    const body = { model: model, messages: messages, max_tokens: Math.min(maxTokens || 2000, 4000), temperature: 0.4 };
+    if (opts && opts.json) body.response_format = { type: 'json_object' };
+    // i modelli GPT OSS "ragionano" prima di rispondere: ragionamento breve = più risposte con la quota gratuita
+    if (/gpt-oss/i.test(model)) body.reasoning_effort = 'low';
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_API_KEY },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(45000)
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        const err = new Error('Groq ' + response.status + ': ' + errText.slice(0, 400));
+        err.status = response.status;
+        err.retryAfter = Number(response.headers.get('retry-after')) || 0;
+        throw err;
+    }
+    const data = await response.json();
+    return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+}
+async function callGroq(anthropicMessages, systemPrompt, maxTokens, opts) {
+    if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY non configurata');
+    // i modelli di testo di Groq non leggono le foto: per quelle si passa a Claude
+    const hasImage = anthropicMessages.some(function (m) { return Array.isArray(m.content) && m.content.some(function (b) { return b.type === 'image'; }); });
+    if (hasImage) throw new Error('Groq: le immagini vanno a Claude');
+    let lastErr = null;
+    for (const model of [GROQ_MODEL, GROQ_FALLBACK_MODEL]) {
+        if (groqBlockedUntil[model] && Date.now() < groqBlockedUntil[model]) continue;
+        try { return await callGroqModel(model, anthropicMessages, systemPrompt, maxTokens, opts); }
+        catch (err) {
+            lastErr = err;
+            if (err.status === 401 || err.status === 403) throw err; // chiave sbagliata: inutile provare l'altro modello
+            if (err.status === 429) { const wait = err.retryAfter > 0 ? err.retryAfter * 1000 : 60000; groqBlockedUntil[model] = Date.now() + Math.min(wait, 86400000); console.error('Groq ' + model + ': limite raggiunto, lo salto per ' + Math.round(wait / 1000) + ' s.'); }
+            else console.error('Groq ' + model + ' non risponde:', err.message);
+        }
+    }
+    throw lastErr || new Error('Groq: limiti raggiunti per tutti i modelli');
+}
+
+// Ordine: Gemini → Groq (gratis) → Claude (Anthropic)
 async function getAiAnswer(anthropicMessages, systemPrompt, maxTokens, opts) {
     try {
         const answer = await callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens, opts);
         return { answer: answer, provider: 'gemini' };
     } catch (geminiErr) {
-        console.error('Gemini non disponibile, provo con Claude (Anthropic) come riserva:', geminiErr.message);
+        console.error('Gemini non disponibile:', String(geminiErr.message || '').slice(0, 300));
+        if (GROQ_API_KEY) {
+            try {
+                const answer = await callGroq(anthropicMessages, systemPrompt, maxTokens, opts);
+                return { answer: answer, provider: 'groq' };
+            } catch (groqErr) {
+                console.error('Groq non disponibile, provo con Claude:', String(groqErr.message || '').slice(0, 300));
+            }
+        }
         try {
             const answer = await callAnthropic(anthropicMessages, systemPrompt, maxTokens);
             // Non aspettiamo questa chiamata (fire and forget): non deve mai
             // rallentare la risposta vera all'utente per colpa di una notifica.
             createNotificationThrottled(
                 'ai_fallback',
-                '⚠️ Il sito sta rispondendo con Claude invece di Gemini. Probabile problema con Gemini — controlla la sua disponibilità.',
+                '⚠️ Il sito sta rispondendo con Claude invece di Gemini e Groq. Controlla quote e chiavi di Gemini e Groq.',
                 6
             );
             return { answer: answer, provider: 'anthropic' };
