@@ -104,6 +104,31 @@ const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
 const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
 // risultati dei libri tenuti in memoria per 6 ore (meno richieste a Google, più veloce)
 const booksCache = new Map();
+// Servizi utili di iAlgae Maps (farmacie, defibrillatori, fontanelle, bagni, punti di interesse):
+// il server chiede i dati a Overpass (OpenStreetMap) provando più copie pubbliche e li tiene
+// in memoria per qualche minuto, così non dipendiamo dal browser dell'utente e pesiamo meno su OSM.
+const placesCache = new Map();
+const PLACES_CACHE_MS = 15 * 60 * 1000;
+const placesRate = new Map();
+const scuolaRate = new Map();
+const OVERPASS_SERVERS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
+];
+let overpassPreferred = 0;
+const PLACES_QUERIES = {
+    pharmacy: function (a) { return 'nwr["amenity"="pharmacy"](around:' + a + ');'; },
+    aed: function (a) { return 'nwr["emergency"="defibrillator"](around:' + a + ');'; },
+    water: function (a) { return 'nwr["amenity"="drinking_water"](around:' + a + ');nwr["drinking_water"="yes"]["amenity"="fountain"](around:' + a + ');'; },
+    toilets: function (a) { return 'nwr["amenity"="toilets"]["wheelchair"~"^(yes|limited|designated)$"](around:' + a + ');'; },
+    library: function (a) { return 'nwr["amenity"="library"](around:' + a + ');'; },
+    study: function (a) { return 'nwr["amenity"~"^(coworking_space|university|college)$"](around:' + a + ');nwr["library"="study_room"](around:' + a + ');nwr["amenity"="study_room"](around:' + a + ');'; },
+    wifi: function (a) { return 'nwr["internet_access"~"^(wlan|yes)$"]["internet_access:fee"="no"](around:' + a + ');'; },
+    canteen: function (a) { return 'nwr["amenity"="canteen"](around:' + a + ');nwr["amenity"="restaurant"]["canteen"="university"](around:' + a + ');'; },
+    poi: function (a) { return 'node["amenity"~"^(restaurant|fast_food|cafe|bar|pub|fuel|bank|atm|pharmacy|hospital|clinic)$"](around:' + a + ');node["shop"](around:' + a + ');node["railway"~"^(station|subway_entrance|tram_stop)$"](around:' + a + ');node["highway"="bus_stop"](around:' + a + ');'; }
+};
 const BOOKS_CACHE_MS = 6 * 60 * 60 * 1000;
 setInterval(function () { const now = Date.now(); for (const [k, v] of booksCache) if (now - v.t > BOOKS_CACHE_MS) booksCache.delete(k); }, 60 * 60 * 1000).unref();
 // Duffel: prezzi voli reali per la pagina Viaggiare/Travel.
@@ -2297,6 +2322,9 @@ function corsOriginFor(req) {
     // tipo di indirizzo (lo assegna solo Chrome stesso a un'estensione
     // davvero installata), quindi accettarli tutti qui è sicuro.
     if (origin && origin.indexOf('chrome-extension://') === 0) return origin;
+    // iAlgae Studio per computer apre i file dal disco (origine "null"): può usare
+    // SOLO i servizi pubblici della sezione Scuola, che non usano cookie.
+    if (origin === 'null' && /^\/api\/(studio\/scuola|places-nearby|maps\/geocode)/.test(req.url || '')) return 'null';
     return ALLOWED_ORIGINS[0];
 }
 
@@ -2770,12 +2798,22 @@ const server = http.createServer((req, res) => {
                             // altri resta null e la riga del percorso si
                             // disegna di un colore solo, come prima.
                             congestione: (r.legs && r.legs[0] && r.legs[0].annotation && r.legs[0].annotation.congestion) || null,
+                            // Limite di velocità per ogni segmento (km/h; null = sconosciuto o senza limite). Solo Mapbox.
+                            limiti: (r.legs && r.legs[0] && r.legs[0].annotation && Array.isArray(r.legs[0].annotation.maxspeed))
+                                ? r.legs[0].annotation.maxspeed.map(function (m) {
+                                    if (!m || m.unknown || m.none || typeof m.speed !== 'number') return null;
+                                    return m.unit === 'mph' ? Math.round(m.speed * 1.609) : Math.round(m.speed);
+                                }) : null,
                             passi: ((r.legs && r.legs[0] && r.legs[0].steps) || []).map(function (s) {
                                 return {
                                     istruzione: s.maneuver,
                                     nome_via: s.name,
                                     distanza: s.distance,
                                     durata: s.duration,
+                                    // corsie all'incrocio della manovra: v = corsia giusta, d = frecce disegnate a terra
+                                    corsie: (s.intersections && s.intersections[0] && Array.isArray(s.intersections[0].lanes))
+                                        ? s.intersections[0].lanes.map(function (l) { return { v: !!l.valid, d: l.indications || [], a: l.valid_indication || null }; })
+                                        : null,
                                     coords: (s.geometry && s.geometry.coordinates) ? s.geometry.coordinates.map(function (c) { return [c[1], c[0]]; }) : []
                                 };
                             })
@@ -2799,7 +2837,8 @@ const server = http.createServer((req, res) => {
                         if (evitaPedaggi) esclusioni.push('toll');
                         if (evitaAutostrade) esclusioni.push('motorway');
                         const parametroExclude = esclusioni.length ? ('&exclude=' + esclusioni.join(',')) : '';
-                        const annotazioni = mapboxProfile === 'driving-traffic' ? '&annotations=congestion' : '';
+                        // maxspeed: il limite di velocità di ogni tratto (per il cartello nel navigatore)
+                        const annotazioni = mapboxProfile === 'driving-traffic' ? '&annotations=congestion,maxspeed' : '';
                         const url = 'https://api.mapbox.com/directions/v5/mapbox/' + mapboxProfile + '/' +
                             fromLon + ',' + fromLat + ';' + toLon + ',' + toLat +
                             '?access_token=' + encodeURIComponent(MAPBOX_ACCESS_TOKEN) +
@@ -6709,6 +6748,67 @@ function parseAdminDateRange(searchParams) {
     }
 
     // Endpoint iAlgae Lens: analizza un'immagine caricata + una domanda contestuale
+    // ---- iAlgae Studio · Scuola: traduttore che spiega, matematica passo per passo, lettura da foto ----
+    // Con l'account: 120 richieste all'ora. Senza (app per computer): 30 all'ora per indirizzo.
+    if (req.method === 'POST' && req.url === '/api/studio/scuola') {
+        let body = ''; let tooLarge = false;
+        req.on('data', function (chunk) { if (tooLarge) return; body += chunk; if (body.length > MAX_IMAGE_BASE64_LENGTH + 20000) { tooLarge = true; body = ''; } });
+        req.on('end', async function () {
+            if (tooLarge) return sendJSON(res, 413, { error: 'Immagine troppo grande.' });
+            try {
+                let p; try { p = JSON.parse(body || '{}'); } catch (e) { return sendJSON(res, 400, { error: 'Richiesta non valida.' }); }
+                const user = await getUserFromRequest(req).catch(function () { return null; });
+                const key = user ? 'u:' + user.sub : 'ip:' + clientIp(req);
+                if (!checkAndConsumeRateLimitMemory(scuolaRate, key, user ? 120 : 30, 60 * 60 * 1000).allowed) {
+                    return sendJSON(res, 429, { error: 'Hai fatto tante richieste: riprova tra un po\'.' });
+                }
+                if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY) return sendJSON(res, 500, { error: 'Servizio IA non configurato.' });
+                const LANGS = { en: 'inglese', la: 'latino', fr: 'francese', de: 'tedesco', es: 'spagnolo', it: 'italiano' };
+                const mode = String(p.mode || '');
+                let messages, system, maxTok = 1600;
+                if (mode === 'ocr') {
+                    const img = p.image, mt = p.mediaType || 'image/jpeg';
+                    if (!img || typeof img !== 'string') return sendJSON(res, 400, { error: 'Immagine mancante.' });
+                    if (['image/jpeg', 'image/png', 'image/webp'].indexOf(mt) === -1) return sendJSON(res, 400, { error: 'Formato immagine non supportato.' });
+                    const what = p.kind === 'math'
+                        ? 'Trascrivi SOLO l\'esercizio di matematica che si vede nella foto, in testo semplice su una riga (usa * per la moltiplicazione, / per la divisione, ^ per le potenze). Nessun commento.'
+                        : 'Trascrivi esattamente il testo che si vede nella foto (la frase o il brano evidenziato o inquadrato, se c\'è). Solo il testo, nessun commento.';
+                    messages = [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: mt, data: img } }, { type: 'text', text: what }] }];
+                    maxTok = 600;
+                } else if (mode === 'translate') {
+                    const text = String(p.text || '').trim().slice(0, 1200);
+                    const from = LANGS[p.from] ? p.from : 'en';
+                    if (!text) return sendJSON(res, 400, { error: 'Scrivi una frase da tradurre.' });
+                    system = 'Sei un insegnante di lingue paziente per studenti italiani delle medie e delle superiori. Rispondi SOLO con JSON valido, senza testo prima o dopo.';
+                    messages = [{ role: 'user', content: 'Testo in ' + LANGS[from] + ':\n"""' + text + '"""\n\n' +
+                        'Rispondi con questo JSON:\n{"translation":"traduzione naturale in italiano","level":"livello QCER stimato, es. A2","notes":[{"phrase":"parole ESATTE copiate dal testo originale","title":"nome breve della regola","explain":"spiegazione semplice in italiano, massimo 2 frasi"}],"practice":["3 frasi brevi nella stessa lingua per esercitarsi sulla stessa regola"]}\n' +
+                        'Metti da 1 a 3 note, solo sulle cose davvero utili (tempi verbali, casi del latino, preposizioni, falsi amici). "phrase" deve comparire identica nel testo originale.' }];
+                } else if (mode === 'math') {
+                    const prob = String(p.text || '').trim().slice(0, 400);
+                    if (!prob) return sendJSON(res, 400, { error: 'Scrivi l\'esercizio.' });
+                    system = 'Sei un insegnante di matematica paziente per studenti italiani. Spieghi un passaggio alla volta, con parole semplici. Rispondi SOLO con JSON valido, senza testo prima o dopo.';
+                    messages = [{ role: 'user', content: 'Esercizio: ' + prob + '\n\nRispondi con questo JSON:\n{"topic":"argomento, es. Equazioni di primo grado","steps":[{"expr":"espressione o equazione di questo passaggio, testo semplice","why":"cosa faccio e perché, 1 frase"}],"answer":"risultato finale, es. x = 4","check":"verifica del risultato, es. 2*4+6 = 14","practice":{"problem":"un esercizio simile con numeri diversi","answer":"il suo risultato"}}\nDa 3 a 8 passaggi. Usa * per moltiplicare e ^ per le potenze. Se non è un esercizio di matematica, rispondi {"error":"non è un esercizio di matematica"}.' }];
+                } else {
+                    return sendJSON(res, 400, { error: 'Modalità non valida.' });
+                }
+                let ai;
+                try { ai = await getAiAnswer(messages, system, maxTok); }
+                catch (e) { console.error('Errore IA (scuola):', e.message); return sendJSON(res, 502, { error: 'Il servizio IA non risponde. Riprova tra poco.' }); }
+                const raw = String(ai.answer || '').trim();
+                if (mode === 'ocr') return sendJSON(res, 200, { text: raw.replace(/^```\w*\n?|```$/g, '').trim().slice(0, 1500) });
+                let j = null;
+                try { const m = raw.match(/\{[\s\S]*\}/); j = JSON.parse(m ? m[0] : raw); } catch (e) { j = null; }
+                if (!j) return sendJSON(res, 502, { error: 'Risposta non valida, riprova.' });
+                if (j.error) return sendJSON(res, 422, { error: String(j.error) });
+                return sendJSON(res, 200, j);
+            } catch (err) {
+                console.error('Errore interno (scuola):', err);
+                return sendJSON(res, 500, { error: 'Errore interno del server.' });
+            }
+        });
+        return;
+    }
+
     if (req.method === 'POST' && req.url === '/api/vision') {
         let body = '';
         let tooLarge = false;
@@ -6831,6 +6931,53 @@ function parseAdminDateRange(searchParams) {
     // chiave bloccata o scaduta), proviamo Google Books senza chiave e poi
     // Open Library (gratis, senza chiave), restituendo i risultati nello stesso
     // formato: la pagina results.html non si accorge della differenza.
+    if (req.method === 'GET' && req.url.indexOf('/api/places-nearby') === 0) {
+        (async function () {
+            try {
+                const u = new URL(req.url, 'http://localhost');
+                const kind = u.searchParams.get('kind');
+                const lat = Number(u.searchParams.get('lat')), lon = Number(u.searchParams.get('lon'));
+                let r = Math.round(Number(u.searchParams.get('r')) || 1000);
+                if (!PLACES_QUERIES[kind] || !isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return sendJSON(res, 400, { error: 'Richiesta non valida' });
+                r = Math.min(kind === 'poi' ? 1200 : 5000, Math.max(300, Math.round(r / 100) * 100));
+                // stessa zona (circa 100 m) = stessa risposta dalla memoria
+                const key = kind + ':' + lat.toFixed(3) + ':' + lon.toFixed(3) + ':' + r;
+                const hit = placesCache.get(key);
+                if (hit && Date.now() - hit.t < PLACES_CACHE_MS) return sendJSON(res, 200, { elements: hit.elements, cached: true });
+                const ip = clientIp(req);
+                if (!checkAndConsumeRateLimitMemory(placesRate, ip, 60, 10 * 60 * 1000).allowed) return sendJSON(res, 429, { error: 'Troppe richieste, riprova tra poco' });
+                const limit = kind === 'poi' ? 70 : 150;
+                const query = '[out:json][timeout:15];(' + PLACES_QUERIES[kind](r + ',' + lat.toFixed(5) + ',' + lon.toFixed(5)) + ');out center ' + limit + ';';
+                const order = OVERPASS_SERVERS.map(function (_, i) { return (overpassPreferred + i) % OVERPASS_SERVERS.length; });
+                for (const i of order) {
+                    try {
+                        const resp = await fetch(OVERPASS_SERVERS[i], {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'iAlgae-Maps/1.0 (https://www.ialgae.com)' },
+                            body: 'data=' + encodeURIComponent(query),
+                            signal: AbortSignal.timeout(12000)
+                        });
+                        if (!resp.ok) { console.error('Overpass ' + OVERPASS_SERVERS[i] + ' HTTP ' + resp.status); continue; }
+                        const data = await resp.json();
+                        if (!data || !Array.isArray(data.elements)) continue;
+                        if (data.remark && !data.elements.length && /runtime error|timed out|out of memory/i.test(data.remark)) { console.error('Overpass ' + OVERPASS_SERVERS[i] + ': ' + data.remark); continue; }
+                        overpassPreferred = i;
+                        // teniamo solo quello che serve alla pagina
+                        const elements = data.elements.map(function (e) { return { type: e.type, lat: e.lat, lon: e.lon, center: e.center, tags: e.tags || {} }; });
+                        if (placesCache.size > 800) placesCache.delete(placesCache.keys().next().value);
+                        placesCache.set(key, { t: Date.now(), elements: elements });
+                        return sendJSON(res, 200, { elements: elements });
+                    } catch (e) { console.error('Overpass ' + OVERPASS_SERVERS[i] + ' errore:', e.message); }
+                }
+                return sendJSON(res, 503, { error: 'Servizio dei dati pubblici non disponibile' });
+            } catch (err) {
+                console.error('Errore endpoint /api/places-nearby:', err);
+                return sendJSON(res, 500, { error: 'Errore interno' });
+            }
+        })();
+        return;
+    }
+
     if (req.method === 'GET' && req.url.indexOf('/api/books') === 0) {
         (async function () {
             try {
