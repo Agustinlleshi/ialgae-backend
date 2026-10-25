@@ -2324,7 +2324,7 @@ function corsOriginFor(req) {
     if (origin && origin.indexOf('chrome-extension://') === 0) return origin;
     // iAlgae Studio per computer apre i file dal disco (origine "null"): può usare
     // SOLO i servizi pubblici della sezione Scuola, che non usano cookie.
-    if (origin === 'null' && /^\/api\/(studio\/scuola|places-nearby|maps\/geocode)/.test(req.url || '')) return 'null';
+    if (origin === 'null' && /^\/api\/(studio\/(scuola|azienda)|places-nearby|maps\/geocode)/.test(req.url || '')) return 'null';
     return ALLOWED_ORIGINS[0];
 }
 
@@ -6750,7 +6750,7 @@ function parseAdminDateRange(searchParams) {
     // Endpoint iAlgae Lens: analizza un'immagine caricata + una domanda contestuale
     // ---- iAlgae Studio · Scuola: traduttore che spiega, matematica passo per passo, lettura da foto ----
     // Con l'account: 120 richieste all'ora. Senza (app per computer): 30 all'ora per indirizzo.
-    if (req.method === 'POST' && req.url === '/api/studio/scuola') {
+    if (req.method === 'POST' && (req.url === '/api/studio/scuola' || req.url === '/api/studio/azienda')) {
         let body = ''; let tooLarge = false;
         req.on('data', function (chunk) { if (tooLarge) return; body += chunk; if (body.length > MAX_IMAGE_BASE64_LENGTH + 20000) { tooLarge = true; body = ''; } });
         req.on('end', async function () {
@@ -6763,7 +6763,8 @@ function parseAdminDateRange(searchParams) {
                     return sendJSON(res, 429, { error: 'Hai fatto tante richieste: riprova tra un po\'.' });
                 }
                 if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY) return sendJSON(res, 500, { error: 'Servizio IA non configurato.' });
-                const LANGS = { it: 'italiano', en: 'inglese', la: 'latino', fr: 'francese', de: 'tedesco', es: 'spagnolo', pt: 'portoghese', ro: 'rumeno', sq: 'albanese', uk: 'ucraino', ar: 'arabo', zh: 'cinese' };
+                // le stesse lingue della pagina Traduttore
+                const LANGS = {"sq": "albanese", "it": "italiano", "en": "inglese", "fr": "francese", "de": "tedesco", "es": "spagnolo", "pt": "portoghese", "ru": "russo", "ja": "giapponese", "zh": "cinese", "ar": "arabo", "hi": "hindi", "ko": "coreano", "af": "afrikaans", "am": "amarico", "ha": "hausa", "ig": "igbo", "rw": "kinyarwanda", "st": "sesotho", "sn": "shona", "sw": "swahili", "xh": "xhosa", "yo": "yoruba", "zu": "zulu", "hy": "armeno", "eu": "basco", "be": "bielorusso", "bs": "bosniaco", "bg": "bulgaro", "ca": "catalano", "co": "corso", "hr": "croato", "cs": "ceco", "da": "danese", "nl": "olandese", "eo": "esperanto", "et": "estone", "fi": "finlandese", "fy": "frisone", "gl": "galiziano", "ka": "georgiano", "el": "greco", "ga": "irlandese", "is": "islandese", "la": "latino", "lv": "lettone", "lt": "lituano", "lb": "lussemburghese", "mk": "macedone", "mt": "maltese", "no": "norvegese", "pl": "polacco", "ro": "rumeno", "gd": "gaelico scozzese", "sr": "serbo", "sk": "slovacco", "sl": "sloveno", "sv": "svedese", "uk": "ucraino", "hu": "ungherese", "az": "azero", "bn": "bengalese", "my": "birmano", "ceb": "cebuano", "jw": "giavanese", "gu": "gujarati", "he": "ebraico", "hmn": "hmong", "id": "indonesiano", "kn": "kannada", "kk": "kazako", "km": "khmer", "ky": "kirghiso", "ku": "curdo", "lo": "lao", "ml": "malayalam", "ms": "malese", "mr": "marathi", "mn": "mongolo", "ne": "nepalese", "or": "odia", "ps": "pashto", "fa": "persiano", "pa": "punjabi", "sd": "sindhi", "si": "singalese", "su": "sundanese", "tl": "tagalog", "tg": "tagiko", "ta": "tamil", "tt": "tataro", "te": "telugu", "th": "tailandese", "tr": "turco", "tk": "turkmeno", "ug": "uiguro", "ur": "urdu", "uz": "uzbeko", "vi": "vietnamita", "mi": "maori", "sm": "samoano", "haw": "hawaiano", "ht": "haitiano", "ny": "chichewa", "yi": "yiddish", "cy": "gallese"};
                 const mode = String(p.mode || '');
                 let messages, system, maxTok = 1600;
                 if (mode === 'ocr') {
@@ -6777,14 +6778,24 @@ function parseAdminDateRange(searchParams) {
                     maxTok = 600;
                 } else if (mode === 'translate') {
                     const text = String(p.text || '').trim().slice(0, 1200);
-                    const from = LANGS[p.from] ? p.from : 'en';
+                    const from = p.from === 'auto' ? 'auto' : (LANGS[p.from] ? p.from : 'en');
                     let to = LANGS[p.to] ? p.to : 'it';
                     if (to === from) to = from === 'it' ? 'en' : 'it';
+                    const auto = from === 'auto';
                     if (!text) return sendJSON(res, 400, { error: 'Scrivi una frase da tradurre.' });
                     system = 'Sei un insegnante di lingue paziente per studenti italiani delle medie e delle superiori. Rispondi SOLO con JSON valido, senza testo prima o dopo.';
-                    messages = [{ role: 'user', content: 'Testo in ' + LANGS[from] + ':\n"""' + text + '"""\n\n' +
-                        'Traducilo in ' + LANGS[to] + '.\n\nRispondi con questo JSON:\n{"translation":"traduzione naturale in ' + LANGS[to] + '","level":"livello QCER stimato, es. A2","notes":[{"phrase":"parole ESATTE copiate dal testo originale","title":"nome breve della regola","explain":"spiegazione semplice in italiano, massimo 2 frasi"}],"practice":["3 frasi brevi nella stessa lingua per esercitarsi sulla stessa regola"]}\n' +
-                        'Le spiegazioni ("title" e "explain") scrivile SEMPRE in italiano. Metti da 1 a 3 note, solo sulle cose davvero utili per capire come si passa da una lingua all\'altra (tempi verbali, casi del latino, preposizioni, ordine delle parole, falsi amici). "phrase" deve comparire identica nel testo originale. Le frasi di "practice" scrivile in ' + LANGS[from] + '.' }];
+                    messages = [{ role: 'user', content: (auto ? 'Testo (riconosci tu in che lingua è scritto):' : 'Testo in ' + LANGS[from] + ':') + '\n"""' + text + '"""\n\n' +
+                        'Traducilo in ' + LANGS[to] + '.\n\nRispondi con questo JSON:\n{' + (auto ? '"detectedCode":"codice ISO 639-1 della lingua del testo, es. en","detected":"nome della lingua in italiano",' : '') + '"translation":"traduzione naturale in ' + LANGS[to] + '","level":"livello QCER stimato, es. A2","notes":[{"phrase":"parole ESATTE copiate dal testo originale","title":"nome breve della regola","explain":"spiegazione semplice in italiano, massimo 2 frasi"}],"practice":["3 frasi brevi nella stessa lingua per esercitarsi sulla stessa regola"]}\n' +
+                        'Le spiegazioni ("title" e "explain") scrivile SEMPRE in italiano. Metti da 1 a 3 note, solo sulle cose davvero utili per capire come si passa da una lingua all\'altra (tempi verbali, casi del latino, preposizioni, ordine delle parole, falsi amici). "phrase" deve comparire identica nel testo originale. Le frasi di "practice" scrivile ' + (auto ? 'nella stessa lingua del testo originale' : 'in ' + LANGS[from]) + '.' }];
+                } else if (mode === 'quote') {
+                    // Preventivi: l'IA prepara SOLO le voci e le quantità. I prezzi li mette l'utente.
+                    const job = String(p.text || '').trim().slice(0, 1500);
+                    if (!job) return sendJSON(res, 400, { error: 'Descrivi il lavoro da fare.' });
+                    system = 'Aiuti piccoli artigiani e imprese italiane a scrivere preventivi chiari. Rispondi SOLO con JSON valido, senza testo prima o dopo.';
+                    messages = [{ role: 'user', content: 'Lavoro descritto dal professionista:\n"""' + job + '"""\n\n' +
+                        'Rispondi con questo JSON:\n{"title":"titolo breve del lavoro, max 6 parole","items":[{"desc":"voce del preventivo, breve e chiara","detail":"dettaglio facoltativo, max 6 parole","qty":numero,"unit":"unità, es. m², ore, pz, stanze, a corpo"}]}\n' +
+                        'Da 3 a 10 voci, in italiano, nell\'ordine in cui si fa il lavoro. Usa le quantità scritte nella descrizione; se non ci sono metti 1 e unità "a corpo". NON scrivere prezzi né importi. Se il testo non descrive un lavoro, rispondi {"error":"descrivi il lavoro da fare"}.' }];
+                    maxTok = 1200;
                 } else if (mode === 'math') {
                     const prob = String(p.text || '').trim().slice(0, 400);
                     if (!prob) return sendJSON(res, 400, { error: 'Scrivi l\'esercizio.' });
