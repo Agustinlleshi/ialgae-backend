@@ -1005,7 +1005,8 @@ async function callGemini(anthropicMessages, systemPrompt, maxTokens, opts) {
     if (opts && opts.json) requestBody.generationConfig.responseMimeType = 'application/json';
     if (systemPrompt) requestBody.systemInstruction = { parts: [{ text: systemPrompt }] };
 
-    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_API_KEY;
+    const model = (opts && opts.model) || GEMINI_MODEL;
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + GEMINI_API_KEY;
     const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1030,18 +1031,29 @@ async function callGemini(anthropicMessages, systemPrompt, maxTokens, opts) {
 // di sprecare la riserva per un problema che si sarebbe risolto da sé.
 const TRANSIENT_GEMINI_STATUS = [429, 500, 502, 503, 504];
 
+// Modello di riserva (facoltativo): su Render, in Environment, aggiungi GEMINI_FALLBACK_MODEL
+// con il nome di un altro modello Gemini (es. uno "lite"). Si usa solo quando quello
+// principale è sovraccarico (errore 503 "high demand").
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || '';
 async function callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens, opts) {
+    const statusOf = function (err) { const m = /^Gemini (\d+):/.exec((err && err.message) || ''); return m ? parseInt(m[1], 10) : null; };
+    const wait = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
     try {
         return await callGemini(anthropicMessages, systemPrompt, maxTokens, opts);
     } catch (err) {
-        const match = /^Gemini (\d+):/.exec(err.message || '');
-        const status = match ? parseInt(match[1], 10) : null;
-        if (status && TRANSIENT_GEMINI_STATUS.indexOf(status) !== -1) {
-            console.error('Gemini ' + status + ' (probabile intoppo momentaneo), ritento tra mezzo secondo:', err.message);
-            await new Promise(function (resolve) { setTimeout(resolve, 500); });
-            return await callGemini(anthropicMessages, systemPrompt, maxTokens, opts);
+        let status = statusOf(err);
+        if (!status || TRANSIENT_GEMINI_STATUS.indexOf(status) === -1) throw err; // es. chiave non valida: inutile ritentare
+        console.error('Gemini ' + status + ' (probabile intoppo momentaneo), ritento tra un secondo e mezzo.');
+        await wait(1500);
+        try { return await callGemini(anthropicMessages, systemPrompt, maxTokens, opts); }
+        catch (err2) {
+            status = statusOf(err2);
+            if (GEMINI_FALLBACK_MODEL && status && TRANSIENT_GEMINI_STATUS.indexOf(status) !== -1) {
+                console.error('Gemini ancora ' + status + ': provo il modello di riserva ' + GEMINI_FALLBACK_MODEL);
+                return await callGemini(anthropicMessages, systemPrompt, maxTokens, Object.assign({}, opts || {}, { model: GEMINI_FALLBACK_MODEL }));
+            }
+            throw err2;
         }
-        throw err; // errore non transitorio (es. chiave mancante/non valida): non ha senso ritentare
     }
 }
 
