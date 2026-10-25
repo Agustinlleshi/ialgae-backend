@@ -994,13 +994,15 @@ async function callAnthropic(anthropicMessages, systemPrompt, maxTokens) {
 
 // Chiama Gemini (Google) con lo stesso formato di messaggi, convertito da
 // toGeminiContents(). Usato SOLO come riserva quando Anthropic non risponde.
-async function callGemini(anthropicMessages, systemPrompt, maxTokens) {
+async function callGemini(anthropicMessages, systemPrompt, maxTokens, opts) {
     if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY non configurata');
 
     const requestBody = {
         contents: toGeminiContents(anthropicMessages),
         generationConfig: { maxOutputTokens: maxTokens || 2000 }
     };
+    // risposte che devono essere JSON (Studio · Scuola e Azienda): Gemini le restituisce già pulite
+    if (opts && opts.json) requestBody.generationConfig.responseMimeType = 'application/json';
     if (systemPrompt) requestBody.systemInstruction = { parts: [{ text: systemPrompt }] };
 
     const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_API_KEY;
@@ -1028,16 +1030,16 @@ async function callGemini(anthropicMessages, systemPrompt, maxTokens) {
 // di sprecare la riserva per un problema che si sarebbe risolto da sé.
 const TRANSIENT_GEMINI_STATUS = [429, 500, 502, 503, 504];
 
-async function callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens) {
+async function callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens, opts) {
     try {
-        return await callGemini(anthropicMessages, systemPrompt, maxTokens);
+        return await callGemini(anthropicMessages, systemPrompt, maxTokens, opts);
     } catch (err) {
         const match = /^Gemini (\d+):/.exec(err.message || '');
         const status = match ? parseInt(match[1], 10) : null;
         if (status && TRANSIENT_GEMINI_STATUS.indexOf(status) !== -1) {
             console.error('Gemini ' + status + ' (probabile intoppo momentaneo), ritento tra mezzo secondo:', err.message);
             await new Promise(function (resolve) { setTimeout(resolve, 500); });
-            return await callGemini(anthropicMessages, systemPrompt, maxTokens);
+            return await callGemini(anthropicMessages, systemPrompt, maxTokens, opts);
         }
         throw err; // errore non transitorio (es. chiave mancante/non valida): non ha senso ritentare
     }
@@ -1253,9 +1255,9 @@ async function runWeeklyBackupIfDue() {
 // (e volendo anche il frontend) sanno sempre quale dei due ha risposto
 // davvero. Se falliscono entrambi (o nessuno dei due è configurato), lancia
 // un errore che il chiamante trasforma in una risposta 502 per l'utente.
-async function getAiAnswer(anthropicMessages, systemPrompt, maxTokens) {
+async function getAiAnswer(anthropicMessages, systemPrompt, maxTokens, opts) {
     try {
-        const answer = await callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens);
+        const answer = await callGeminiWithRetry(anthropicMessages, systemPrompt, maxTokens, opts);
         return { answer: answer, provider: 'gemini' };
     } catch (geminiErr) {
         console.error('Gemini non disponibile, provo con Claude (Anthropic) come riserva:', geminiErr.message);
@@ -6788,14 +6790,31 @@ function parseAdminDateRange(searchParams) {
                         'Traducilo in ' + LANGS[to] + '.\n\nRispondi con questo JSON:\n{' + (auto ? '"detectedCode":"codice ISO 639-1 della lingua del testo, es. en","detected":"nome della lingua in italiano",' : '') + '"translation":"traduzione naturale in ' + LANGS[to] + '","level":"livello QCER stimato, es. A2","notes":[{"phrase":"parole ESATTE copiate dal testo originale","title":"nome breve della regola","explain":"spiegazione semplice in italiano, massimo 2 frasi"}],"practice":["3 frasi brevi nella stessa lingua per esercitarsi sulla stessa regola"]}\n' +
                         'Le spiegazioni ("title" e "explain") scrivile SEMPRE in italiano. Metti da 1 a 3 note, solo sulle cose davvero utili per capire come si passa da una lingua all\'altra (tempi verbali, casi del latino, preposizioni, ordine delle parole, falsi amici). "phrase" deve comparire identica nel testo originale. Le frasi di "practice" scrivile ' + (auto ? 'nella stessa lingua del testo originale' : 'in ' + LANGS[from]) + '.' }];
                 } else if (mode === 'quote') {
-                    // Preventivi: l'IA prepara SOLO le voci e le quantità. I prezzi li mette l'utente.
-                    const job = String(p.text || '').trim().slice(0, 1500);
+                    // Preventivi: l'IA prepara le voci e le quantità. NON inventa prezzi:
+                    // se l'utente indica un importo da raggiungere, dà solo il "peso" di ogni voce
+                    // e lo Studio divide quell'importo (dell'utente) tra le voci.
+                    const job = String(p.text || '').trim().slice(0, 2500);
                     if (!job) return sendJSON(res, 400, { error: 'Descrivi il lavoro da fare.' });
-                    system = 'Aiuti piccoli artigiani e imprese italiane a scrivere preventivi chiari. Rispondi SOLO con JSON valido, senza testo prima o dopo.';
-                    messages = [{ role: 'user', content: 'Lavoro descritto dal professionista:\n"""' + job + '"""\n\n' +
-                        'Rispondi con questo JSON:\n{"title":"titolo breve del lavoro, max 6 parole","items":[{"desc":"voce del preventivo, breve e chiara","detail":"dettaglio facoltativo, max 6 parole","qty":numero,"unit":"unità, es. m², ore, pz, stanze, a corpo"}]}\n' +
-                        'Da 3 a 10 voci, in italiano, nell\'ordine in cui si fa il lavoro. Usa le quantità scritte nella descrizione; se non ci sono metti 1 e unità "a corpo". NON scrivere prezzi né importi. Se il testo non descrive un lavoro, rispondi {"error":"descrivi il lavoro da fare"}.' }];
-                    maxTok = 1200;
+                    system = 'Aiuti piccoli artigiani e imprese italiane a scrivere preventivi chiari e ordinati. Rispondi SOLO con JSON valido.';
+                    messages = [{ role: 'user', content: 'Lavoro descritto dal professionista (può essere scritto di fretta, con errori):\n"""' + job + '"""\n\n' +
+                        'Rispondi con questo JSON:\n{"title":"titolo breve del lavoro, max 6 parole","budget":null,"items":[{"desc":"voce del preventivo, breve e chiara","detail":"dettaglio facoltativo, max 8 parole","qty":1,"unit":"a corpo","share":10}]}\n' +
+                        'Regole:\n- Da 3 a 14 voci in italiano, nell\'ordine in cui si fa il lavoro. Una voce per ogni lavorazione nominata (es. demolizioni, pavimenti, bagno, porte, finestre, tinteggiatura, battiscopa, impianto elettrico, impianto idraulico, smaltimento macerie).\n' +
+                        '- qty e unit: usa quelle scritte nel testo; se non ci sono metti qty 1 e unit "a corpo".\n' +
+                        '- "budget": se il professionista scrive un importo totale da raggiungere (es. "arrivare a 55.000"), mettilo come numero (55000), altrimenti null.\n' +
+                        '- "share": quanto pesa ogni voce sul costo totale, in percentuale; la somma di tutte le "share" deve fare 100. È solo una proporzione indicativa, NON un prezzo.\n' +
+                        '- NON scrivere prezzi né importi in euro dentro le voci.\n' +
+                        'Se il testo non descrive un lavoro, rispondi {"error":"descrivi il lavoro da fare"}.' }];
+                    maxTok = 6000;
+                } else if (mode === 'minutes') {
+                    // Verbali: dagli appunti (o dalla dettatura) a riassunto, decisioni e compiti
+                    const notes = String(p.text || '').trim().slice(0, 12000);
+                    if (notes.length < 20) return sendJSON(res, 400, { error: 'Incolla o detta gli appunti della riunione.' });
+                    const who = String(p.people || '').slice(0, 300), when = String(p.date || '').slice(0, 30);
+                    system = 'Scrivi verbali di riunione chiari e fedeli per piccole aziende italiane. Usa SOLO quello che c\'è negli appunti: non inventare decisioni, nomi, date o numeri. Rispondi SOLO con JSON valido.';
+                    messages = [{ role: 'user', content: (who ? 'Partecipanti: ' + who + '\n' : '') + (when ? 'Data della riunione: ' + when + '\n' : '') + 'Appunti:\n"""' + notes + '"""\n\n' +
+                        'Rispondi con questo JSON:\n{"title":"argomento della riunione, max 8 parole","summary":"riassunto in 2-4 frasi","decisions":["decisione presa"],"tasks":[{"what":"cosa fare","who":"chi lo fa, o \'\' se non detto","due":"entro quando, o \'\' se non detto"}],"open":["questione rimasta aperta"]}\n' +
+                        'Scrivi in italiano semplice. Se una cosa non è stata decisa, mettila in "open" e non in "decisions". Le scadenze lasciale come sono state dette (es. "venerdì", "entro il 10").' }];
+                    maxTok = 6000;
                 } else if (mode === 'math') {
                     const prob = String(p.text || '').trim().slice(0, 400);
                     if (!prob) return sendJSON(res, 400, { error: 'Scrivi l\'esercizio.' });
@@ -6805,13 +6824,22 @@ function parseAdminDateRange(searchParams) {
                     return sendJSON(res, 400, { error: 'Modalità non valida.' });
                 }
                 let ai;
-                try { ai = await getAiAnswer(messages, system, maxTok); }
+                // il modello "pensa" prima di rispondere e il pensiero consuma token: ne lasciamo parecchi,
+                // altrimenti con le richieste lunghe la risposta arriva tagliata a metà
+                try { ai = await getAiAnswer(messages, system, mode === 'ocr' ? Math.max(maxTok, 2000) : Math.max(maxTok, 6000), mode === 'ocr' ? null : { json: true }); }
                 catch (e) { console.error('Errore IA (scuola):', e.message); return sendJSON(res, 502, { error: 'Il servizio IA non risponde. Riprova tra poco.' }); }
                 const raw = String(ai.answer || '').trim();
                 if (mode === 'ocr') return sendJSON(res, 200, { text: raw.replace(/^```\w*\n?|```$/g, '').trim().slice(0, 1500) });
                 let j = null;
                 try { const m = raw.match(/\{[\s\S]*\}/); j = JSON.parse(m ? m[0] : raw); } catch (e) { j = null; }
-                if (!j) return sendJSON(res, 502, { error: 'Risposta non valida, riprova.' });
+                // risposta tagliata? recuperiamo almeno le voci complete (preventivi e verbali)
+                if (!j && (mode === 'quote' || mode === 'minutes')) {
+                    const objs = (raw.match(/\{[^{}\[\]]*\}/g) || []).map(function (x) { try { return JSON.parse(x); } catch (e) { return null; } }).filter(Boolean);
+                    const t = /"title"\s*:\s*"([^"]{1,120})"/.exec(raw);
+                    if (mode === 'quote') { const it = objs.filter(function (o) { return o.desc; }); if (it.length) { const bg = /"budget"\s*:\s*(\d+(?:\.\d+)?)/.exec(raw); j = { title: t ? t[1] : '', budget: bg ? Number(bg[1]) : null, items: it, partial: true }; } }
+                    else { const tk = objs.filter(function (o) { return o.what; }); const sm = /"summary"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(raw); if (sm || tk.length) j = { title: t ? t[1] : '', summary: sm ? JSON.parse('"' + sm[1] + '"') : '', decisions: [], tasks: tk, partial: true }; }
+                }
+                if (!j) { console.error('Risposta IA non valida (' + mode + '):', raw.slice(0, 300)); return sendJSON(res, 502, { error: 'La risposta è arrivata incompleta. Riprova: di solito la seconda volta va.' }); }
                 if (j.error) return sendJSON(res, 422, { error: String(j.error) });
                 return sendJSON(res, 200, j);
             } catch (err) {
