@@ -346,21 +346,6 @@ const memory2faAttempts = new Map(); // userId -> { count, windowStart }
 // giorno non tengono sveglio il database in continuazione (che su Neon,
 // sul piano gratuito, si traduce in ore di calcolo consumate inutilmente).
 const pendingDurations = new Map(); // page_view id -> durationMs
-// Ricerche in attesa di essere scritte (come per le durate: un'unica query
-// ogni 5 minuti). Chiave "giorno|tipo|parola" -> quante volte.
-const pendingSearchTerms = new Map();
-function noteSearchTerm(q, kind, ua) {
-    try {
-        let t = String(q || '').toLowerCase().replace(/\s+/g, ' ').trim();
-        if (t.length < 2 || t.length > 80) return;
-        if (/@|\d{6,}|https?:|www\./.test(t)) return; // email, telefoni, indirizzi web: mai salvati
-        if (analyticsDetectBot(ua, null).isBot) return;
-        const day = new Date().toISOString().slice(0, 10);
-        const key = day + '|' + kind + '|' + t;
-        pendingSearchTerms.set(key, (pendingSearchTerms.get(key) || 0) + 1);
-        if (pendingSearchTerms.size > 5000) pendingSearchTerms.clear(); // protezione memoria
-    } catch (e) { /* mai bloccante */ }
-}
 
 // Segnalazioni stradali (tabella map_reports / endpoint /api/maps/reports):
 // se il database non è configurato, ripiego in memoria.
@@ -556,28 +541,6 @@ async function initDb() {
     // combinato con altri dati potrebbe rendere una persona identificabile.
     // Qui vogliamo solo capire "quanti visitatori usano il telefono", non chi sono.
     await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS device TEXT');
-    // Statistiche dettagliate (stile Google Analytics). Anche qui MAI lo
-    // User-Agent completo né l'IP: solo la "famiglia" del browser e del
-    // sistema (es. "Chrome", "Android"), la lingua a 2 lettere, il sito da cui
-    // si arriva (solo il dominio, es. "google.com") e se la visita è di un robot.
-    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS browser TEXT');
-    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS os TEXT');
-    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS device_type TEXT');
-    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS lang TEXT');
-    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS source TEXT');
-    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS ref_host TEXT');
-    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS is_bot BOOLEAN');
-    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS bot_kind TEXT');
-    await pool.query('ALTER TABLE page_views ADD COLUMN IF NOT EXISTS bot_name TEXT');
-    await pool.query('CREATE INDEX IF NOT EXISTS idx_page_views_visitor ON page_views (visitor_id)');
-    // Dispositivi del proprietario del sito da NON contare nelle statistiche
-    // (il pulsante "Non contare questo dispositivo" nella pagina statistiche).
-    // Parole cercate su iAlgae: solo il testo della ricerca (normalizzato) e
-    // quante volte è stato cercato in quel giorno. Nessun collegamento con chi
-    // l'ha cercato. Nella pagina statistiche compaiono solo le ricerche fatte
-    // almeno 3 volte, e mai quelle che sembrano email o numeri di telefono.
-    await pool.query('CREATE TABLE IF NOT EXISTS search_terms (day DATE NOT NULL, term TEXT NOT NULL, kind TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, term, kind))');
-    await pool.query('CREATE TABLE IF NOT EXISTS analytics_excluded (visitor_id TEXT PRIMARY KEY, label TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())');
 
     // Download di iAlgae Core (per la dashboard): una riga per ogni clic su
     // "Scarica per Mac" / "Scarica per Windows" nella pagina browser.html.
@@ -1953,11 +1916,11 @@ async function getGeoForIp(ip) {
 
     try {
         const response = await fetch(
-            'http://ip-api.com/json/' + encodeURIComponent(ip) + '?fields=status,country,countryCode,city,lat,lon,hosting,isp,org'
+            'http://ip-api.com/json/' + encodeURIComponent(ip) + '?fields=status,country,countryCode,city,lat,lon'
         );
         const json = await response.json();
         const data = (json.status === 'success')
-            ? { country: json.country || null, countryCode: json.countryCode || null, city: json.city || null, lat: json.lat != null ? json.lat : null, lon: json.lon != null ? json.lon : null, hosting: json.hosting === true, org: (json.org || json.isp || '').toString().slice(0, 80) || null }
+            ? { country: json.country || null, countryCode: json.countryCode || null, city: json.city || null, lat: json.lat != null ? json.lat : null, lon: json.lon != null ? json.lon : null }
             : empty;
         geoIpCache.set(ip, { data: data, timestamp: Date.now() });
         return data;
@@ -2410,85 +2373,6 @@ function guessDeviceName(ua) {
     const br = /iAlgaeCore/.test(ua) ? 'iAlgae Core' : /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' :
         /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : '';
     return br ? os + ' · ' + br : os;
-}
-
-
-// ------------------------------------------------------------
-// STATISTICHE DETTAGLIATE: riconoscimento browser, sistema, robot e
-// provenienza. Tutto viene ridotto a poche categorie fisse prima di essere
-// salvato, così nel database non finisce mai niente che identifichi qualcuno.
-// ------------------------------------------------------------
-function analyticsParseUA(ua) {
-    ua = String(ua || '');
-    let browser = 'Altro';
-    if (/iAlgaeCore\//.test(ua)) browser = 'iAlgae Core';
-    else if (/Edg(e|A|iOS)?\//.test(ua)) browser = 'Edge';
-    else if (/OPR\/|Opera/.test(ua)) browser = 'Opera';
-    else if (/SamsungBrowser\//.test(ua)) browser = 'Samsung Internet';
-    else if (/Firefox\/|FxiOS\//.test(ua)) browser = 'Firefox';
-    else if (/Chrome\/|CriOS\//.test(ua)) browser = 'Chrome';
-    else if (/Safari\//.test(ua) && /Version\//.test(ua)) browser = 'Safari';
-    let os = 'Altro';
-    if (/Windows/.test(ua)) os = 'Windows';
-    else if (/Android/.test(ua)) os = 'Android';
-    else if (/iPhone|iPad|iPod/.test(ua)) os = 'iOS';
-    else if (/Mac OS X|Macintosh/.test(ua)) os = 'macOS';
-    else if (/CrOS/.test(ua)) os = 'ChromeOS';
-    else if (/Linux/.test(ua)) os = 'Linux';
-    let deviceType = 'desktop';
-    if (/iPad|Tablet/.test(ua) || (/Android/.test(ua) && !/Mobile/.test(ua))) deviceType = 'tablet';
-    else if (/Mobi|iPhone|iPod|Android/.test(ua)) deviceType = 'mobile';
-    return { browser: browser, os: os, deviceType: deviceType };
-}
-
-const ANALYTICS_SEARCH_BOTS = [
-    [/Googlebot|Google-InspectionTool|GoogleOther|AdsBot-Google|Mediapartners-Google|Google-Read-Aloud|Storebot-Google/i, 'Google'],
-    [/bingbot|BingPreview|msnbot|adidxbot/i, 'Bing'],
-    [/DuckDuckBot|DuckAssistBot/i, 'DuckDuckGo'],
-    [/YandexBot|YandexRenderResourcesBot/i, 'Yandex'],
-    [/Baiduspider/i, 'Baidu'],
-    [/Applebot/i, 'Apple'],
-    [/Slurp/i, 'Yahoo'],
-    [/PetalBot/i, 'Petal (Huawei)'],
-    [/SeznamBot/i, 'Seznam'],
-    [/Qwantify|Qwantbot/i, 'Qwant']
-];
-// Provider di server "cloud": una visita da qui con un browser normale è
-// quasi sempre un programma automatico. NON ci sono Cloudflare, Akamai e
-// Fastly perché li usano anche servizi di privacy per persone vere (es.
-// iCloud Private Relay di Apple).
-const ANALYTICS_CLOUD_ORGS = /amazon|aws|google llc|google cloud|microsoft|azure|digitalocean|hetzner|ovh|linode|oracle|alibaba|tencent|huawei cloud|contabo|vultr|choopa|scaleway|leaseweb|hostinger|ionos|datacamp|m247|upcloud|kamatera/i;
-
-function analyticsDetectBot(ua, geo) {
-    ua = String(ua || '');
-    for (const [re, name] of ANALYTICS_SEARCH_BOTS) {
-        if (re.test(ua)) return { isBot: true, kind: 'search', name: name };
-    }
-    const m = /([A-Za-z0-9_-]*(?:bot|crawler|spider))/i.exec(ua);
-    if (m || /HeadlessChrome|Lighthouse|PageSpeed|facebookexternalhit|python|curl\/|wget|axios|node-fetch|undici|Go-http|Java\/|okhttp|PhantomJS|Selenium|Puppeteer|Playwright|scrapy/i.test(ua) || !ua) {
-        const name = m ? m[1] : (/HeadlessChrome|Puppeteer|Playwright|Selenium|PhantomJS/i.test(ua) ? 'Browser automatico' : (/Lighthouse|PageSpeed/i.test(ua) ? 'Test di velocità' : 'Programma automatico'));
-        return { isBot: true, kind: 'other', name: name.slice(0, 40) };
-    }
-    if (geo && geo.hosting && geo.org && ANALYTICS_CLOUD_ORGS.test(geo.org)) {
-        return { isBot: true, kind: 'other', name: ('Server ' + geo.org).slice(0, 60) };
-    }
-    return { isBot: false, kind: null, name: null };
-}
-
-function analyticsSource(refHost) {
-    const h = String(refHost || '').toLowerCase();
-    if (!h) return 'direct';
-    if (/(^|\.)ialgae\.com$/.test(h)) return 'internal';
-    if (/(^|\.)(google|bing|duckduckgo|yahoo|ecosia|yandex|baidu|qwant|startpage|search\.brave|brave|seznam|naver|libero|virgilio)\./.test(h)) return 'search';
-    if (/(^|\.)(chatgpt\.com|openai\.com|perplexity\.ai|gemini\.google\.com|claude\.ai|copilot\.microsoft\.com|you\.com|phind\.com)$/.test(h)) return 'ai';
-    if (/(^|\.)(facebook|instagram|t\.co|twitter|x\.com|tiktok|linkedin|lnkd|reddit|pinterest|youtube|youtu\.be|whatsapp|wa\.me|telegram|t\.me|snapchat|threads|tumblr|vk)\b/.test(h) || /^(l|lm|m)\.facebook\.com$/.test(h)) return 'social';
-    if (/(^|\.)(mail\.|outlook\.|gmail|webmail|posta\.|libero\.it\/mail)/.test(h)) return 'email';
-    return 'referral';
-}
-
-function analyticsLang(acceptLanguage, fromPage) {
-    const v = String(fromPage || acceptLanguage || '').trim().slice(0, 2).toLowerCase();
-    return /^[a-z]{2}$/.test(v) ? v : null;
 }
 
 function readJsonBody(req, maxBytes) {
@@ -4137,30 +4021,10 @@ const server = http.createServer((req, res) => {
                 const device = (payload.device === 'mobile' || payload.device === 'desktop') ? payload.device : null;
                 const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
                 const geo = await getGeoForIp(ip);
-                // Dettagli per le statistiche: calcolati qui e subito ridotti a
-                // categorie (lo User-Agent completo non viene salvato).
-                const ua = req.headers['user-agent'] || '';
-                const uaInfo = analyticsParseUA(ua);
-                const bot = analyticsDetectBot(ua, geo);
-                const lang = analyticsLang(req.headers['accept-language'], payload.lang);
-                // "referrer" arriva solo dalle pagine col tracciamento aggiornato;
-                // dalle altre resta vuoto e la provenienza risulta "non nota".
-                let refHost = null, source = null;
-                if (typeof payload.referrer === 'string') {
-                    refHost = payload.referrer ? extractHost(payload.referrer).toLowerCase().slice(0, 100) : null;
-                    if (refHost && !/^[a-z0-9.-]+$/.test(refHost)) refHost = null;
-                    if (refHost) refHost = refHost.replace(/^(l|lm|m|mobile|out|web)\./, '');
-                    source = analyticsSource(refHost);
-                }
-                if (typeof payload.utm === 'string' && /^[a-z0-9_.-]{1,30}$/i.test(payload.utm)) {
-                    const u = payload.utm.toLowerCase();
-                    source = /mail|newsletter/.test(u) ? 'email' : /facebook|instagram|tiktok|social|whatsapp|telegram/.test(u) ? 'social' : source || 'referral';
-                    if (!refHost) refHost = u;
-                }
 
                 const insertResult = await pool.query(
-                    'INSERT INTO page_views (page, country, country_code, city, latitude, longitude, visitor_id, device, browser, os, device_type, lang, source, ref_host, is_bot, bot_kind, bot_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id',
-                    [page, geo.country, geo.countryCode, geo.city, geo.lat, geo.lon, visitorId, device, uaInfo.browser, uaInfo.os, uaInfo.deviceType, lang, source, refHost, bot.isBot, bot.kind, bot.name]
+                    'INSERT INTO page_views (page, country, country_code, city, latitude, longitude, visitor_id, device) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id',
+                    [page, geo.country, geo.countryCode, geo.city, geo.lat, geo.lon, visitorId, device]
                 );
                 // L'id torna al browser, che lo terrà da parte per mandarlo
                 // insieme alla durata quando l'utente lascerà la pagina (vedi
@@ -4322,149 +4186,6 @@ function parseAdminDateRange(searchParams) {
 
     return { rangeStart: rangeStart, rangeEnd: rangeEnd, rangeDays: rangeDays, prevStart: prevStart, prevEnd: prevEnd };
 }
-
-    // ---- STATISTICHE DETTAGLIATE (pagina statistiche.html) ----
-    // Tutto in forma aggregata: numeri e classifiche, mai l'elenco delle
-    // persone. Protetto con ADMIN_SECRET come il resto del pannello admin.
-    if (req.method === 'GET' && req.url.indexOf('/api/admin/analytics?') === 0) {
-        (async function () {
-            try {
-                if (!pool) return sendJSON(res, 500, { error: 'Database non configurato.' });
-                if (!ADMIN_SECRET) return sendJSON(res, 500, { error: 'ADMIN_SECRET non configurata sul server.' });
-                const u = new URL(req.url, 'http://localhost');
-                if ((u.searchParams.get('secret') || '') !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Password errata.' });
-                const { rangeStart, rangeEnd, rangeDays, prevStart, prevEnd } = parseAdminDateRange(u.searchParams);
-                const hourly = rangeDays <= 1;
-                const q = function (sql, params) { return pool.query(sql, params).then(function (r) { return r.rows; }); };
-                // Filtri comuni: "persone" = non robot e non dispositivi esclusi.
-                const EXCL = 'NOT EXISTS (SELECT 1 FROM analytics_excluded e WHERE e.visitor_id = pv.visitor_id)';
-                const HUMAN = '(pv.is_bot IS NOT TRUE) AND ' + EXCL;
-                const R = 'pv.created_at >= $1 AND pv.created_at <= $2';
-                const P = [rangeStart, rangeEnd];
-                const top = function (col, extra, limit) {
-                    return q('SELECT ' + col + ' AS name, COUNT(*)::int AS views, COUNT(DISTINCT COALESCE(pv.visitor_id, pv.id::text))::int AS users ' +
-                        'FROM page_views pv WHERE ' + R + ' AND ' + HUMAN + (extra ? ' AND ' + extra : '') +
-                        ' GROUP BY 1 ORDER BY users DESC, views DESC LIMIT ' + (limit || 10), P);
-                };
-                const sessionsSql = function (from, to) {
-                    return 'WITH o AS (SELECT pv.visitor_id, pv.created_at, pv.duration_ms, ' +
-                        'pv.created_at - LAG(pv.created_at) OVER (PARTITION BY pv.visitor_id ORDER BY pv.created_at) AS gap ' +
-                        'FROM page_views pv WHERE pv.created_at >= ' + from + ' AND pv.created_at <= ' + to + ' AND pv.visitor_id IS NOT NULL AND ' + HUMAN + '), ' +
-                        "s AS (SELECT visitor_id, SUM(CASE WHEN gap IS NULL OR gap > interval '30 minutes' THEN 1 ELSE 0 END) OVER (PARTITION BY visitor_id ORDER BY created_at) AS n FROM o), " +
-                        'c AS (SELECT visitor_id, n, COUNT(*) AS pages FROM s GROUP BY 1, 2) ' +
-                        'SELECT COUNT(*)::int AS sessions, COUNT(*) FILTER (WHERE pages = 1)::int AS bounced FROM c';
-                };
-                const kpiSql = 'SELECT COUNT(DISTINCT COALESCE(pv.visitor_id, pv.id::text))::int AS users, COUNT(*)::int AS views, ' +
-                    'AVG(pv.duration_ms) FILTER (WHERE pv.duration_ms IS NOT NULL) AS avg_ms FROM page_views pv WHERE pv.created_at >= $1 AND pv.created_at <= $2 AND ' + HUMAN;
-                const newUsersSql = 'SELECT COUNT(*)::int AS c FROM (SELECT pv.visitor_id, MIN(pv.created_at) AS f FROM page_views pv ' +
-                    'WHERE pv.visitor_id IS NOT NULL AND ' + HUMAN + ' GROUP BY 1) t WHERE f >= $1 AND f <= $2';
-                const bucket = hourly ? "to_char(date_trunc('hour', pv.created_at AT TIME ZONE 'Europe/Rome'), 'YYYY-MM-DD\"T\"HH24')"
-                                      : "to_char(date_trunc('day', pv.created_at AT TIME ZONE 'Europe/Rome'), 'YYYY-MM-DD')";
-                const seriesSql = function (from, to) {
-                    return 'SELECT ' + bucket + ' AS t, COUNT(DISTINCT COALESCE(pv.visitor_id, pv.id::text))::int AS users, COUNT(*)::int AS views ' +
-                        'FROM page_views pv WHERE pv.created_at >= ' + from + ' AND pv.created_at <= ' + to + ' AND ' + HUMAN + ' GROUP BY 1 ORDER BY 1';
-                };
-
-                const [kpi, kpiPrev, sess, sessPrev, newU, newUPrev, series, seriesPrev, live, sources, refs, browsers, oses, devices, langs,
-                       countries, cities, pages, searches, bots, botsTotal, unknownSrc, mine, excludedCount, oldRows, searchesTotal] = await Promise.all([
-                    q(kpiSql, P), q(kpiSql, [prevStart, prevEnd]),
-                    q(sessionsSql('$1', '$2'), P), q(sessionsSql('$1', '$2'), [prevStart, prevEnd]),
-                    q(newUsersSql, P), q(newUsersSql, [prevStart, prevEnd]),
-                    q(seriesSql('$1', '$2'), P), q(seriesSql('$1', '$2'), [prevStart, prevEnd]),
-                    q("SELECT COUNT(DISTINCT COALESCE(pv.visitor_id, pv.id::text))::int AS c FROM page_views pv WHERE pv.created_at >= now() - interval '5 minutes' AND " + HUMAN, []),
-                    top('pv.source', "pv.source IS NOT NULL AND pv.source <> 'internal'", 10),
-                    top('pv.ref_host', "pv.ref_host IS NOT NULL AND pv.source IN ('referral','social','ai','email','search')", 12),
-                    top("COALESCE(pv.browser, 'Non noto')", null, 10),
-                    top("COALESCE(pv.os, 'Non noto')", null, 10),
-                    top("COALESCE(pv.device_type, pv.device, 'Non noto')", null, 5),
-                    top("COALESCE(pv.lang, '??')", null, 8),
-                    q('SELECT pv.country AS name, pv.country_code AS code, COUNT(DISTINCT COALESCE(pv.visitor_id, pv.id::text))::int AS users, COUNT(*)::int AS views ' +
-                      'FROM page_views pv WHERE ' + R + ' AND ' + HUMAN + ' AND pv.country IS NOT NULL GROUP BY 1, 2 ORDER BY users DESC LIMIT 15', P),
-                    q('SELECT pv.city AS name, pv.country_code AS code, COUNT(DISTINCT COALESCE(pv.visitor_id, pv.id::text))::int AS users, COUNT(*)::int AS views ' +
-                      'FROM page_views pv WHERE ' + R + ' AND ' + HUMAN + ' AND pv.city IS NOT NULL GROUP BY 1, 2 ORDER BY users DESC LIMIT 15', P),
-                    q("SELECT split_part(pv.page, '?', 1) || CASE WHEN pv.page LIKE '%type=maps%' THEN '?type=maps' WHEN pv.page LIKE '/blog.html?post=%' THEN '?post=' || split_part(split_part(pv.page, 'post=', 2), '&', 1) ELSE '' END AS name, " +
-                      'COUNT(*)::int AS views, COUNT(DISTINCT COALESCE(pv.visitor_id, pv.id::text))::int AS users, ' +
-                      'ROUND(AVG(pv.duration_ms) FILTER (WHERE pv.duration_ms IS NOT NULL) / 1000)::int AS avg_s ' +
-                      'FROM page_views pv WHERE ' + R + ' AND ' + HUMAN + ' GROUP BY 1 ORDER BY views DESC LIMIT 12', P),
-                    // Ricerche fatte su iAlgae (tabella search_terms): mostrate SOLO
-                    // se cercate almeno 3 volte nel periodo, così una ricerca
-                    // personale di una sola persona non compare mai.
-                    q("SELECT term AS name, SUM(count)::int AS views, MODE() WITHIN GROUP (ORDER BY kind) AS kind FROM search_terms " +
-                      "WHERE day >= ($1::timestamptz AT TIME ZONE 'UTC')::date AND day <= ($2::timestamptz AT TIME ZONE 'UTC')::date " +
-                      'GROUP BY term HAVING SUM(count) >= 3 ORDER BY views DESC LIMIT 15', P),
-                    q("SELECT COALESCE(pv.bot_name, '?') AS name, pv.bot_kind AS kind, COUNT(*)::int AS views FROM page_views pv WHERE " + R + ' AND pv.is_bot = TRUE GROUP BY 1, 2 ORDER BY views DESC LIMIT 12', P),
-                    q("SELECT COUNT(*) FILTER (WHERE pv.bot_kind = 'search')::int AS search, COUNT(*) FILTER (WHERE pv.bot_kind <> 'search' OR pv.bot_kind IS NULL)::int AS other FROM page_views pv WHERE " + R + ' AND pv.is_bot = TRUE', P),
-                    q('SELECT COUNT(*)::int AS c FROM page_views pv WHERE ' + R + ' AND ' + HUMAN + ' AND pv.source IS NULL', P),
-                    q('SELECT COUNT(*)::int AS c FROM page_views pv WHERE ' + R + ' AND EXISTS (SELECT 1 FROM analytics_excluded e WHERE e.visitor_id = pv.visitor_id)', P),
-                    q('SELECT COUNT(*)::int AS c FROM analytics_excluded', []),
-                    q('SELECT COUNT(*)::int AS c FROM page_views pv WHERE ' + R + ' AND pv.is_bot IS NULL', P),
-                    q("SELECT COALESCE(SUM(count), 0)::int AS c FROM search_terms WHERE day >= ($1::timestamptz AT TIME ZONE 'UTC')::date AND day <= ($2::timestamptz AT TIME ZONE 'UTC')::date", P)
-                ]);
-                const k = kpi[0], kp = kpiPrev[0];
-                return sendJSON(res, 200, {
-                    from: rangeStart.toISOString(), to: rangeEnd.toISOString(), rangeDays: rangeDays, hourly: hourly,
-                    kpi: {
-                        users: k.users, views: k.views, avgSeconds: k.avg_ms != null ? Math.round(k.avg_ms / 1000) : null,
-                        sessions: sess[0].sessions, bounce: sess[0].sessions ? Math.round(sess[0].bounced / sess[0].sessions * 1000) / 10 : null,
-                        newUsers: newU[0].c
-                    },
-                    prev: {
-                        users: kp.users, views: kp.views, avgSeconds: kp.avg_ms != null ? Math.round(kp.avg_ms / 1000) : null,
-                        sessions: sessPrev[0].sessions, bounce: sessPrev[0].sessions ? Math.round(sessPrev[0].bounced / sessPrev[0].sessions * 1000) / 10 : null,
-                        newUsers: newUPrev[0].c
-                    },
-                    series: series, seriesPrev: seriesPrev, liveNow: live[0].c,
-                    sources: sources, referrers: refs, unknownSource: unknownSrc[0].c,
-                    browsers: browsers, os: oses, devices: devices, langs: langs,
-                    countries: countries, cities: cities, pages: pages, searches: searches,
-                    bots: bots, botsTotal: botsTotal[0], myViews: mine[0].c, excludedDevices: excludedCount[0].c,
-                    oldUnclassified: oldRows[0].c, searchesTotal: searchesTotal[0].c
-                });
-            } catch (err) {
-                console.error('Errore statistiche dettagliate:', err);
-                return sendJSON(res, 500, { error: 'Errore del server.' });
-            }
-        })();
-        return;
-    }
-
-    // "Non contare questo dispositivo": la pagina statistiche manda l'ID
-    // anonimo del browser del proprietario, che da quel momento (e anche
-    // per le visite passate) non entra più nei numeri.
-    if (req.method === 'POST' && req.url === '/api/admin/analytics/exclude') {
-        (async function () {
-            try {
-                const b = await readJsonBody(req, 4096);
-                if (!b || !ADMIN_SECRET || b.secret !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Password errata.' });
-                if (!pool) return sendJSON(res, 500, { error: 'Database non configurato.' });
-                const vid = String(b.visitorId || '').slice(0, 64);
-                if (!vid) return sendJSON(res, 400, { error: 'ID mancante.' });
-                if (b.exclude === false) await pool.query('DELETE FROM analytics_excluded WHERE visitor_id = $1', [vid]);
-                else await pool.query('INSERT INTO analytics_excluded (visitor_id, label) VALUES ($1, $2) ON CONFLICT (visitor_id) DO UPDATE SET label = EXCLUDED.label',
-                    [vid, String(b.label || '').slice(0, 60) || null]);
-                const r = await pool.query('SELECT 1 FROM analytics_excluded WHERE visitor_id = $1', [vid]);
-                return sendJSON(res, 200, { ok: true, excluded: r.rows.length > 0 });
-            } catch (err) {
-                console.error('Errore esclusione dispositivo:', err);
-                return sendJSON(res, 500, { error: 'Errore del server.' });
-            }
-        })();
-        return;
-    }
-    if (req.method === 'GET' && req.url.indexOf('/api/admin/analytics/excluded?') === 0) {
-        (async function () {
-            try {
-                const u = new URL(req.url, 'http://localhost');
-                if (!ADMIN_SECRET || (u.searchParams.get('secret') || '') !== ADMIN_SECRET) return sendJSON(res, 401, { error: 'Password errata.' });
-                const vid = (u.searchParams.get('visitorId') || '').slice(0, 64);
-                const r = await pool.query('SELECT 1 FROM analytics_excluded WHERE visitor_id = $1', [vid]);
-                return sendJSON(res, 200, { excluded: r.rows.length > 0 });
-            } catch (err) {
-                return sendJSON(res, 500, { error: 'Errore del server.' });
-            }
-        })();
-        return;
-    }
 
     // Download di iAlgae Core per la dashboard admin: totali Mac/Windows (da
     // sempre e nel periodo scelto), persone diverse, andamento giorno per
@@ -7883,7 +7604,6 @@ function parseAdminDateRange(searchParams) {
                 const allowedTypes = ['web', 'images', 'news', 'videos'];
                 let type = (fullUrl.searchParams.get('type') || 'web').toLowerCase();
                 if (allowedTypes.indexOf(type) === -1) type = 'web';
-                if (q && page === 1) noteSearchTerm(q, type, req.headers['user-agent']);
 
                 // SafeSearch: distinguiamo due casi diversi apposta —
                 // 1) parametro DEL TUTTO ASSENTE dalla richiesta: vuol dire
@@ -8296,27 +8016,6 @@ if (dbEnabled) {
             );
         } catch (err) {
             console.error('Errore scrittura raggruppata delle durate di visita:', err.message);
-        }
-    }, 5 * 60 * 1000);
-
-    // Stessa cosa per le parole cercate (vedi noteSearchTerm più sopra).
-    setInterval(async function () {
-        if (pendingSearchTerms.size === 0) return;
-        const days = [], kinds = [], terms = [], counts = [];
-        for (const [key, n] of pendingSearchTerms) {
-            const a = key.indexOf('|'), b = key.indexOf('|', a + 1);
-            days.push(key.slice(0, a)); kinds.push(key.slice(a + 1, b)); terms.push(key.slice(b + 1)); counts.push(n);
-        }
-        pendingSearchTerms.clear();
-        try {
-            await pool.query(
-                'INSERT INTO search_terms (day, kind, term, count) ' +
-                'SELECT unnest($1::date[]), unnest($2::text[]), unnest($3::text[]), unnest($4::int[]) ' +
-                'ON CONFLICT (day, term, kind) DO UPDATE SET count = search_terms.count + EXCLUDED.count',
-                [days, kinds, terms, counts]
-            );
-        } catch (err) {
-            console.error('Errore scrittura parole cercate:', err.message);
         }
     }, 5 * 60 * 1000);
 }
